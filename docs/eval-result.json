@@ -10,7 +10,7 @@
     "pattern": "/briefing/pressReleaseView.do?newsId={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 19,
-    "seconds": 36.9
+    "seconds": 37.1
   },
   {
     "url": "https://www.msit.go.kr",
@@ -23,7 +23,7 @@
     "pattern": "/bbs/view.do?bbsSeqNo={n}&mId={n}&mPid={n}&nttSeqNo={n}&sCode=*",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 21,
-    "seconds": 40.3
+    "seconds": 40.4
   },
   {
     "url": "https://www.motie.go.kr",
@@ -32,7 +32,7 @@
     "message": null,
     "site_type": "PUBLIC",
     "method": "STATIC",
-    "hubs": 16,
+    "hubs": 14,
     "pattern": "/kor/article/{id}/{n}/view?mno=*",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 40,
@@ -75,7 +75,7 @@
     "pattern": "/{n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 21,
-    "seconds": 36.3
+    "seconds": 36.2
   },
   {
     "url": "https://zdnet.co.kr",
@@ -88,7 +88,7 @@
     "pattern": "/view/?no={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 13,
-    "seconds": 24.1
+    "seconds": 25.3
   },
   {
     "url": "https://www.ddaily.co.kr",
@@ -114,7 +114,7 @@
     "pattern": null,
     "quality": null,
     "requests": 7,
-    "seconds": 12.0
+    "seconds": 12.1
   },
   {
     "url": "https://www.bloter.net",
@@ -127,6 +127,6 @@
     "pattern": "/news/articleView.html?idxno={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 10,
-    "seconds": 14.2
+    "seconds": 14.1
   }
 ]

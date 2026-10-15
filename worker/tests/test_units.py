@@ -293,7 +293,9 @@ def test_sections_found_by_korean_board_names():
     f = PoliteFetcher(Settings(min_interval_seconds=0, allow_private_hosts=True))
     d = Discoverer(f, "m.go.kr", "https://m.go.kr")
     html = ('<a href="/kor/contents/49">조직도</a><a href="/kor/article/ATCL369bcdf07">알림/소식</a>'
-            '<a href="/kor/article/ATCL3f49a5a8c">보도자료</a><a href="/news/list.do">목록</a><a href="/">홈</a>')
+            '<a href="/kor/article/ATCL3f49a5a8c">보도자료</a><a href="/news/list.do">목록</a><a href="/">홈</a>'
+            '<a href="/news/articleView.html?idxno=101">기사 제목 101번 소식</a>'      # 글 제목은 섹션이 아니다
+            '<a href="/news/articleView.html?idxno=102">올해 뉴스 결산 발표</a>')
     assert [s["name"] for s in d._sections(html, "https://m.go.kr/")] == ["목록", "보도자료", "알림/소식"]
     f.close()
 

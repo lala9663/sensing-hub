@@ -276,8 +276,9 @@ class Discoverer:
                 entries = [(u, d) for u, d in links_with_dates(page.text, page.url) if same_site(u, self.domain)]
                 self._remember(entries)
                 candidates += [u for u, _ in entries]
-        hubs = [home.url] + [s["url"] for s in kept[:15]]
         for pattern in self._ranked_patterns(candidates, 3):
+            # 기사 주소 자체는 허브가 아니다
+            hubs = [home.url] + [s["url"] for s in kept[:15] if not matches(s["url"], pattern)]
             yield self._result("STATIC", hubs, pattern, sections, excluded, candidates)
 
     def _remember(self, entries: list[tuple[str, str | None]]) -> None:
@@ -340,7 +341,9 @@ class Discoverer:
             if LIST_HINT.search(url):
                 seen.add(url)
                 by_url.append({"url": url, "name": name})
-            elif BOARD_NAME_HINT.search(name) and url.rstrip("/") != self.base_url.rstrip("/"):
+            elif (BOARD_NAME_HINT.search(name) and len(name) <= 10 and not re.search(r"\d{3,}", name)
+                    and url.rstrip("/") != self.base_url.rstrip("/")):
+                # 메뉴 이름은 짧다. "기사 제목 101번 소식" 같은 글 제목은 섹션이 아니다
                 seen.add(url)
                 by_name.append({"url": url, "name": name})
         # 이름으로 찾은 섹션은 보도자료 → 공지·소식 → 나머지 순으로 연다 (열어 볼 수 있는 수가 제한돼 있다)
