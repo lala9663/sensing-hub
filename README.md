@@ -126,7 +126,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 
 M1에서 바로 할 일:
 
-- [ ] 도메인 단위 요청 간격을 워커 여러 대가 공유하도록 DB 또는 advisory lock으로 옮기기
+- [x] 도메인 단위 요청 간격을 워커 여러 대가 공유 (`domain_throttle` 슬롯 예약, `SENSING_SHARED_THROTTLE`)
 - [ ] 소스별 평소 수집량 대비 급감(`ANOMALY_DROP`) 감지와 2회 연속 시 BROKEN 전환
 - [ ] 실패 증거(응답 HTML 일부) 파일 저장과 `evidence_path` 기록
 - [ ] 관리자용 처리 대기 큐 API (`/api/v1/review-queue`)

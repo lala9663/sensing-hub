@@ -27,6 +27,8 @@ class Settings:
         "SENSING_USER_AGENT", "SensingHubBot/0.1 (+contact: sensing-hub admin)"))
     # 같은 도메인에 대한 최소 요청 간격(초)
     min_interval_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_MIN_INTERVAL", "2")))
+    # 켜면 도메인 간격을 DB(domain_throttle)로 워커끼리 공유한다
+    shared_throttle: bool = field(default_factory=lambda: _bool("SENSING_SHARED_THROTTLE", True))
     connect_timeout: float = field(default_factory=lambda: float(os.getenv("SENSING_CONNECT_TIMEOUT", "10")))
     read_timeout: float = field(default_factory=lambda: float(os.getenv("SENSING_READ_TIMEOUT", "30")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_RETRIES", "3")))

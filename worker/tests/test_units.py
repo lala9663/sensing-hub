@@ -9,6 +9,7 @@ from sensing_worker.discovery import Discoverer, canonical_article_url, matches,
 from sensing_worker.extract import Article, extract_article
 from sensing_worker.fetcher import PoliteFetcher
 from sensing_worker.policy import defaults_for, guess_site_type, passes_quality
+from sensing_worker.throttle import LocalThrottle, throttle_key
 
 
 def test_signature_and_pattern_for_ndsoft():
@@ -130,3 +131,12 @@ def test_internal_address_is_blocked_without_flag():
     with pytest.raises(CrawlFailure) as e:
         f.get("http://127.0.0.1:9/")
     assert e.value.code == Code.INTERNAL_ADDRESS
+
+
+def test_local_throttle_reserves_slots_per_domain():
+    t = LocalThrottle(10)
+    assert t.reserve("www.a.com") == 0
+    assert 9.9 < t.reserve("a.com") <= 10
+    assert 19.9 < t.reserve("a.com") <= 20
+    assert t.reserve("b.com") == 0
+    assert throttle_key("WWW.News.Example.COM.") == "news.example.com"

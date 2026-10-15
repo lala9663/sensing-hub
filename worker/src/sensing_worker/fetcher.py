@@ -15,7 +15,6 @@ import os
 import re
 import socket
 import ssl
-import threading
 import time
 import urllib.robotparser
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ import httpx
 
 from .codes import Code, CrawlFailure
 from .config import Settings
+from .throttle import DbThrottle, LocalThrottle
 
 CHALLENGE_MARKERS = (
     "cf-browser-verification", "challenge-platform", "cf-chl-", "just a moment...", "attention required! | cloudflare",
@@ -44,7 +44,8 @@ class Page:
 
 
 class PoliteFetcher:
-    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None):
+    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None,
+                 throttle: LocalThrottle | DbThrottle | None = None):
         self.s = settings
         self._client = httpx.Client(
             headers={"User-Agent": settings.user_agent, "Accept-Language": "ko,en;q=0.8"},
@@ -52,13 +53,14 @@ class PoliteFetcher:
             follow_redirects=False,
             transport=transport,
         )
-        self._last_request: dict[str, float] = {}
+        # 워커 여러 대가 돌 때는 DbThrottle을 넘겨 도메인 간격을 공유한다
+        self.throttle = throttle or LocalThrottle(settings.min_interval_seconds)
         self._robots: dict[str, tuple[float, urllib.robotparser.RobotFileParser | None, str]] = {}
-        self._lock = threading.Lock()
         self.request_count = 0
 
     def close(self) -> None:
         self._client.close()
+        self.throttle.close()
 
     # ------------------------------------------------------------------ robots
     def robots_status(self, base_url: str) -> str:
@@ -189,13 +191,7 @@ class PoliteFetcher:
         return b"".join(chunks)
 
     def _throttle(self, url: str) -> None:
-        host = urlsplit(url).hostname or ""
-        with self._lock:
-            last = self._last_request.get(host, 0.0)
-            wait = self.s.min_interval_seconds - (time.monotonic() - last)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_request[host] = time.monotonic()
+        self.throttle.wait(urlsplit(url).hostname or "")
 
     def _backoff(self, attempt: int) -> None:
         time.sleep(min(0.5 * (2 ** (attempt - 1)), 10) if self.s.min_interval_seconds > 0 else 0)

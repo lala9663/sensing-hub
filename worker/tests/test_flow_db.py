@@ -18,9 +18,10 @@ from sensing_worker.db import Store
 from sensing_worker.fetcher import PoliteFetcher
 from sensing_worker.jobs import JobRunner
 from sensing_worker.main import process_one
+from sensing_worker.throttle import DbThrottle
 
 DSN = os.getenv("SENSING_TEST_DSN")
-SCHEMA = pathlib.Path(__file__).resolve().parents[2] / "backend/src/main/resources/db/migration/V1__init.sql"
+MIGRATIONS = pathlib.Path(__file__).resolve().parents[2] / "backend/src/main/resources/db/migration"
 pytestmark = pytest.mark.skipif(not DSN, reason="SENSING_TEST_DSN not set")
 
 
@@ -28,7 +29,9 @@ pytestmark = pytest.mark.skipif(not DSN, reason="SENSING_TEST_DSN not set")
 def env():
     with psycopg.connect(DSN, autocommit=True) as c:
         c.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        c.execute(SCHEMA.read_text())
+        # Flyway와 같은 순서(V1, V2, ...)로 적용한다
+        for path in sorted(MIGRATIONS.glob("V*__*.sql"), key=lambda p: int(p.name[1:].split("__")[0])):
+            c.execute(path.read_text(encoding="utf-8"))
     settings = Settings(db_url=DSN, min_interval_seconds=0, max_retries=1, allow_private_hosts=True,
                         worker_id="test-worker")
     store = Store(DSN)
@@ -171,3 +174,16 @@ def test_only_one_worker_gets_a_job(env):
         assert first is not None and second is None
     finally:
         other.close()
+
+
+def test_domain_interval_is_shared_between_workers(env):
+    # 워커 두 대가 같은 도메인에 번갈아 요청해도 슬롯은 순서대로 interval씩 밀린다
+    a, b = DbThrottle(DSN, 30), DbThrottle(DSN, 30)
+    try:
+        assert a.reserve("www.example.com") == 0
+        assert 29 < b.reserve("example.com") <= 30          # www. 유무와 관계없이 같은 도메인
+        assert 59 < a.reserve("EXAMPLE.com") <= 60
+        assert b.reserve("other.example.org") == 0           # 다른 도메인은 기다리지 않는다
+    finally:
+        a.close()
+        b.close()

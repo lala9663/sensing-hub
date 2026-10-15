@@ -16,6 +16,7 @@ from .config import Settings
 from .db import Store
 from .fetcher import PoliteFetcher
 from .jobs import JobRunner
+from .throttle import DbThrottle
 
 log = logging.getLogger("sensing_worker")
 
@@ -60,7 +61,8 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
     store = Store(settings.db_url)
-    fetcher = PoliteFetcher(settings)
+    throttle = DbThrottle(settings.db_url, settings.min_interval_seconds) if settings.shared_throttle else None
+    fetcher = PoliteFetcher(settings, throttle=throttle)
     runner = JobRunner(store, fetcher, settings)
     log.info("worker %s started", settings.worker_id)
     try:
