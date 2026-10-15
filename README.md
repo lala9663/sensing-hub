@@ -135,7 +135,12 @@ M1에서 바로 할 일:
 - [x] 소스별 평소 수집량 대비 급감(`ANOMALY_DROP`) 감지와 2회 연속 시 BROKEN 전환 (기준: 같은 설정 버전의 최근 정상 실행 평균 후보 수, 30% 미만)
 - [x] 실패 증거(응답 HTML 일부) 파일 저장과 `evidence_path` 기록 (`SENSING_EVIDENCE_DIR`/날짜/, 30일 보관)
 - [x] 관리자용 처리 대기 큐 API (`/api/v1/review-queue`: 승인 대기·REVIEW·BROKEN·BLOCKED를 우선순위순으로)
-- [ ] 실제 사이트 10곳으로 자동 탐색 성공률 측정 (목표 8곳)
+- [x] 실제 사이트 10곳으로 자동 탐색 성공률 측정 도구 (`sensing-discovery-eval`, 표본 `docs/eval-sites.txt`)
+- [ ] 자동 탐색 성공률 목표 8/10 달성 — 2026-10-16 첫 측정 **6/10** (`docs/eval-result.json`)
+  - 공공기관 2곳(msit, motie) `DISCOVERY_FAILED`: RSS·사이트맵이 없고 게시판 링크 패턴을 못 잡음
+  - korea.kr `QUALITY_FAILED`: 사이트맵에서 오래된 글만 샘플로 뽑힘 (최근 30일 글 없음)
+  - daily.hankooki.com `BOT_CHALLENGE`: 봇 확인 화면 → 원칙대로 우회하지 않음 (측정 분모에서 뺄지 결정 필요)
+  - hankyung.com이 `ETC`로 분류됨 → 언론사인데 본문까지 저장하게 됨 (사이트 유형 판정 보강 필요)
 
 ## 원칙
 

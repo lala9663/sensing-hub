@@ -32,6 +32,10 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
+    }
     // 통합 테스트는 SENSING_IT_DB_URL이 있을 때만 실행된다 (README 참고)
     environment 'SENSING_IT_DB_URL', System.getenv('SENSING_IT_DB_URL') ?: ''
 }

@@ -1,0 +1,13 @@
+# 자동 탐색 성공률 측정용 표본 (M1 목표: 10곳 중 8곳 자동 등록)
+# 실제 운영 대상이 정해지면 이 목록을 바꿔 다시 측정한다:
+#   cd worker && sensing-discovery-eval ../docs/eval-sites.txt --target 8 --json ../docs/eval-result.json
+https://www.korea.kr          # 정책브리핑 (공공)
+https://www.msit.go.kr        # 과학기술정보통신부 (공공)
+https://www.motie.go.kr       # 산업통상자원부 (공공)
+https://www.yna.co.kr         # 연합뉴스
+https://www.hankyung.com      # 한국경제
+https://www.etnews.com        # 전자신문
+https://zdnet.co.kr           # 지디넷코리아
+https://www.ddaily.co.kr      # 디지털데일리 (ndsoft)
+https://daily.hankooki.com    # 데일리한국 (ndsoft)
+https://www.bloter.net        # 블로터

@@ -162,3 +162,23 @@ def test_http_errors_carry_evidence():
     with pytest.raises(CrawlFailure) as e:
         f.get("https://a.example/x")
     assert e.value.code == Code.HTTP_4XX and e.value.evidence == "<html>gone</html>"
+
+
+def test_discovery_eval_classifies_sites_like_onboarding():
+    from fakesite import Site, blocked_site_routes, news_site_routes
+    from sensing_worker.evaluate import evaluate_site, read_sites, summarize
+
+    settings = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True)
+    news, blocked = Site(news_site_routes()), Site(blocked_site_routes())
+    try:
+        ok = evaluate_site(news.base + "/news/articleView.html?idxno=101", settings)
+        assert ok.outcome == "OK" and ok.method == "STATIC" and ok.site_type == "NEWS" and ok.requests > 0
+        assert ok.url == news.base                                   # 기사 주소를 넣어도 사이트 단위로 본다
+        bad = evaluate_site(blocked.base, settings)
+        assert bad.outcome == "BLOCKED" and bad.code == "BOT_CHALLENGE"
+        text = summarize([ok, bad], target=2)
+        assert "자동 등록 성공 1/2곳 (목표 2곳: 미달)" in text
+    finally:
+        news.close()
+        blocked.close()
+    assert read_sites(["a.com", "a.com", "b.com"]) == ["a.com", "b.com"]

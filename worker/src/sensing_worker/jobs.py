@@ -9,7 +9,8 @@ from urllib.parse import urlsplit
 from .codes import Code, CrawlFailure, MESSAGES
 from .config import Settings
 from .db import Job, Store, sha256
-from .discovery import Discoverer, canonical_article_url, looks_like_feed, matches, parse_feed, parse_sitemap, same_site
+from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, matches, parse_feed,
+                        parse_sitemap, same_site)
 from .evidence import EvidenceStore
 from .extract import extract_article, links
 from .fetcher import EVIDENCE_CHARS, PoliteFetcher
@@ -61,14 +62,10 @@ class JobRunner:
 
         # 1) 사전 점검
         self.db.update_registration(job.source_id, step="PROBE", message="사전 점검 중입니다.")
-        robots = self.f.robots_status(base_url)
-        ai_blocked = self.f.ai_bots_blocked(base_url)
-        if robots == "DISALLOWED":
-            raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=base_url, stage="PROBE")
-        home = self.f.get(base_url)
-        site_type = guess_site_type(domain, home.text)
-        self.db.update_site(source["site_id"], robots_status=robots, site_type=site_type, ai_restricted=ai_blocked,
-                            risk_flags={"ai_bots_blocked": ai_blocked})
+        probe = probe_site(self.f, domain, base_url)
+        site_type = probe.site_type
+        self.db.update_site(source["site_id"], robots_status=probe.robots, site_type=site_type,
+                            ai_restricted=probe.ai_blocked, risk_flags={"ai_bots_blocked": probe.ai_blocked})
 
         # 2) 자동 탐색
         self.db.update_registration(job.source_id, step="DISCOVERY", message="기사 입구와 기사 주소 패턴을 찾는 중입니다.")
@@ -76,18 +73,7 @@ class JobRunner:
 
         # 3) 품질 검사 (샘플 5건)
         self.db.update_registration(job.source_id, step="QUALITY", message="샘플 기사로 품질을 검사하는 중입니다.")
-        samples = []
-        for url in result.sample_urls[:5]:
-            try:
-                page = self.f.get(url)
-                samples.append(extract_article(page.text, page.url))
-            except CrawlFailure as e:
-                if e.blocking:
-                    raise
-        ok, detail = passes_quality(samples)
-        if not ok:
-            raise CrawlFailure(Code.QUALITY_FAILED, f"{MESSAGES[Code.QUALITY_FAILED]} ({detail})",
-                               url=base_url, stage="DISCOVERY")
+        detail = check_quality(self.f, result, base_url)
 
         # 4) 기본값 적용 → 설정 새 버전 → ACTIVE
         defaults = defaults_for(site_type)
@@ -229,6 +215,42 @@ class JobRunner:
         elif code in (Code.PARSE_EMPTY, Code.DISCOVERY_FAILED):
             self.db.set_source_status(job.source_id, "BROKEN", code.value)
         self.db.mark_crawl_result(job.source_id, False, source["interval_minutes"])
+
+
+# ---------------------------------------------------------------------- 온보딩 판단 (DB 없이도 쓴다: evaluate.py)
+
+@dataclass
+class Probe:
+    robots: str
+    ai_blocked: bool
+    site_type: str
+
+
+def probe_site(f: PoliteFetcher, domain: str, base_url: str) -> Probe:
+    """사전 점검: robots·AI 봇 차단 여부, 홈 접속(차단·로그인 판정 포함), 사이트 유형."""
+    robots = f.robots_status(base_url)
+    ai_blocked = f.ai_bots_blocked(base_url)
+    if robots == "DISALLOWED":
+        raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=base_url, stage="PROBE")
+    home = f.get(base_url)
+    return Probe(robots, ai_blocked, guess_site_type(domain, home.text))
+
+
+def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str) -> str:
+    """샘플 5건으로 품질 검사. 통과하면 설명을 돌려주고, 아니면 QUALITY_FAILED."""
+    samples = []
+    for url in result.sample_urls[:5]:
+        try:
+            page = f.get(url)
+            samples.append(extract_article(page.text, page.url))
+        except CrawlFailure as e:
+            if e.blocking:
+                raise
+    ok, detail = passes_quality(samples)
+    if not ok:
+        raise CrawlFailure(Code.QUALITY_FAILED, f"{MESSAGES[Code.QUALITY_FAILED]} ({detail})",
+                           url=base_url, stage="DISCOVERY")
+    return detail
 
 
 def host_of(url: str) -> str:
