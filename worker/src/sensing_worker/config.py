@@ -36,6 +36,10 @@ class Settings:
     # 실행 1회당 상한
     max_pages_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_PAGES", "60")))
     max_articles_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_ARTICLES", "40")))
+    # 수집량 급감 감지: 기사 후보 수가 평소(같은 설정 버전의 최근 정상 실행 평균)의 이 비율 미만이면 이상으로 본다
+    anomaly_drop_ratio: float = field(default_factory=lambda: float(os.getenv("SENSING_ANOMALY_RATIO", "0.3")))
+    # 이상이 이 횟수만큼 연속되면 소스를 BROKEN으로 바꾼다
+    anomaly_broken_after: int = field(default_factory=lambda: int(os.getenv("SENSING_ANOMALY_BROKEN_AFTER", "2")))
     # 테스트에서만 켠다: 사설 IP·localhost 접속 허용
     allow_private_hosts: bool = field(default_factory=lambda: _bool("SENSING_ALLOW_PRIVATE_HOSTS", False))
     evidence_dir: str = field(default_factory=lambda: os.getenv("SENSING_EVIDENCE_DIR", "./data/evidence"))

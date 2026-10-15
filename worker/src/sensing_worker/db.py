@@ -107,7 +107,7 @@ class Store:
             self.conn.execute(
                 """
                 UPDATE source SET active_config_version_id = %s, method = %s, interval_minutes = %s,
-                       status = 'ACTIVE', status_reason = NULL, updated_at = now()
+                       status = 'ACTIVE', status_reason = NULL, consecutive_anomalies = 0, updated_at = now()
                 WHERE id = %s
                 """, (config_id, config["method"], interval_minutes, source_id))
         return config_id, version
@@ -150,14 +150,34 @@ class Store:
     def document_count(self, source_id: int) -> int:
         return self.conn.execute("SELECT count(*) AS c FROM document WHERE source_id = %s", (source_id,)).fetchone()["c"]
 
-    def recent_new_average(self, source_id: int, runs: int = 5) -> float:
+    def found_baseline(self, source_id: int, config_version_id: int | None, runs: int = 5,
+                       min_runs: int = 3) -> float | None:
+        """같은 설정 버전으로 돈 최근 정상 실행의 평균 기사 후보 수. 이력이 min_runs보다 적으면 None.
+
+        새 기사 수(new_count)는 조용한 시간대에 0이 되기 쉬워서, 허브에 보이는 후보 수(found_count)를 기준으로 삼는다.
+        이상으로 기록된 실행은 기준에서 뺀다. 설정을 새로 만들면(재탐색) 기준도 새로 쌓인다.
+        """
+        if config_version_id is None:
+            return None
         row = self.conn.execute(
             """
-            SELECT AVG(new_count) AS a FROM (
-                SELECT new_count FROM crawl_job WHERE source_id = %s AND job_type IN ('CRAWL', 'ONBOARD')
-                  AND status IN ('SUCCESS', 'PARTIAL') ORDER BY id DESC LIMIT %s) t
-            """, (source_id, runs)).fetchone()
-        return float(row["a"] or 0)
+            SELECT count(*) AS n, AVG(found_count) AS a FROM (
+                SELECT j.found_count FROM crawl_job j
+                WHERE j.source_id = %s AND j.config_version_id = %s AND j.job_type IN ('CRAWL', 'ONBOARD')
+                  AND j.status IN ('SUCCESS', 'PARTIAL')
+                  AND NOT EXISTS (SELECT 1 FROM crawl_error e WHERE e.job_id = j.id AND e.code = 'ANOMALY_DROP')
+                ORDER BY j.id DESC LIMIT %s) t
+            """, (source_id, config_version_id, runs)).fetchone()
+        return float(row["a"]) if row["n"] >= min_runs else None
+
+    def mark_anomaly(self, source_id: int, anomalous: bool) -> int:
+        """연속 이상 횟수를 갱신하고 돌려준다."""
+        return self.conn.execute(
+            """
+            UPDATE source SET consecutive_anomalies = CASE WHEN %s THEN consecutive_anomalies + 1 ELSE 0 END,
+                   updated_at = now()
+            WHERE id = %s RETURNING consecutive_anomalies
+            """, (anomalous, source_id)).fetchone()["consecutive_anomalies"]
 
     def upsert_document(self, *, source_id: int, job_id: int, url: str, title: str | None, author: str | None,
                         section: str | None, published_at: datetime | None, body: str | None) -> tuple[int, str]:

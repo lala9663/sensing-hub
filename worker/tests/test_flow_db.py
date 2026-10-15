@@ -187,3 +187,53 @@ def test_domain_interval_is_shared_between_workers(env):
     finally:
         a.close()
         b.close()
+
+
+def crawl(store: Store, runner, settings, source_id: int, trigger: str = "SCHEDULE") -> str:
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'CRAWL', %s)",
+                       (source_id, trigger))
+    return process_one(store, runner, settings)
+
+
+def shrink_hubs(site: Site, article_ids) -> None:
+    shrunk = news_site_routes(article_ids)
+    for key in ("/", "/news/articleList.html"):
+        site.routes[key] = shrunk[key]
+
+
+def test_sudden_drop_twice_marks_source_broken_and_recheck_restores(env):
+    store, runner, settings, sites = env
+    site = Site(news_site_routes(range(101, 111))); sites.append(site)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"            # 온보딩: 후보 10건
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"       # 기준 3회 확보 (평균 10건)
+
+    # 일부 개편: 목록에 기사 2건만 보인다 (0건이 아니라 PARSE_EMPTY로는 안 잡힌다)
+    normal = dict(site.routes)
+    shrink_hubs(site, range(101, 103))
+
+    assert crawl(store, runner, settings, source_id) == "PARTIAL"
+    src = q(store, "SELECT status, consecutive_anomalies FROM source WHERE id = %s", source_id)
+    assert src["status"] == "ACTIVE" and src["consecutive_anomalies"] == 1    # 1회는 지켜본다
+    err = q(store, "SELECT code, message FROM crawl_error ORDER BY id DESC LIMIT 1")
+    assert err["code"] == "ANOMALY_DROP" and "2건" in err["message"]
+
+    assert crawl(store, runner, settings, source_id) == "PARTIAL"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)
+    assert src["status"] == "BROKEN" and src["status_reason"] == "ANOMALY_DROP"
+
+    # 사이트가 복구된 뒤 관리자 재점검(수동 CRAWL)이 정상이면 ACTIVE로 돌아간다
+    site.routes.update(normal)
+    assert crawl(store, runner, settings, source_id, "MANUAL") == "SUCCESS"
+    src = q(store, "SELECT status, consecutive_anomalies FROM source WHERE id = %s", source_id)
+    assert src["status"] == "ACTIVE" and src["consecutive_anomalies"] == 0
+
+
+def test_no_anomaly_without_enough_history(env):
+    store, runner, settings, sites = env
+    site = Site(news_site_routes(range(101, 111))); sites.append(site)
+    source_id = register(store, site.base)
+    process_one(store, runner, settings)
+    shrink_hubs(site, range(101, 102))
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"    # 기준 이력 1회뿐 → 판단 보류

@@ -24,6 +24,7 @@ class CrawlStats:
     updated: int = 0
     errors: int = 0
     field_missing: int = 0
+    anomalies: int = 0
 
 
 class JobRunner:
@@ -108,11 +109,17 @@ class JobRunner:
         if not source.get("config"):
             raise CrawlFailure(Code.DISCOVERY_FAILED, "활성 설정이 없습니다.", stage="LIST")
         stats = self._crawl(job, source, source["config"])
-        if source["status"] in ("BLOCKED", "BROKEN"):  # 관리자 재점검 통과
+        streak = self.db.mark_anomaly(job.source_id, stats.anomalies > 0)
+        if streak >= self.s.anomaly_broken_after:
+            # 조용한 실패가 이어진다: 사이트 개편으로 일부만 잡히는 것으로 보고 관리자에게 넘긴다
+            self.db.set_source_status(job.source_id, "BROKEN", Code.ANOMALY_DROP.value)
+            log.warning("source %s BROKEN: %s consecutive anomalies", job.source_id, streak)
+        elif streak == 0 and source["status"] in ("BLOCKED", "BROKEN"):  # 관리자 재점검 통과
             self.db.set_source_status(job.source_id, "ACTIVE")
         self.db.mark_crawl_result(job.source_id, True, source["interval_minutes"])
         status = "PARTIAL" if stats.errors else "SUCCESS"
-        self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors)
+        self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors,
+                           source["active_config_version_id"])
         return status
 
     def _crawl(self, job: Job, source: dict, config: dict) -> CrawlStats:
@@ -137,6 +144,15 @@ class JobRunner:
 
         if not candidates:
             raise CrawlFailure(Code.PARSE_EMPTY, url=config["hubs"][0] if config["hubs"] else None, stage="LIST")
+
+        # 조용한 실패 감지 1: 허브에 보이는 기사 후보가 평소보다 크게 줄었다 (일부 섹션만 개편 등)
+        baseline = self.db.found_baseline(job.source_id, source.get("active_config_version_id"))
+        if baseline and stats.found < baseline * self.s.anomaly_drop_ratio:
+            self.db.record_error(job.id, CrawlFailure(
+                Code.ANOMALY_DROP, f"기사 후보가 {stats.found}건으로 평소({baseline:.1f}건)보다 크게 줄었습니다.",
+                url=config["hubs"][0], stage="LIST"))
+            stats.errors += 1
+            stats.anomalies += 1
 
         hashes = {sha256(u): u for u in candidates}
         known = self.db.known_urls(list(hashes))
@@ -168,12 +184,13 @@ class JobRunner:
                 for att_url, name in art.attachments:
                     self.db.add_attachment(doc_id, att_url, name)
 
-        # 조용한 실패 감지: 필드가 절반 넘게 비면 구조 변경 의심
+        # 조용한 실패 감지 2: 필드가 절반 넘게 비면 상세 페이지 구조 변경 의심
         if fresh and stats.field_missing > len(fresh) / 2:
             self.db.record_error(job.id, CrawlFailure(
                 Code.ANOMALY_DROP, f"새 기사 {len(fresh)}건 중 {stats.field_missing}건에서 제목·발행일을 찾지 못했습니다.",
                 url=config["hubs"][0], stage="EXTRACT"))
             stats.errors += 1
+            stats.anomalies += 1
         return stats
 
     # ------------------------------------------------------------------ 실패 처리

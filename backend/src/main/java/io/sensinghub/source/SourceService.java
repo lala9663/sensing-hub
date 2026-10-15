@@ -28,7 +28,7 @@ public class SourceService {
     public record SourceSummary(long id, String domain, String baseUrl, String siteType, String method, String status,
                                 String statusReason, Integer configVersion, int intervalMinutes,
                                 OffsetDateTime lastSuccessAt, OffsetDateTime nextRunAt, int consecutiveFailures,
-                                long documentCount, boolean aiRestricted) {
+                                int consecutiveAnomalies, long documentCount, boolean aiRestricted) {
     }
 
     public record JobRow(long id, String jobType, String trigger, String status, Integer configVersion,
@@ -51,7 +51,7 @@ public class SourceService {
     private static final String SUMMARY_SQL = """
             SELECT s.id, t.domain, t.base_url, t.site_type, s.method, s.status, s.status_reason,
                    v.version AS config_version, s.interval_minutes, s.last_success_at, s.next_run_at,
-                   s.consecutive_failures, t.ai_restricted,
+                   s.consecutive_failures, s.consecutive_anomalies, t.ai_restricted,
                    (SELECT count(*) FROM document d WHERE d.source_id = s.id) AS document_count
             FROM source s
             JOIN site t ON t.id = s.site_id
@@ -187,6 +187,6 @@ public class SourceService {
                 rs.getString("status_reason"), (Integer) rs.getObject("config_version"),
                 rs.getInt("interval_minutes"), rs.getObject("last_success_at", OffsetDateTime.class),
                 rs.getObject("next_run_at", OffsetDateTime.class), rs.getInt("consecutive_failures"),
-                rs.getLong("document_count"), rs.getBoolean("ai_restricted"));
+                rs.getInt("consecutive_anomalies"), rs.getLong("document_count"), rs.getBoolean("ai_restricted"));
     }
 }
