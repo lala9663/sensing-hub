@@ -128,7 +128,7 @@ M1에서 바로 할 일:
 
 - [x] 도메인 단위 요청 간격을 워커 여러 대가 공유 (`domain_throttle` 슬롯 예약, `SENSING_SHARED_THROTTLE`)
 - [x] 소스별 평소 수집량 대비 급감(`ANOMALY_DROP`) 감지와 2회 연속 시 BROKEN 전환 (기준: 같은 설정 버전의 최근 정상 실행 평균 후보 수, 30% 미만)
-- [ ] 실패 증거(응답 HTML 일부) 파일 저장과 `evidence_path` 기록
+- [x] 실패 증거(응답 HTML 일부) 파일 저장과 `evidence_path` 기록 (`SENSING_EVIDENCE_DIR`/날짜/, 30일 보관)
 - [ ] 관리자용 처리 대기 큐 API (`/api/v1/review-queue`)
 - [ ] 실제 사이트 10곳으로 자동 탐색 성공률 측정 (목표 8곳)
 

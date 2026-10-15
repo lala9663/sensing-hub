@@ -64,7 +64,8 @@ def main(argv: list[str] | None = None) -> None:
     throttle = DbThrottle(settings.db_url, settings.min_interval_seconds) if settings.shared_throttle else None
     fetcher = PoliteFetcher(settings, throttle=throttle)
     runner = JobRunner(store, fetcher, settings)
-    log.info("worker %s started", settings.worker_id)
+    pruned = runner.evidence.prune()
+    log.info("worker %s started (evidence dirs pruned: %s)", settings.worker_id, pruned)
     try:
         while True:
             status = process_one(store, runner, settings)

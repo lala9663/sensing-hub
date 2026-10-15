@@ -32,6 +32,8 @@ CHALLENGE_MARKERS = (
     "are you a robot", "verify you are human", "자동입력 방지", "보안 문자",
 )
 LOGIN_URL_RE = re.compile(r"(login|signin|sign-in|auth/|member/log)", re.I)
+# 실패 증거로 남길 응답 본문 길이 (문자)
+EVIDENCE_CHARS = 20000
 
 
 @dataclass
@@ -165,20 +167,22 @@ class PoliteFetcher:
                 if attempt < self.s.max_retries:
                     self._backoff(attempt)
                     continue
+                evidence = page.text[:EVIDENCE_CHARS]
                 if _has_challenge(page.text):
-                    raise CrawlFailure(Code.BOT_CHALLENGE, url=url, http_status=page.status, evidence=page.text[:2000])
-                raise CrawlFailure(Code.HTTP_5XX, url=url, http_status=page.status, retryable=True)
+                    raise CrawlFailure(Code.BOT_CHALLENGE, url=url, http_status=page.status, evidence=evidence)
+                raise CrawlFailure(Code.HTTP_5XX, url=url, http_status=page.status, retryable=True, evidence=evidence)
+            evidence = page.text[:EVIDENCE_CHARS]
             if page.status == 429:
-                raise CrawlFailure(Code.RATE_LIMITED, url=url, http_status=429)
+                raise CrawlFailure(Code.RATE_LIMITED, url=url, http_status=429, evidence=evidence)
             if page.status in (401, 403):
                 code = Code.LOGIN_REQUIRED if page.status == 401 else Code.BOT_CHALLENGE
-                raise CrawlFailure(code, url=url, http_status=page.status, evidence=page.text[:2000])
+                raise CrawlFailure(code, url=url, http_status=page.status, evidence=evidence)
             if page.status >= 400:
-                raise CrawlFailure(Code.HTTP_4XX, url=url, http_status=page.status)
+                raise CrawlFailure(Code.HTTP_4XX, url=url, http_status=page.status, evidence=evidence)
             if _has_challenge(page.text):
-                raise CrawlFailure(Code.BOT_CHALLENGE, url=url, http_status=page.status, evidence=page.text[:2000])
+                raise CrawlFailure(Code.BOT_CHALLENGE, url=url, http_status=page.status, evidence=evidence)
             if _looks_like_login(page.text):
-                raise CrawlFailure(Code.LOGIN_REQUIRED, url=url, http_status=page.status)
+                raise CrawlFailure(Code.LOGIN_REQUIRED, url=url, http_status=page.status, evidence=evidence)
             return page
 
     def _read_limited(self, resp: httpx.Response) -> bytes:

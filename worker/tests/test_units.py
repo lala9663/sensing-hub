@@ -6,6 +6,7 @@ import pytest
 from sensing_worker.codes import Code, CrawlFailure
 from sensing_worker.config import Settings
 from sensing_worker.discovery import Discoverer, canonical_article_url, matches, signature
+from sensing_worker.evidence import EvidenceStore
 from sensing_worker.extract import Article, extract_article
 from sensing_worker.fetcher import PoliteFetcher
 from sensing_worker.policy import defaults_for, guess_site_type, passes_quality
@@ -140,3 +141,24 @@ def test_local_throttle_reserves_slots_per_domain():
     assert 19.9 < t.reserve("a.com") <= 20
     assert t.reserve("b.com") == 0
     assert throttle_key("WWW.News.Example.COM.") == "news.example.com"
+
+
+def test_evidence_store_writes_relative_path_and_prunes(tmp_path):
+    store = EvidenceStore(str(tmp_path), retention_days=30)
+    assert store.save(1, CrawlFailure(Code.TIMEOUT, url="https://a.com")) is None   # 본문 없으면 남기지 않음
+    rel = store.save(7, CrawlFailure(Code.BOT_CHALLENGE, url="https://a.com/x--y", http_status=403,
+                                     evidence="<html>challenge</html>"))
+    assert rel and rel.split("/")[1].startswith("job7-bot_challenge-")
+    text = (tmp_path / rel).read_text(encoding="utf-8")
+    assert text.endswith("<html>challenge</html>") and "x%2D%2Dy" in text and "http_status: 403" in text
+    (tmp_path / "20000101").mkdir()
+    assert store.prune() == 1 and (tmp_path / rel).exists()
+
+
+def test_http_errors_carry_evidence():
+    def handler(request):
+        return httpx.Response(404, text="<html>gone</html>")
+    f = PoliteFetcher(Settings(min_interval_seconds=0, allow_private_hosts=True), transport=httpx.MockTransport(handler))
+    with pytest.raises(CrawlFailure) as e:
+        f.get("https://a.example/x")
+    assert e.value.code == Code.HTTP_4XX and e.value.evidence == "<html>gone</html>"

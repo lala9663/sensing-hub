@@ -36,8 +36,9 @@ public class SourceService {
                          OffsetDateTime startedAt, OffsetDateTime finishedAt) {
     }
 
+    /** evidencePath: 워커 증거 폴더(SENSING_EVIDENCE_DIR) 기준 상대 경로. 증거가 없으면 null. */
     public record ErrorRow(long jobId, String url, String stage, String code, Integer httpStatus, String message,
-                           OffsetDateTime createdAt) {
+                           String evidencePath, OffsetDateTime createdAt) {
     }
 
     public record ConfigRow(long id, int version, String status, String changeNote, String config,
@@ -89,12 +90,12 @@ public class SourceService {
                         rs.getString(4), (Integer) rs.getObject(5), rs.getInt(6), rs.getInt(7), rs.getInt(8),
                         rs.getObject(9, OffsetDateTime.class), rs.getObject(10, OffsetDateTime.class))).list();
         List<ErrorRow> errors = jdbc.sql("""
-                SELECT e.job_id, e.url, e.stage, e.code, e.http_status, e.message, e.created_at
+                SELECT e.job_id, e.url, e.stage, e.code, e.http_status, e.message, e.evidence_path, e.created_at
                 FROM crawl_error e JOIN crawl_job j ON j.id = e.job_id
                 WHERE j.source_id = ? ORDER BY e.id DESC LIMIT 20
                 """).param(id).query((rs, n) -> new ErrorRow(rs.getLong(1), rs.getString(2), rs.getString(3),
-                        rs.getString(4), (Integer) rs.getObject(5), rs.getString(6),
-                        rs.getObject(7, OffsetDateTime.class))).list();
+                        rs.getString(4), (Integer) rs.getObject(5), rs.getString(6), rs.getString(7),
+                        rs.getObject(8, OffsetDateTime.class))).list();
         List<ConfigRow> configs = jdbc.sql("""
                 SELECT id, version, status, change_note, config::text, created_at
                 FROM source_config_version WHERE source_id = ? ORDER BY version DESC

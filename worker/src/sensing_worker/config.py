@@ -42,4 +42,6 @@ class Settings:
     anomaly_broken_after: int = field(default_factory=lambda: int(os.getenv("SENSING_ANOMALY_BROKEN_AFTER", "2")))
     # 테스트에서만 켠다: 사설 IP·localhost 접속 허용
     allow_private_hosts: bool = field(default_factory=lambda: _bool("SENSING_ALLOW_PRIVATE_HOSTS", False))
+    # 실패 증거(응답 HTML 일부) 저장 위치와 보관 기간
     evidence_dir: str = field(default_factory=lambda: os.getenv("SENSING_EVIDENCE_DIR", "./data/evidence"))
+    evidence_retention_days: int = field(default_factory=lambda: int(os.getenv("SENSING_EVIDENCE_DAYS", "30")))

@@ -10,8 +10,9 @@ from .codes import Code, CrawlFailure, MESSAGES
 from .config import Settings
 from .db import Job, Store, sha256
 from .discovery import Discoverer, canonical_article_url, looks_like_feed, matches, parse_feed, parse_sitemap, same_site
+from .evidence import EvidenceStore
 from .extract import extract_article, links
-from .fetcher import PoliteFetcher
+from .fetcher import EVIDENCE_CHARS, PoliteFetcher
 from .policy import defaults_for, guess_site_type, passes_quality
 
 log = logging.getLogger(__name__)
@@ -28,10 +29,16 @@ class CrawlStats:
 
 
 class JobRunner:
-    def __init__(self, store: Store, fetcher: PoliteFetcher, settings: Settings):
+    def __init__(self, store: Store, fetcher: PoliteFetcher, settings: Settings,
+                 evidence: EvidenceStore | None = None):
         self.db = store
         self.f = fetcher
         self.s = settings
+        self.evidence = evidence or EvidenceStore(settings.evidence_dir, settings.evidence_retention_days)
+
+    def _record(self, job: Job, failure: CrawlFailure) -> None:
+        """실패를 기록한다. 응답 본문이 붙어 있으면 증거 파일로 남기고 경로를 함께 적는다."""
+        self.db.record_error(job.id, failure, self.evidence.save(job.id, failure))
 
     def run(self, job: Job) -> str:
         source = self.db.load_source(job.source_id)
@@ -42,7 +49,7 @@ class JobRunner:
                 return self._crawl_job(job, source)
             raise CrawlFailure(Code.UNEXPECTED, f"지원하지 않는 작업 유형: {job.job_type}")
         except CrawlFailure as failure:
-            self.db.record_error(job.id, failure)
+            self._record(job, failure)
             self._apply_failure(job, source, failure)
             self.db.finish_job(job.id, "FAILED", errors=1)
             return "FAILED"
@@ -129,8 +136,10 @@ class JobRunner:
 
         # 허브에서 기사 후보 모으기
         candidates: list[str] = []
+        first_hub_html: str | None = None
         for hub in config["hubs"]:
             page = self.f.get(hub)
+            first_hub_html = first_hub_html if first_hub_html is not None else page.text
             if looks_like_feed(page.text):
                 urls = parse_feed(page.text)
             elif page.text.lstrip().startswith("<?xml") and "<urlset" in page.text[:2000]:
@@ -142,15 +151,17 @@ class JobRunner:
         candidates = list(dict.fromkeys(candidates))
         stats.found = len(candidates)
 
+        hub_evidence = (first_hub_html or "")[:EVIDENCE_CHARS] or None
         if not candidates:
-            raise CrawlFailure(Code.PARSE_EMPTY, url=config["hubs"][0] if config["hubs"] else None, stage="LIST")
+            raise CrawlFailure(Code.PARSE_EMPTY, url=config["hubs"][0] if config["hubs"] else None, stage="LIST",
+                               evidence=hub_evidence)
 
         # 조용한 실패 감지 1: 허브에 보이는 기사 후보가 평소보다 크게 줄었다 (일부 섹션만 개편 등)
         baseline = self.db.found_baseline(job.source_id, source.get("active_config_version_id"))
         if baseline and stats.found < baseline * self.s.anomaly_drop_ratio:
-            self.db.record_error(job.id, CrawlFailure(
+            self._record(job, CrawlFailure(
                 Code.ANOMALY_DROP, f"기사 후보가 {stats.found}건으로 평소({baseline:.1f}건)보다 크게 줄었습니다.",
-                url=config["hubs"][0], stage="LIST"))
+                url=config["hubs"][0], stage="LIST", evidence=hub_evidence))
             stats.errors += 1
             stats.anomalies += 1
 
@@ -159,6 +170,7 @@ class JobRunner:
         fresh = [u for h, u in hashes.items() if h not in known][: self.s.max_articles_per_run]
 
         scope = config.get("store_scope", "FULL")
+        missing_sample: tuple[str, str] | None = None  # 제목·발행일을 못 찾은 첫 페이지 (증거용)
         for url in fresh:
             try:
                 page = self.f.get(url)
@@ -166,12 +178,13 @@ class JobRunner:
                 if e.blocking:
                     raise
                 e.stage = "DETAIL"
-                self.db.record_error(job.id, e)
+                self._record(job, e)
                 stats.errors += 1
                 continue
             art = extract_article(page.text, page.url, config.get("selectors"))
             if not art.title or not art.published_at:
                 stats.field_missing += 1
+                missing_sample = missing_sample or (page.url, page.text[:EVIDENCE_CHARS])
             doc_id, result = self.db.upsert_document(
                 source_id=job.source_id, job_id=job.id, url=url, title=art.title, author=art.author,
                 section=art.section, published_at=art.published_at,
@@ -186,9 +199,9 @@ class JobRunner:
 
         # 조용한 실패 감지 2: 필드가 절반 넘게 비면 상세 페이지 구조 변경 의심
         if fresh and stats.field_missing > len(fresh) / 2:
-            self.db.record_error(job.id, CrawlFailure(
+            self._record(job, CrawlFailure(
                 Code.ANOMALY_DROP, f"새 기사 {len(fresh)}건 중 {stats.field_missing}건에서 제목·발행일을 찾지 못했습니다.",
-                url=config["hubs"][0], stage="EXTRACT"))
+                url=missing_sample[0], stage="EXTRACT", evidence=missing_sample[1]))
             stats.errors += 1
             stats.anomalies += 1
         return stats

@@ -26,14 +26,14 @@ pytestmark = pytest.mark.skipif(not DSN, reason="SENSING_TEST_DSN not set")
 
 
 @pytest.fixture()
-def env():
+def env(tmp_path):
     with psycopg.connect(DSN, autocommit=True) as c:
         c.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
         # Flyway와 같은 순서(V1, V2, ...)로 적용한다
         for path in sorted(MIGRATIONS.glob("V*__*.sql"), key=lambda p: int(p.name[1:].split("__")[0])):
             c.execute(path.read_text(encoding="utf-8"))
     settings = Settings(db_url=DSN, min_interval_seconds=0, max_retries=1, allow_private_hosts=True,
-                        worker_id="test-worker")
+                        worker_id="test-worker", evidence_dir=str(tmp_path / "evidence"))
     store = Store(DSN)
     fetcher = PoliteFetcher(settings)
     runner = JobRunner(store, fetcher, settings)
@@ -126,7 +126,11 @@ def test_bot_challenge_site_is_rejected_and_blocked(env):
     assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "BLOCKED"
     reg = q(store, "SELECT status, result_message FROM registration_request")
     assert reg["status"] == "REJECTED" and "봇 확인" in reg["result_message"]
-    assert q(store, "SELECT code FROM crawl_error")["code"] == "BOT_CHALLENGE"
+    err = q(store, "SELECT code, evidence_path FROM crawl_error")
+    assert err["code"] == "BOT_CHALLENGE"
+    saved = pathlib.Path(settings.evidence_dir) / err["evidence_path"]   # 차단 화면을 증거로 남긴다
+    assert "cf-browser-verification" in saved.read_text(encoding="utf-8")
+    assert "code: BOT_CHALLENGE" in saved.read_text(encoding="utf-8")
 
 
 def test_robots_disallowed_site_is_rejected(env):
@@ -161,6 +165,8 @@ def test_structure_change_marks_source_broken(env):
     assert process_one(store, runner, settings) == "FAILED"
     src = q(store, "SELECT status, status_reason, consecutive_failures FROM source WHERE id = %s", source_id)
     assert src["status"] == "BROKEN" and src["status_reason"] == "PARSE_EMPTY" and src["consecutive_failures"] == 1
+    err = q(store, "SELECT evidence_path FROM crawl_error WHERE code = 'PARSE_EMPTY'")
+    assert "/article/2026/1" in (pathlib.Path(settings.evidence_dir) / err["evidence_path"]).read_text(encoding="utf-8")
 
 
 def test_only_one_worker_gets_a_job(env):
