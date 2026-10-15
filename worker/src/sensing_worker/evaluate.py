@@ -22,9 +22,8 @@ from urllib.parse import urlsplit
 
 from .codes import CrawlFailure
 from .config import Settings
-from .discovery import Discoverer
 from .fetcher import PoliteFetcher
-from .jobs import check_quality, probe_site
+from .jobs import discover, probe_site
 
 # 온보딩 결과와 같은 분류: OK(자동 등록) | REVIEW(관리자 큐) | BLOCKED(등록 불가) | ERROR(그 밖의 실패)
 REVIEW_CODES = {"DISCOVERY_FAILED", "QUALITY_FAILED"}
@@ -56,10 +55,9 @@ def evaluate_site(url: str, settings: Settings) -> SiteResult:
     try:
         probe = probe_site(fetcher, domain, base_url)
         result.site_type = probe.site_type
-        found = Discoverer(fetcher, domain, base_url).run()  # 온보딩과 같은 탐색 한도
+        found, result.quality = discover(fetcher, domain, base_url, probe.site_type)  # 온보딩과 같은 판단
         result.method, result.hubs = found.method, len(found.hubs)
         result.pattern = found.article_pattern.get("signature") or found.article_pattern.get("path")
-        result.quality = check_quality(fetcher, found, base_url)
         result.outcome = "OK"
     except CrawlFailure as e:
         result.code, result.message = e.code.value, str(e)

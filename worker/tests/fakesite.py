@@ -111,3 +111,64 @@ def blocked_site_routes() -> dict:
 def robots_blocked_routes() -> dict:
     return {"/": (200, "text/html", "<html><body>hi</body></html>"),
             "/robots.txt": (200, "text/plain", "User-agent: *\nDisallow: /\n")}
+
+
+def _sdate(days_ago: float) -> str:
+    """공공기관 목록 행에 흔한 "2026. 10. 15" 형식"""
+    d = datetime.now(timezone(timedelta(hours=9))) - timedelta(days=days_ago)
+    return d.strftime("%Y. %m. %d")
+
+
+def gov_cms_routes() -> dict:
+    """공공기관 CMS(산업부형): 사이트맵에는 게시판·콘텐츠 페이지만 있고 글은 섹션 안에만 보인다.
+    og:title은 사이트 이름이고, 글 제목은 .detail-tit, 등록일은 <li><em>등록일</em><span>날짜</span></li>에 있다."""
+    boards = {"ATCL3f49a5a8c": "보도자료", "ATCL369bcdf07": "알림/소식", "ATCLe0854704d": "참고자료"}
+    nav = "".join(f'<a href="/kor/article/{b}">{n}</a>' for b, n in boards.items())
+    head = ('<head><title>테스트부</title><meta property="og:title" content="테스트부">'
+            '<meta property="og:site_name" content="테스트부"></head>')
+    home = f'<html>{head}<body><nav>{nav}<a href="/kor/contents/49">조직도</a><a href="/kor/contents/91">정책Q&amp;A</a></nav></body></html>'
+    sitemap = ("<?xml version='1.0'?><urlset>"
+               + "".join(f"<url><loc>{{base}}/kor/article/{b}</loc><lastmod>2026-10-15</lastmod></url>" for b in boards)
+               + "".join(f"<url><loc>{{base}}/kor/contents/{i}</loc><lastmod>2026-10-14</lastmod></url>" for i in (49, 91, 99))
+               + "</urlset>")
+    routes = {"/": (200, "text/html; charset=utf-8", home),
+              "/robots.txt": (200, "text/plain", "User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n"),
+              "/sitemap.xml": (200, "application/xml", sitemap)}
+    for b, name in boards.items():
+        rows = "".join(f'<tr><td><a href="/kor/article/{b}/{1000 + i}/view?mno=&amp;pageIndex=1">{name} {i}번</a></td>'
+                       f"<td>{_kdate(i)}</td></tr>" for i in range(1, 7))
+        routes[f"/kor/article/{b}"] = (200, "text/html; charset=utf-8",
+                                       f'<html><head><title>{name} &lt; 테스트부</title><meta property="og:title" content="테스트부"></head>'
+                                       f"<body><nav>{nav}</nav><table><tr><th>제목</th><th>등록일</th></tr>{rows}</table></body></html>")
+        for i in range(1, 7):
+            routes[f"/kor/article/{b}/{1000 + i}/view"] = (200, "text/html; charset=utf-8", f"""<html>{head}<body>
+            <h1>테스트부</h1><article><div class="board-detail"><div class="detail-tit"><span>{name} {i}번 안내</span></div>
+            <div class="detail-info"><ul><li><em>담당자</em><span>홍길동</span></li><li><em>등록일</em><span>{_kdate(i)}</span></li>
+            <li class="info-down"><em>첨부파일</em><a href="/attach/down/abc{i}">자료_{i}.pdf [100 KB]</a></li></ul></div>
+            <div class="detail-cont"><p>{BODY}</p></div></div></article></body></html>""")
+    return routes
+
+
+def gov_board_js_routes() -> dict:
+    """공공기관 게시판(과기부형): 목록 페이지는 스크립트로 그려져 링크가 없고, 홈 행에만 날짜가 보인다.
+    상세에는 제목(.view_head h2)과 짧은 안내문뿐이고 내용은 스크립트로 내려받는 HWP 첨부에 있다."""
+    posts = range(3187801, 3187807)
+    rows = "".join(f'<li><a href="/bbs/view.do?sCode=user&amp;mId=307&amp;bbsSeqNo=94&amp;nttSeqNo={n}">보도자료 {n}</a>'
+                   f"<span>{_sdate(i)}</span></li>" for i, n in enumerate(posts))
+    home = ("<html><head><title>테스트청</title></head><body>"
+            '<nav><a href="/bbs/list.do?sCode=user&amp;mId=307">보도자료</a></nav>'
+            f'<ul class="swiper"><li class="swiper-slide"><a href="/bbs/view.do?sCode=user&amp;mId=307&amp;bbsSeqNo=94&amp;nttSeqNo={posts[0]}">배너</a></li></ul>'
+            f"<ul>{rows}</ul></body></html>")
+    routes = {"/": (200, "text/html; charset=utf-8", home),
+              "/robots.txt": (404, "text/plain", ""),
+              "/bbs/list.do": (200, "text/html; charset=utf-8", "<html><body><div id='list'></div><script>load()</script></body></html>")}
+    for n in posts:
+        # 정규 주소는 쿼리 키를 정렬하므로 경로 키도 그 순서로 둔다
+        routes[f"/bbs/view.do?bbsSeqNo=94&mId=307&nttSeqNo={n}&sCode=user"] = (200, "text/html; charset=utf-8", f"""<html>
+        <head><title>보도자료 - 테스트청</title></head><body><div class="board_view"><div class="view_head">
+        <h2>보도자료 {n}번 제목입니다</h2><div class="meta"><dl><dt>부서</dt><dd>홍보과</dd></dl></div></div>
+        <div class="board_notcon">보도자료 내용입니다. 자세한 내용은 첨부파일을 참고하시기 바랍니다.</div>
+        <div class="view_file"><ul><li><a class="ico_file_hwp" title="파일명">자료_{n}.hwpx</a>
+        <span><a class="down" href="javascript:void(0);" onclick="fn_download('{n}', '1', 'hwpx');">다운로드</a></span></li></ul></div>
+        </div></body></html>""")
+    return routes

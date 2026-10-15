@@ -9,10 +9,10 @@ from urllib.parse import urlsplit
 from .codes import Code, CrawlFailure, MESSAGES
 from .config import Settings
 from .db import Job, Store, sha256
-from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, matches, parse_feed,
-                        parse_sitemap, same_site)
+from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, looks_like_sitemap,
+                        matches, parse_feed_entries, same_site, sitemap_urls)
 from .evidence import EvidenceStore
-from .extract import extract_article, links
+from .extract import extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, PoliteFetcher
 from .policy import defaults_for, guess_site_type, passes_quality
 
@@ -67,13 +67,10 @@ class JobRunner:
         self.db.update_site(source["site_id"], robots_status=probe.robots, site_type=site_type,
                             ai_restricted=probe.ai_blocked, risk_flags={"ai_bots_blocked": probe.ai_blocked})
 
-        # 2) 자동 탐색
-        self.db.update_registration(job.source_id, step="DISCOVERY", message="기사 입구와 기사 주소 패턴을 찾는 중입니다.")
-        result = Discoverer(self.f, domain, base_url).run()
-
-        # 3) 품질 검사 (샘플 5건)
-        self.db.update_registration(job.source_id, step="QUALITY", message="샘플 기사로 품질을 검사하는 중입니다.")
-        detail = check_quality(self.f, result, base_url)
+        # 2) 자동 탐색 + 3) 품질 검사: 후보를 유력한 순서로 샘플 검사해 첫 합격을 쓴다
+        self.db.update_registration(job.source_id, step="DISCOVERY",
+                                    message="기사 입구와 주소 패턴을 찾고 샘플 기사로 품질을 검사하는 중입니다.")
+        result, detail = discover(self.f, domain, base_url, site_type)
 
         # 4) 기본값 적용 → 설정 새 버전 → ACTIVE
         defaults = defaults_for(site_type)
@@ -118,22 +115,27 @@ class JobRunner:
     def _crawl(self, job: Job, source: dict, config: dict) -> CrawlStats:
         stats = CrawlStats()
         pattern = config["article_pattern"]
-        domain = source["domain"]
+        domain = config.get("site_domain") or source["domain"]
 
         # 허브에서 기사 후보 모으기
         candidates: list[str] = []
+        hints: dict[str, str] = {}  # 기사 URL → 목록·피드에 보인 날짜 (상세에 날짜가 없을 때 씀)
         first_hub_html: str | None = None
         for hub in config["hubs"]:
             page = self.f.get(hub)
             first_hub_html = first_hub_html if first_hub_html is not None else page.text
             if looks_like_feed(page.text):
-                urls = parse_feed(page.text)
-            elif page.text.lstrip().startswith("<?xml") and "<urlset" in page.text[:2000]:
-                urls = parse_sitemap(page.text)[0]
+                entries = parse_feed_entries(page.text)
+            elif looks_like_sitemap(page.text):
+                entries = [(u, None) for u in sitemap_urls(self.f.get, page.text)[: self.s.max_articles_per_run * 3]]
             else:
-                urls = links(page.text, page.url)
-            candidates += [canonical_article_url(u, pattern) for u in urls
-                           if same_site(u, domain) and matches(u, pattern)]
+                entries = links_with_dates(page.text, page.url)
+            for u, date in entries:
+                if same_site(u, domain) and matches(u, pattern):
+                    c = canonical_article_url(u, pattern)
+                    candidates.append(c)
+                    if date and c not in hints:
+                        hints[c] = date
         candidates = list(dict.fromkeys(candidates))
         stats.found = len(candidates)
 
@@ -167,7 +169,7 @@ class JobRunner:
                 self._record(job, e)
                 stats.errors += 1
                 continue
-            art = extract_article(page.text, page.url, config.get("selectors"))
+            art = extract_article(page.text, page.url, config.get("selectors"), date_hint=hints.get(url))
             if not art.title or not art.published_at:
                 stats.field_missing += 1
                 missing_sample = missing_sample or (page.url, page.text[:EVIDENCE_CHARS])
@@ -236,21 +238,52 @@ def probe_site(f: PoliteFetcher, domain: str, base_url: str) -> Probe:
     return Probe(robots, ai_blocked, guess_site_type(domain, home.text))
 
 
-def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str) -> str:
-    """샘플 5건으로 품질 검사. 통과하면 설명을 돌려주고, 아니면 QUALITY_FAILED."""
+def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site_type: str = "ETC") -> str:
+    """샘플 5건으로 품질 검사. 통과하면 설명을 돌려주고, 아니면 QUALITY_FAILED.
+
+    언론사가 아니면 본문 대신 첨부(보도자료 HWP·PDF)가 있어도 샘플로 인정한다.
+    """
     samples = []
     for url in result.sample_urls[:5]:
         try:
             page = f.get(url)
-            samples.append(extract_article(page.text, page.url))
+            samples.append(extract_article(page.text, page.url, date_hint=result.sample_dates.get(url)))
         except CrawlFailure as e:
             if e.blocking:
                 raise
-    ok, detail = passes_quality(samples)
+    ok, detail = passes_quality(samples, attachments_ok=site_type != "NEWS")
     if not ok:
         raise CrawlFailure(Code.QUALITY_FAILED, f"{MESSAGES[Code.QUALITY_FAILED]} ({detail})",
                            url=base_url, stage="DISCOVERY")
     return detail
+
+
+def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str,
+             max_tries: int = 6) -> tuple[DiscoveryResult, str]:
+    """자동 탐색 후보를 유력한 순서로 품질 검사해 첫 합격 (결과, 검사 설명)을 돌려준다.
+
+    후보가 하나도 없으면 DISCOVERY_FAILED, 있었지만 모두 불합격이면 첫 후보의 QUALITY_FAILED를 낸다.
+    """
+    tried: set[str] = set()
+    first_failure: CrawlFailure | None = None
+    for result in Discoverer(f, domain, base_url).candidates():
+        sig = result.article_pattern.get("signature") or result.article_pattern["path"]
+        if sig in tried:
+            continue
+        tried.add(sig)
+        try:
+            return result, check_quality(f, result, base_url, site_type)
+        except CrawlFailure as e:
+            if e.code != Code.QUALITY_FAILED:
+                raise
+            log.info("discovery candidate rejected domain=%s method=%s pattern=%s: %s", domain, result.method, sig, e)
+            first_failure = first_failure or e
+        if len(tried) >= max_tries:
+            break
+    if first_failure:
+        raise CrawlFailure(Code.QUALITY_FAILED, f"{first_failure} [후보 {len(tried)}개 검사]",
+                           url=base_url, stage="DISCOVERY")
+    raise CrawlFailure(Code.DISCOVERY_FAILED, stage="DISCOVERY", url=base_url)
 
 
 def host_of(url: str) -> str:

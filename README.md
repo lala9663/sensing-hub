@@ -136,11 +136,12 @@ M1에서 바로 할 일:
 - [x] 실패 증거(응답 HTML 일부) 파일 저장과 `evidence_path` 기록 (`SENSING_EVIDENCE_DIR`/날짜/, 30일 보관)
 - [x] 관리자용 처리 대기 큐 API (`/api/v1/review-queue`: 승인 대기·REVIEW·BROKEN·BLOCKED를 우선순위순으로)
 - [x] 실제 사이트 10곳으로 자동 탐색 성공률 측정 도구 (`sensing-discovery-eval`, 표본 `docs/eval-sites.txt`)
-- [ ] 자동 탐색 성공률 목표 8/10 달성 — 2026-10-16 첫 측정 **6/10** (`docs/eval-result.json`)
-  - 공공기관 2곳(msit, motie) `DISCOVERY_FAILED`: RSS·사이트맵이 없고 게시판 링크 패턴을 못 잡음
-  - korea.kr `QUALITY_FAILED`: 사이트맵에서 오래된 글만 샘플로 뽑힘 (최근 30일 글 없음)
-  - daily.hankooki.com `BOT_CHALLENGE`: 봇 확인 화면 → 원칙대로 우회하지 않음 (측정 분모에서 뺄지 결정 필요)
-  - hankyung.com이 `ETC`로 분류됨 → 언론사인데 본문까지 저장하게 됨 (사이트 유형 판정 보강 필요)
+- [x] 자동 탐색 성공률 목표 8/10 달성 — 2026-10-16 **9/10** (첫 측정 6/10, `docs/eval-result.json`)
+  - 남은 1곳 daily.hankooki.com은 봇 확인 화면(`BOT_CHALLENGE`) → 원칙대로 우회하지 않음
+  - 6 → 9로 올린 변경: 홈이 스크립트로 넘기는 사이트 따라가기, 다른 호스트로 넘어가면 그곳을 사이트로 보기,
+    영숫자 식별자(`ATCL6fd477428`) 패턴화, 사이트맵 `lastmod` 최신순, 메뉴 이름(보도자료·공지)으로 게시판 찾기,
+    후보를 유력한 순서로 품질 검사해 첫 합격 채택, 목록 행의 날짜를 상세에 넘기기, 게시판 제목·등록일·스크립트 첨부 추출,
+    자기 하위 페이지로 링크하는 목록 페이지는 기사로 보지 않기, 공공기관은 본문 대신 첨부가 있어도 통과
 
 ## 원칙
 

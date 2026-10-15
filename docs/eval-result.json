@@ -1,42 +1,42 @@
 [
   {
     "url": "https://www.korea.kr",
-    "outcome": "REVIEW",
-    "code": "QUALITY_FAILED",
-    "message": "기사 내용을 충분히 추출하지 못했습니다. 관리자가 확인합니다. (최근 30일 안에 발행된 글이 없습니다.)",
-    "site_type": "ETC",
+    "outcome": "OK",
+    "code": null,
+    "message": null,
+    "site_type": "PUBLIC",
     "method": "SITEMAP",
     "hubs": 1,
-    "pattern": "/multi/visualNewsView.do?newsId={n}",
-    "quality": null,
-    "requests": 18,
-    "seconds": 34.5
+    "pattern": "/briefing/pressReleaseView.do?newsId={n}",
+    "quality": "샘플 5건 중 5건 통과",
+    "requests": 19,
+    "seconds": 36.9
   },
   {
     "url": "https://www.msit.go.kr",
-    "outcome": "REVIEW",
-    "code": "DISCOVERY_FAILED",
-    "message": "기사 목록을 자동으로 찾지 못했습니다. 관리자가 확인합니다.",
+    "outcome": "OK",
+    "code": null,
+    "message": null,
     "site_type": "PUBLIC",
-    "method": null,
-    "hubs": 0,
-    "pattern": null,
-    "quality": null,
-    "requests": 9,
-    "seconds": 16.0
+    "method": "STATIC",
+    "hubs": 6,
+    "pattern": "/bbs/view.do?bbsSeqNo={n}&mId={n}&mPid={n}&nttSeqNo={n}&sCode=*",
+    "quality": "샘플 5건 중 5건 통과",
+    "requests": 21,
+    "seconds": 40.3
   },
   {
     "url": "https://www.motie.go.kr",
-    "outcome": "REVIEW",
-    "code": "DISCOVERY_FAILED",
-    "message": "기사 목록을 자동으로 찾지 못했습니다. 관리자가 확인합니다.",
+    "outcome": "OK",
+    "code": null,
+    "message": null,
     "site_type": "PUBLIC",
-    "method": null,
-    "hubs": 0,
-    "pattern": null,
-    "quality": null,
-    "requests": 23,
-    "seconds": 26.2
+    "method": "STATIC",
+    "hubs": 16,
+    "pattern": "/kor/article/{id}/{n}/view?mno=*",
+    "quality": "샘플 5건 중 5건 통과",
+    "requests": 40,
+    "seconds": 72.2
   },
   {
     "url": "https://www.yna.co.kr",
@@ -46,7 +46,7 @@
     "site_type": "NEWS",
     "method": "SITEMAP",
     "hubs": 1,
-    "pattern": "/view/AKR{n}",
+    "pattern": "/view/{id}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 15,
     "seconds": 28.1
@@ -56,13 +56,13 @@
     "outcome": "OK",
     "code": null,
     "message": null,
-    "site_type": "ETC",
+    "site_type": "NEWS",
     "method": "RSS",
     "hubs": 5,
     "pattern": "/article/{n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 13,
-    "seconds": 24.1
+    "seconds": 24.2
   },
   {
     "url": "https://www.etnews.com",
@@ -75,7 +75,7 @@
     "pattern": "/{n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 21,
-    "seconds": 36.2
+    "seconds": 36.3
   },
   {
     "url": "https://zdnet.co.kr",
@@ -101,7 +101,7 @@
     "pattern": "/page/view/{n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 12,
-    "seconds": 22.2
+    "seconds": 22.3
   },
   {
     "url": "https://daily.hankooki.com",
@@ -114,7 +114,7 @@
     "pattern": null,
     "quality": null,
     "requests": 7,
-    "seconds": 12.1
+    "seconds": 12.0
   },
   {
     "url": "https://www.bloter.net",
@@ -127,6 +127,6 @@
     "pattern": "/news/articleView.html?idxno={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 10,
-    "seconds": 14.1
+    "seconds": 14.2
   }
 ]

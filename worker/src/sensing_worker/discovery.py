@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
 from .codes import Code, CrawlFailure
-from .extract import feed_links, links
+from .extract import feed_links, links, links_with_dates
 from .fetcher import PoliteFetcher
 
 COMMON_FEED_PATHS = ("/rss", "/rss.xml", "/feed", "/rss/allArticle.xml", "/rss/S1N1.xml", "/rssIndex.html")
@@ -22,7 +23,12 @@ COMMON_FEED_PATHS = ("/rss", "/rss.xml", "/feed", "/rss/allArticle.xml", "/rss/S
 LIST_HINT = re.compile(r"(list|section|category|catalog|board(?!.*(wr_id|idx|seq|no=|view|detail))|bbs.*list)", re.I)
 # 기사 패턴 후보에서 제외할 목록형 경로
 LIST_PATH = re.compile(r"(list|section|category|catalog)", re.I)
-TRACKING_PARAM = re.compile(r"^(utm_.*|fbclid|gclid|ref|referrer|from|sns|share)$", re.I)
+# 추적용·목록 쪽수 파라미터: 기사를 식별하지 않으므로 서명·정규 주소에서 뺀다
+TRACKING_PARAM = re.compile(r"^(utm_.*|fbclid|gclid|ref|referrer|from|sns|share|page|pageindex|pageno|pagenum)$", re.I)
+# 주소에 list 같은 단서가 없어도 메뉴 이름이 이러면 게시판(섹션)으로 본다 (공공기관 CMS: /kor/article/ATCL…)
+BOARD_NAME_HINT = re.compile(r"(보도|공지|알림|소식|뉴스|자료|브리핑|공고|정책|행사|채용|입찰|발표|news|notice|press)", re.I)
+BOARD_NAME_FIRST = re.compile(r"(보도|press)", re.I)
+BOARD_NAME_SECOND = re.compile(r"(공지|알림|소식|뉴스|공고|news|notice)", re.I)
 SKIP_PATH = re.compile(r"(login|logout|join|member|search|print|rss|mailto|share|comment|reply|tag/|"
                        r"\.(jpg|jpeg|png|gif|css|js|pdf|hwp|hwpx|zip|xlsx?|docx?)$)", re.I)
 # 포토·영상·연예 등 텍스트가 거의 없는 섹션은 기본 제외
@@ -44,18 +50,32 @@ class DiscoveryResult:
     excluded_sections: list[str] = field(default_factory=list)
     sample_urls: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    domain: str = ""                               # 실제 수집 대상 호스트 (홈이 다른 호스트로 넘긴 경우 그곳)
+    sample_dates: dict[str, str] = field(default_factory=dict)  # 샘플 URL → 목록·피드에 보인 날짜 (상세에 없을 때 씀)
 
     def to_config(self) -> dict:
         return {"method": self.method, "hubs": self.hubs, "article_pattern": self.article_pattern,
-                "sections": self.sections, "excluded_sections": self.excluded_sections}
+                "sections": self.sections, "excluded_sections": self.excluded_sections,
+                "site_domain": self.domain}
 
 
 # ---------------------------------------------------------------------- URL 서명
 
+ID_SEGMENT_RE = re.compile(r"^(?=.*\d.*\d.*\d)[A-Za-z0-9_-]{6,}$")  # 숫자 3개 이상 섞인 6자 이상 토큰
+
+
+def _generalize_segment(seg: str) -> str:
+    if seg.isdigit():
+        return "{n}"
+    if ID_SEGMENT_RE.match(seg) and not seg.isalpha():
+        return "{id}"
+    return re.sub(r"\d+", "{n}", seg)
+
+
 def signature(url: str) -> str:
-    """URL을 패턴 서명으로 바꾼다. 숫자는 {n}, 쿼리 값은 숫자면 {n} 아니면 *."""
+    """URL을 패턴 서명으로 바꾼다. 숫자는 {n}, 영숫자 식별자는 {id}, 쿼리 값은 숫자면 {n} 아니면 *."""
     parts = urlsplit(url)
-    path = re.sub(r"\d+", "{n}", parts.path or "/")
+    path = "/".join(_generalize_segment(seg) for seg in (parts.path or "/").split("/"))
     q = sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not TRACKING_PARAM.match(k))
     if q:
         qs = "&".join(f"{k}={'{n}' if v.isdigit() else '*'}" for k, v in q)
@@ -65,7 +85,8 @@ def signature(url: str) -> str:
 
 def pattern_from_signature(sig: str) -> dict:
     path, _, query = sig.partition("?")
-    regex = "^" + re.escape(path).replace(re.escape("{n}"), r"\d+") + "$"
+    regex = ("^" + re.escape(path).replace(re.escape("{n}"), r"\d+")
+             .replace(re.escape("{id}"), r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*") + "$")
     keys = [kv.split("=", 1)[0] for kv in query.split("&") if kv]
     id_keys = [kv.split("=", 1)[0] for kv in query.split("&") if kv.endswith("={n}")]
     return {"path": regex, "query_keys": keys, "id_keys": id_keys, "signature": sig}
@@ -100,6 +121,11 @@ def same_site(url: str, domain: str) -> bool:
 # ---------------------------------------------------------------------- 피드·사이트맵
 
 def parse_feed(xml: str) -> list[str]:
+    return [u for u, _ in parse_feed_entries(xml)]
+
+
+def parse_feed_entries(xml: str) -> list[tuple[str, str | None]]:
+    """(링크, 발행일 문자열 | None)"""
     soup = BeautifulSoup(xml, "xml")
     out = []
     for item in soup.find_all(["item", "entry"]):
@@ -107,17 +133,60 @@ def parse_feed(xml: str) -> list[str]:
         if link is None:
             continue
         href = link.get("href") or link.get_text(strip=True)
-        if href:
-            out.append(href.strip())
+        if not href:
+            continue
+        date = item.find(["pubDate", "published", "updated", "dc:date"])
+        out.append((href.strip(), date.get_text(strip=True) if date else None))
     return out
 
 
 def parse_sitemap(xml: str) -> tuple[list[str], list[str]]:
-    """(기사 후보 URL, 하위 사이트맵 URL)"""
+    """(기사 후보 URL, 하위 사이트맵 URL). 각각 lastmod가 최신인 순서."""
+    urls, children = parse_sitemap_entries(xml)
+    return [u for u, _ in urls], [u for u, _ in children]
+
+
+def parse_sitemap_entries(xml: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """(loc, lastmod) 목록을 최신 순으로. lastmod가 없는 항목은 문서 순서를 지키되 뒤로 보낸다."""
     soup = BeautifulSoup(xml, "xml")
+    entries = []
+    for i, node in enumerate(soup.find_all(["url", "sitemap"])):
+        loc = node.find("loc")
+        if loc is None:
+            continue
+        lastmod = node.find("lastmod")
+        entries.append((loc.get_text(strip=True), lastmod.get_text(strip=True) if lastmod else "", i))
+    entries.sort(key=lambda e: (e[1] == "", -_lastmod_key(e[1]), e[2]))
+    out = [(u, lm) for u, lm, _ in entries]
     if soup.find("sitemapindex"):
-        return [], [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-    return [loc.get_text(strip=True) for loc in soup.find_all("loc")], []
+        return [], out
+    return out, []
+
+
+def _lastmod_key(lastmod: str) -> float:
+    """lastmod 문자열을 비교 가능한 숫자로. 형식이 이상하면 0 (가장 오래된 것으로 취급)."""
+    digits = re.sub(r"\D", "", lastmod)[:14]
+    return float(digits.ljust(14, "0")) if digits else 0.0
+
+
+def looks_like_sitemap(text: str) -> bool:
+    head = text[:3000].lower()
+    return "<urlset" in head or "<sitemapindex" in head
+
+
+def sitemap_urls(get, xml: str, max_children: int = 3) -> list[str]:
+    """사이트맵(또는 인덱스)에서 기사 후보 URL을 최신 순으로. 인덱스면 lastmod가 최신인 하위 사이트맵 몇 개만 연다.
+
+    get: url -> Page | None (탐색은 페이지 한도를 지키는 Discoverer._get, 수집은 fetcher.get)
+    """
+    urls, children = parse_sitemap_entries(xml)
+    out = list(urls)
+    for child, _ in children[:max_children]:
+        page = get(child)
+        if page:
+            out += parse_sitemap_entries(page.text)[0]
+    out.sort(key=lambda e: (e[1] == "", -_lastmod_key(e[1])))
+    return list(dict.fromkeys(u for u, _ in out))
 
 
 def looks_like_feed(text: str) -> bool:
@@ -128,13 +197,14 @@ def looks_like_feed(text: str) -> bool:
 # ---------------------------------------------------------------------- 탐색
 
 class Discoverer:
-    def __init__(self, fetcher: PoliteFetcher, domain: str, base_url: str, max_pages: int = 25):
+    def __init__(self, fetcher: PoliteFetcher, domain: str, base_url: str, max_pages: int = 40):
         self.f = fetcher
         self.domain = domain
         self.base_url = base_url
         self.max_pages = max_pages
         self.pages = 0
         self.notes: list[str] = []
+        self.hints: dict[str, str] = {}  # 후보 URL → 목록·피드에서 본 날짜
 
     def _get(self, url: str):
         if self.pages >= self.max_pages:
@@ -149,10 +219,30 @@ class Discoverer:
             return None
 
     def run(self) -> DiscoveryResult:
+        """가장 유력한 후보 하나. 없으면 DISCOVERY_FAILED."""
+        for result in self.candidates():
+            return result
+        raise CrawlFailure(Code.DISCOVERY_FAILED, stage="DISCOVERY", url=self.base_url)
+
+    def candidates(self) -> Iterator[DiscoveryResult]:
+        """후보를 유력한 순서로 낸다 (RSS → 사이트맵 → 홈·섹션 링크, 단계마다 패턴 몇 개).
+
+        호출자(jobs.discover)가 샘플 품질 검사로 걸러 첫 합격을 쓴다. 사이트맵에 게시판 목록만 있고
+        글은 섹션 안에만 보이는 공공기관 CMS처럼, 첫 후보가 틀렸을 때 다음 후보로 넘어가기 위한 구조다.
+        """
         home = self.f.get(self.base_url)  # 홈은 반드시 열려야 한다
         self.pages += 1
-        home_links = [u for u in links(home.text, home.url) if same_site(u, self.domain)]
+        if not same_site(home.url, self.domain):
+            # 등록한 도메인이 다른 호스트로 넘긴다 (motie.go.kr → motir.go.kr). 넘어간 곳을 사이트로 본다
+            host = (urlsplit(home.url).hostname or "").lower()
+            self.notes.append(f"home redirects to {host}")
+            self.domain = host[4:] if host.startswith("www.") else host
+            self.base_url = f"{urlsplit(home.url).scheme}://{urlsplit(home.url).netloc}"
+        home_entries = [(u, d) for u, d in links_with_dates(home.text, home.url) if same_site(u, self.domain)]
+        self._remember(home_entries)
+        home_links = [u for u, _ in home_entries]
         sections = self._sections(home.text, home.url)
+        excluded = self._excluded(sections)
 
         # 1. RSS
         feeds = self._find_feeds(home.text, home.url)
@@ -161,43 +251,65 @@ class Discoverer:
             for feed in feeds[:5]:
                 page = self._get(feed)
                 if page and looks_like_feed(page.text):
-                    items += [u for u in parse_feed(page.text) if same_site(u, self.domain)]
-            pattern = self._dominant_pattern(items)
-            if pattern:
-                return DiscoveryResult("RSS", feeds[:5], pattern, sections, self._excluded(sections),
-                                       _samples(items, pattern)[:10], self.notes)
+                    entries = [(u, d) for u, d in parse_feed_entries(page.text) if same_site(u, self.domain)]
+                    self._remember(entries)
+                    items += [u for u, _ in entries]
+            for pattern in self._ranked_patterns(items, 2):
+                yield self._result("RSS", feeds[:5], pattern, sections, excluded, items)
 
-        # 2. 사이트맵
+        # 2. 사이트맵 (최신 순: 인덱스면 lastmod가 최신인 하위 사이트맵만 연다)
         for sm in self.f.sitemaps(self.base_url)[:3]:
             page = self._get(sm)
             if not page:
                 continue
-            urls, children = parse_sitemap(page.text)
-            for child in children[-2:]:  # 최신 하위 사이트맵이 보통 뒤에 있다
-                sub = self._get(child)
-                if sub:
-                    urls += parse_sitemap(sub.text)[0]
-            urls = [u for u in urls if same_site(u, self.domain)]
-            pattern = self._dominant_pattern(urls)
-            if pattern:
-                return DiscoveryResult("SITEMAP", [sm], pattern, sections, self._excluded(sections),
-                                       _samples(urls, pattern)[-10:], self.notes)
+            urls = [u for u in sitemap_urls(self._get, page.text) if same_site(u, self.domain)]
+            # 최근 항목 안에서 패턴을 고른다: 오래된 대용량 카테고리가 최신 기사 패턴을 가리지 않게
+            for pattern in self._ranked_patterns(urls[:500], 2):
+                yield self._result("SITEMAP", [sm], pattern, sections, excluded, urls)
 
-        # 3. 홈·섹션 링크 패턴
+        # 3. 홈·섹션 링크
         candidates = list(home_links)
-        kept_sections = [s for s in sections if s["name"] not in self._excluded(sections)]
-        for sec in kept_sections[:8]:
+        kept = [s for s in sections if s["name"] not in excluded]
+        for sec in kept[:8]:
             page = self._get(sec["url"])
             if page:
-                candidates += [u for u in links(page.text, page.url) if same_site(u, self.domain)]
-        pattern = self._dominant_pattern(candidates)
-        if not pattern:
-            raise CrawlFailure(Code.DISCOVERY_FAILED, stage="DISCOVERY", url=self.base_url)
-        hubs = [home.url] + [s["url"] for s in kept_sections[:15]]
-        return DiscoveryResult("STATIC", hubs, pattern, sections, self._excluded(sections),
-                               _samples(candidates, pattern)[:10], self.notes)
+                entries = [(u, d) for u, d in links_with_dates(page.text, page.url) if same_site(u, self.domain)]
+                self._remember(entries)
+                candidates += [u for u, _ in entries]
+        hubs = [home.url] + [s["url"] for s in kept[:15]]
+        for pattern in self._ranked_patterns(candidates, 3):
+            yield self._result("STATIC", hubs, pattern, sections, excluded, candidates)
 
-    # ------------------------------------------------------------------
+    def _remember(self, entries: list[tuple[str, str | None]]) -> None:
+        for url, date in entries:
+            if date and url not in self.hints:
+                self.hints[url] = date
+
+    def _result(self, method: str, hubs: list[str], pattern: dict, sections: list[dict], excluded: list[str],
+                urls: list[str]) -> DiscoveryResult:
+        samples, dates = self._samples(urls, pattern)
+        return DiscoveryResult(method, hubs, pattern, sections, excluded, samples[:10], list(self.notes),
+                               self.domain, dates)
+
+    def _samples(self, urls: list[str], pattern: dict) -> tuple[list[str], dict[str, str]]:
+        """패턴에 맞는 후보(목록에 날짜가 보이는 것부터)와 그 날짜."""
+        seen: set[str] = set()
+        hinted, rest, dates = [], [], {}
+        for u in urls:
+            if not matches(u, pattern):
+                continue
+            c = canonical_article_url(u, pattern)
+            if c in seen:
+                continue
+            seen.add(c)
+            hint = self.hints.get(u)
+            if hint:
+                dates[c] = hint
+                hinted.append(c)
+            else:
+                rest.append(c)
+        return hinted + rest, dates
+
     def _find_feeds(self, html: str, base: str) -> list[str]:
         found = [u for u in feed_links(html, base) if same_site(u, self.domain)]
         if found:
@@ -218,16 +330,22 @@ class Discoverer:
 
     def _sections(self, html: str, base: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
-        out, seen = [], set()
+        by_url, by_name, seen = [], [], set()
         for a in soup.find_all("a", href=True):
             url = urljoin(base, a["href"]).split("#", 1)[0]
             name = a.get_text(" ", strip=True)
-            if not name or len(name) > 20 or not same_site(url, self.domain) or SKIP_PATH.search(urlsplit(url).path):
+            if (not name or len(name) > 20 or url in seen or not same_site(url, self.domain)
+                    or SKIP_PATH.search(urlsplit(url).path)):
                 continue
-            if LIST_HINT.search(url) and url not in seen:
+            if LIST_HINT.search(url):
                 seen.add(url)
-                out.append({"url": url, "name": name})
-        return out[:40]
+                by_url.append({"url": url, "name": name})
+            elif BOARD_NAME_HINT.search(name) and url.rstrip("/") != self.base_url.rstrip("/"):
+                seen.add(url)
+                by_name.append({"url": url, "name": name})
+        # 이름으로 찾은 섹션은 보도자료 → 공지·소식 → 나머지 순으로 연다 (열어 볼 수 있는 수가 제한돼 있다)
+        by_name.sort(key=lambda s: 0 if BOARD_NAME_FIRST.search(s["name"]) else 1 if BOARD_NAME_SECOND.search(s["name"]) else 2)
+        return (by_url + by_name)[:40]
 
     @staticmethod
     def _excluded(sections: list[dict]) -> list[str]:
@@ -235,14 +353,19 @@ class Discoverer:
 
     @staticmethod
     def _dominant_pattern(urls: list[str]) -> dict | None:
-        """링크 묶음에서 기사 상세로 보이는 패턴 하나를 고른다."""
+        ranked = Discoverer._ranked_patterns(urls, 1)
+        return ranked[0] if ranked else None
+
+    @staticmethod
+    def _ranked_patterns(urls: list[str], limit: int = 3) -> list[dict]:
+        """링크 묶음에서 기사 상세로 보이는 패턴을 유력한 순서로 고른다."""
         urls = [u for u in urls if not SKIP_PATH.search(urlsplit(u).path)]
         if not urls:
-            return None
+            return []
         sigs = Counter(signature(u) for u in urls)
         scored: list[tuple[float, str]] = []
         for sig, count in sigs.items():
-            if "{n}" not in sig or count < 3:
+            if ("{n}" not in sig and "{id}" not in sig) or count < 3:
                 continue
             path = sig.split("?", 1)[0]
             if LIST_PATH.search(path) and not any(sig.startswith(k.split("?")[0]) for k in KNOWN_ARTICLE_SIGNATURES):
@@ -253,14 +376,8 @@ class Discoverer:
             if re.search(r"(view|article|detail|news|read|show)", sig, re.I):
                 score *= 1.5
             scored.append((score, sig))
-        if not scored:
-            return None
         scored.sort(reverse=True)
-        return pattern_from_signature(scored[0][1])
-
-
-def _samples(urls: list[str], pattern: dict) -> list[str]:
-    return list(dict.fromkeys(canonical_article_url(u, pattern) for u in urls if matches(u, pattern)))
+        return [pattern_from_signature(sig) for _, sig in scored[:limit]]
 
 
 def _sig_matches_known(sig: str, known: str) -> bool:

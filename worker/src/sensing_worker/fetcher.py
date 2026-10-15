@@ -32,6 +32,11 @@ CHALLENGE_MARKERS = (
     "are you a robot", "verify you are human", "자동입력 방지", "보안 문자",
 )
 LOGIN_URL_RE = re.compile(r"(login|signin|sign-in|auth/|member/log)", re.I)
+# 본문이 거의 없는 "넘김" 페이지: <meta refresh> 또는 location.href = "..." 한 줄짜리 홈 (공공기관에 흔하다)
+CLIENT_REDIRECT_MAX_BYTES = 4096
+META_REFRESH_RE = re.compile(r"""<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)""", re.I)
+JS_REDIRECT_RE = re.compile(r"""(?:location|window\.location|document\.location)(?:\.href)?\s*=\s*["']([^"']+)["']"""
+                            r"""|location\.replace\(\s*["']([^"']+)["']\s*\)""", re.I)
 # 실패 증거로 남길 응답 본문 길이 (문자)
 EVIDENCE_CHARS = 20000
 
@@ -163,6 +168,12 @@ class PoliteFetcher:
             if not classify:
                 return page
 
+            # 홈이 스크립트 한 줄로 다른 주소로 넘기는 경우도 리다이렉트처럼 따라간다
+            target = client_redirect_target(page)
+            if target and redirects < 5:
+                return self._request(urljoin(page.url, target), check_robots=check_robots, classify=classify,
+                                     redirects=redirects + 1)
+
             if page.status >= 500:
                 if attempt < self.s.max_retries:
                     self._backoff(attempt)
@@ -239,6 +250,20 @@ def _decode(body: bytes, resp: httpx.Response) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return body.decode("utf-8", errors="replace")
+
+
+def client_redirect_target(page: Page) -> str | None:
+    """작은 HTML 응답이 meta refresh·location.href로 넘기는 주소. 없으면 None."""
+    if page.status != 200 or "html" not in page.content_type.lower() or len(page.text) > CLIENT_REDIRECT_MAX_BYTES:
+        return None
+    m = META_REFRESH_RE.search(page.text)
+    if m:
+        return m.group(1).strip()
+    m = JS_REDIRECT_RE.search(page.text)
+    if m:
+        target = (m.group(1) or m.group(2) or "").strip()
+        return target or None
+    return None
 
 
 def _has_challenge(text: str) -> bool:

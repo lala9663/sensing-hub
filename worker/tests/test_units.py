@@ -5,10 +5,12 @@ import pytest
 
 from sensing_worker.codes import Code, CrawlFailure
 from sensing_worker.config import Settings
-from sensing_worker.discovery import Discoverer, canonical_article_url, matches, signature
+from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, parse_sitemap, pattern_from_signature,
+                                      signature, sitemap_urls)
 from sensing_worker.evidence import EvidenceStore
-from sensing_worker.extract import Article, extract_article
-from sensing_worker.fetcher import PoliteFetcher
+from sensing_worker.extract import Article, extract_article, links_with_dates
+from sensing_worker.jobs import discover
+from sensing_worker.fetcher import Page, PoliteFetcher, client_redirect_target
 from sensing_worker.policy import defaults_for, guess_site_type, passes_quality
 from sensing_worker.throttle import LocalThrottle, throttle_key
 
@@ -182,3 +184,173 @@ def test_discovery_eval_classifies_sites_like_onboarding():
         news.close()
         blocked.close()
     assert read_sites(["a.com", "a.com", "b.com"]) == ["a.com", "b.com"]
+
+
+def test_signature_generalizes_alphanumeric_ids():
+    assert signature("https://www.motir.go.kr/kor/article/ATCL6fd477428") == "/kor/article/{id}"
+    assert signature("https://a.com/view/20261016A003") == "/view/{id}"
+    assert signature("https://a.com/news/2026/10/16/story") == "/news/{n}/{n}/{n}/story"
+    assert signature("https://a.com/page2.html") == "/page{n}.html"       # 짧은 토큰은 숫자만 바꾼다
+    pattern = Discoverer._dominant_pattern([f"https://m.go.kr/kor/article/ATCL{h}" for h in ("6fd477428", "f589e9758", "0a1b2c3d4")]
+                                           + ["https://m.go.kr/kor/contents/49"] * 3)
+    assert pattern["signature"] == "/kor/article/{id}"
+    assert matches("https://m.go.kr/kor/article/ATCL111aaa222", pattern)
+    assert not matches("https://m.go.kr/kor/article/list", pattern)
+
+
+def test_client_side_redirect_is_followed():
+    def handler(request):
+        if request.url.path == "/":
+            return httpx.Response(200, headers={"content-type": "text/html;charset=UTF-8"},
+                                  text='<script>\r\nlocation.href = "/index.do";\r\n</script>\r\n')
+        if request.url.path == "/index.do":
+            return httpx.Response(200, headers={"content-type": "text/html"}, text="<html><body>" + "<p>home</p>" * 5 + "</body></html>")
+        return httpx.Response(404, text="")
+    f = PoliteFetcher(Settings(min_interval_seconds=0, allow_private_hosts=True), transport=httpx.MockTransport(handler))
+    page = f.get("https://msit.example/")
+    assert page.url == "https://msit.example/index.do" and "home" in page.text
+    big = Page("u", 200, "text/html", "<html>" + "x" * 5000 + 'location.href="/x"</html>', {})
+    assert client_redirect_target(big) is None                           # 본문이 있는 페이지의 스크립트는 무시
+    meta = Page("u", 200, "text/html", '<meta http-equiv="refresh" content="0; url=/main.do">', {})
+    assert client_redirect_target(meta) == "/main.do"
+
+
+SITEMAP_INDEX = """<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<sitemap><loc>https://k.kr/sitemap_old.xml</loc><lastmod>2024-01-01</lastmod></sitemap>
+<sitemap><loc>https://k.kr/sitemap_news.xml</loc><lastmod>2026-10-16T09:00:00+09:00</lastmod></sitemap>
+<sitemap><loc>https://k.kr/sitemap_speech.xml</loc><lastmod>2026-09-01</lastmod></sitemap>
+</sitemapindex>"""
+SITEMAP_NEWS = """<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://k.kr/news/view.do?newsId=1</loc><lastmod>2026-10-01</lastmod></url>
+<url><loc>https://k.kr/news/view.do?newsId=3</loc><lastmod>2026-10-16</lastmod></url>
+<url><loc>https://k.kr/news/view.do?newsId=2</loc><lastmod>2026-10-10</lastmod></url>
+</urlset>"""
+
+
+def test_sitemap_prefers_newest_by_lastmod():
+    assert parse_sitemap(SITEMAP_INDEX)[1] == ["https://k.kr/sitemap_news.xml", "https://k.kr/sitemap_speech.xml",
+                                               "https://k.kr/sitemap_old.xml"]
+    opened = []
+
+    def get(url):
+        opened.append(url)
+        return Page(url, 200, "application/xml", SITEMAP_NEWS if "news" in url else "<urlset></urlset>", {})
+
+    urls = sitemap_urls(get, SITEMAP_INDEX, max_children=2)
+    assert opened == ["https://k.kr/sitemap_news.xml", "https://k.kr/sitemap_speech.xml"]   # 오래된 것은 안 연다
+    assert urls == ["https://k.kr/news/view.do?newsId=3", "https://k.kr/news/view.do?newsId=2",
+                    "https://k.kr/news/view.do?newsId=1"]
+
+
+def test_site_type_from_jsonld_and_article_links():
+    hankyung_like = ('<html><head><meta property="og:type" content="website">'
+                     '<meta property="og:site_name" content="한국경제"></head><body>'
+                     '<script type="application/ld+json">{"@type":"NewsMediaOrganization"}</script></body></html>')
+    assert guess_site_type("hankyung.com", hankyung_like) == "NEWS"
+    links_only = ('<html><head><meta property="og:site_name" content="서울경제"></head><body>'
+                  + "".join(f'<a href="/article/{i}">기사</a>' for i in range(12)) + "</body></html>")
+    assert guess_site_type("sedaily.com", links_only) == "NEWS"
+    assert guess_site_type("korea.kr", "<html></html>") == "PUBLIC"
+    assert guess_site_type("acme.com", '<meta property="og:site_name" content="경제연구소"><a href="/about">x</a>') == "ETC"
+
+
+def test_title_and_date_from_board_markup():
+    html = ('<html><head><title>테스트부</title><meta property="og:title" content="테스트부">'
+            '<meta property="og:site_name" content="테스트부"></head><body><h1>테스트부</h1>'
+            '<div class="board-detail"><div class="detail-tit"><span>중견기업 성장을 위한 10대 프로젝트 시작한다</span></div>'
+            '<div class="detail-info"><ul><li><em>담당자</em><span>홍길동</span></li>'
+            '<li><em>등록일</em><span>2026-10-15</span></li></ul></div><p>' + "본문 " * 100 + "</p></div></body></html>")
+    art = extract_article(html, "https://m.go.kr/kor/article/ATCLx/1/view")
+    assert art.title == "중견기업 성장을 위한 10대 프로젝트 시작한다"          # og:title(사이트 이름)은 무시
+    assert art.published_at == datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)   # KST 자정
+    # 목록 페이지의 표 머리글 "등록일"은 아래 행의 날짜를 집지 않는다 (게시판을 기사로 오인하지 않게)
+    board = "<html><body><table><tr><th>제목</th><th>등록일</th></tr><tr><td>글</td><td>2026-10-15</td></tr></table></body></html>"
+    assert extract_article(board, "https://m.go.kr/b").published_at is None
+    assert extract_article(board, "https://m.go.kr/b", date_hint="2026. 10. 15").published_at is not None
+
+
+def test_js_download_attachment_is_recorded_with_filename():
+    html = ('<html><body><div class="view_file"><ul><li><a class="ico_file_hwp" title="파일명">261014 보도자료.hwpx</a>'
+            '<span><a class="down" href="javascript:void(0);" onclick="fn_download(\'55308\', \'1\', \'hwpx\');">다운로드</a>'
+            '<a class="view" href="javascript:void(0);" onclick="getExtension_path(\'55308\', \'1\');">바로보기</a></span></li></ul></div>'
+            "</body></html>")
+    art = extract_article(html, "https://www.msit.go.kr/bbs/view.do?nttSeqNo=1")
+    assert art.attachments == [("https://www.msit.go.kr/bbs/view.do?nttSeqNo=1#js:fn_download('55308', '1', 'hwpx');",
+                                "261014 보도자료.hwpx")]
+
+
+def test_links_with_dates_reads_row_date():
+    html = ('<ul><li><a href="/bbs/view.do?nttSeqNo=1">보도자료 1</a><span>2026. 10. 15</span></li>'
+            '<li class="swiper-slide"><a href="/bbs/view.do?nttSeqNo=2">카드뉴스</a></li></ul>'
+            '<div><a href="/about">소개</a>' + "x" * 500 + " 2024-01-01</div>")
+    assert links_with_dates(html, "https://g.go.kr/") == [
+        ("https://g.go.kr/bbs/view.do?nttSeqNo=1", "2026. 10. 15"),
+        ("https://g.go.kr/bbs/view.do?nttSeqNo=2", None),
+        ("https://g.go.kr/about", None)]                                   # 큰 묶음의 날짜는 행 날짜가 아니다
+
+
+def test_sections_found_by_korean_board_names():
+    f = PoliteFetcher(Settings(min_interval_seconds=0, allow_private_hosts=True))
+    d = Discoverer(f, "m.go.kr", "https://m.go.kr")
+    html = ('<a href="/kor/contents/49">조직도</a><a href="/kor/article/ATCL369bcdf07">알림/소식</a>'
+            '<a href="/kor/article/ATCL3f49a5a8c">보도자료</a><a href="/news/list.do">목록</a><a href="/">홈</a>')
+    assert [s["name"] for s in d._sections(html, "https://m.go.kr/")] == ["목록", "보도자료", "알림/소식"]
+    f.close()
+
+
+def test_page_params_are_not_part_of_identity():
+    sig = signature("https://m.go.kr/kor/article/ATCL3f49a5a8c/172296/view?mno=&pageIndex=1")
+    assert sig == "/kor/article/{id}/{n}/view?mno=*"
+    pattern = pattern_from_signature(sig)
+    assert canonical_article_url("https://m.go.kr/kor/article/ATCL3f49a5a8c/172296/view?mno=&pageIndex=2", pattern) \
+        == "https://m.go.kr/kor/article/ATCL3f49a5a8c/172296/view?mno="
+
+
+def test_quality_accepts_attachment_instead_of_body_for_public_sites():
+    now = datetime.now(timezone.utc)
+    stub = Article(url="u", title="t", published_at=now, body="첨부 참고", attachments=[("https://g.go.kr/f.hwp", "f.hwp")])
+    assert not passes_quality([stub] * 5)[0]
+    assert passes_quality([stub] * 5, attachments_ok=True)[0]
+
+
+def test_discover_skips_sitemap_boards_and_finds_posts_in_sections():
+    from fakesite import Site, gov_cms_routes
+    site = Site({})
+    site.routes.update({k: (s, t, b.replace("{base}", site.base)) for k, (s, t, b) in gov_cms_routes().items()})
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        assert next(Discoverer(f, "127.0.0.1", site.base).candidates()).method == "SITEMAP"   # 첫 후보는 게시판 목록
+        result, detail = discover(f, "127.0.0.1", site.base, "PUBLIC")
+        assert result.method == "STATIC"
+        assert result.article_pattern["signature"] == "/kor/article/{id}/{n}/view?mno=*"
+        assert "5건 통과" in detail and len(result.sample_dates) >= 5
+    finally:
+        f.close()
+        site.close()
+
+
+def test_discover_js_board_uses_row_dates_and_attachments():
+    from fakesite import Site, gov_board_js_routes
+    site = Site(gov_board_js_routes())
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, detail = discover(f, "127.0.0.1", site.base, "PUBLIC")
+        assert result.method == "STATIC" and result.article_pattern["signature"].startswith("/bbs/view.do?")
+        assert len(result.sample_dates) >= 5 and "5건 통과" in detail
+        with pytest.raises(CrawlFailure) as e:
+            discover(f, "127.0.0.1", site.base, "NEWS")       # 언론사 기준(본문 필수)으로는 불합격
+        assert e.value.code == Code.QUALITY_FAILED
+    finally:
+        f.close()
+        site.close()
+
+
+def test_board_page_linking_to_its_posts_is_hub_like():
+    rows = "".join(f'<li><a href="/kor/article/ATCL1/{1000 + i}/view?mno=">글 {i}</a><span>2026-10-{10 + i}</span></li>'
+                   for i in range(5))
+    board = f'<html><head><title>보도자료</title></head><body><ul>{rows}</ul><p>{"본문 " * 100}</p></body></html>'
+    art = extract_article(board, "https://m.go.kr/kor/article/ATCL1", date_hint="2026-10-15")
+    assert art.is_hub_like and not art.is_article_like
+    assert not passes_quality([art] * 5, attachments_ok=True)[0]
+    post = f'<html><head><title>글 1</title></head><body><a href="/kor/article/ATCL1">목록</a><p>{"본문 " * 100}</p></body></html>'
+    assert not extract_article(post, "https://m.go.kr/kor/article/ATCL1/1001/view?mno=", date_hint="2026-10-15").is_hub_like

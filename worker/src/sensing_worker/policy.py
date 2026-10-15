@@ -7,16 +7,25 @@ from datetime import datetime, timedelta, timezone
 
 from .extract import Article
 
-PUBLIC_DOMAIN = re.compile(r"\.(go\.kr|gov|gov\.[a-z]{2}|mil\.kr|or\.kr|assembly\.go\.kr)$", re.I)
+PUBLIC_DOMAIN = re.compile(r"(\.(go\.kr|gov|gov\.[a-z]{2}|mil\.kr|or\.kr|assembly\.go\.kr)|^korea\.kr)$", re.I)
 NEWS_HINT = re.compile(r"(news|daily|times|herald|ilbo|journal|press|media|신문|일보|뉴스)", re.I)
+# 매체 이름(og:site_name·title)에서만 보는 단서. 도메인에는 쓰지 않는다 (economy.go.kr 같은 곳 때문)
+NEWS_NAME_HINT = re.compile(r"(신문|일보|뉴스|경제|데일리|투데이|타임스|타임즈|헤럴드|저널|미디어|news|daily|times|herald)", re.I)
+NEWS_MARKUP = ("newsmediaorganization", '"newsarticle"', 'og:type" content="article', "ndsoft", "newspaper")
+ARTICLE_HREF = re.compile(r"""href=["'][^"']*/(?:article|news|articleview)[s/.?]""", re.I)
+SITE_NAME_RE = re.compile(r"""<meta[^>]+(?:og:site_name|application-name)[^>]+content=["']([^"']+)""", re.I)
 
 
 def guess_site_type(domain: str, home_html: str) -> str:
     if PUBLIC_DOMAIN.search(domain):
         return "PUBLIC"
-    low = home_html[:50000].lower()
-    if NEWS_HINT.search(domain) or "기사" in home_html[:50000] or 'og:type" content="article' in low \
-            or "newsarticle" in low or "ndsoft" in low:
+    low = home_html.lower()
+    if NEWS_HINT.search(domain) or any(m in low for m in NEWS_MARKUP):
+        return "NEWS"
+    if "기사" in home_html and len(ARTICLE_HREF.findall(home_html)) >= 10:
+        return "NEWS"
+    name = SITE_NAME_RE.search(home_html)
+    if name and NEWS_NAME_HINT.search(name.group(1)) and len(ARTICLE_HREF.findall(home_html)) >= 10:
         return "NEWS"
     return "ETC"
 
@@ -31,12 +40,16 @@ def defaults_for(site_type: str) -> dict:
 
 
 def passes_quality(samples: list[Article], *, now: datetime | None = None, need: int = 4,
-                   max_age_days: int = 30) -> tuple[bool, str]:
-    """샘플 5건 중 4건 이상이 제목·발행일·본문 200자 이상이고, 최근 30일 안에 발행된 글이 있어야 한다."""
+                   max_age_days: int = 30, attachments_ok: bool = False) -> tuple[bool, str]:
+    """샘플 5건 중 4건 이상이 제목·발행일·본문 200자 이상이고, 최근 30일 안에 발행된 글이 있어야 한다.
+
+    attachments_ok: 본문 대신 첨부파일(보도자료 HWP·PDF)에 내용을 두는 공공기관 게시판은 제목·발행일·첨부로도 통과한다.
+    """
     now = now or datetime.now(timezone.utc)
     if not samples:
         return False, "샘플 기사를 가져오지 못했습니다."
-    good = [a for a in samples if a.title and a.published_at and a.body_length >= 200]
+    good = [a for a in samples if a.title and a.published_at and not a.is_hub_like
+            and (a.body_length >= 200 or (attachments_ok and a.attachments))]
     required = min(need, len(samples))
     if len(good) < required:
         return False, f"샘플 {len(samples)}건 중 {len(good)}건만 제목·발행일·본문을 갖췄습니다."
