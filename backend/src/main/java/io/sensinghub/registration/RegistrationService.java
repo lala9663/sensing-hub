@@ -90,6 +90,21 @@ public class RegistrationService {
         return get(requestId);
     }
 
+    /** 승인 대기 요청을 반려한다. 사유는 요청자에게 그대로 보인다. */
+    @Transactional
+    public Registration reject(CurrentUser admin, long requestId, String reason) {
+        admin.require(Role.ADMIN);
+        Registration reg = get(requestId);
+        if (!reg.status().equals("AWAITING_APPROVAL")) {
+            throw ApiException.conflict("승인 대기 상태가 아닙니다.");
+        }
+        String message = "관리자가 등록 요청을 반려했습니다."
+                + (reason == null || reason.isBlank() ? "" : " 사유: " + reason.strip());
+        updateRequest(requestId, "REJECTED", "REJECTED", message, null);
+        audit.log(admin.id(), "REGISTRATION_REJECTED", "registration_request", requestId, null);
+        return get(requestId);
+    }
+
     public List<Registration> mine(CurrentUser user) {
         return jdbc.sql(SELECT + " WHERE user_id = ? ORDER BY created_at DESC LIMIT 100")
                 .param(user.id())

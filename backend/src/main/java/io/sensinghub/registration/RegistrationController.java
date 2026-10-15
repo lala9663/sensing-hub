@@ -62,4 +62,13 @@ public class RegistrationController {
     public Registration approve(CurrentUser user, @PathVariable long id) {
         return service.approve(user, id);
     }
+
+    public record RejectRequest(@Size(max = 300) String reason) {
+    }
+
+    @PostMapping("/{id}/reject")
+    public Registration reject(CurrentUser user, @PathVariable long id,
+                               @Valid @RequestBody(required = false) RejectRequest body) {
+        return service.reject(user, id, body == null ? null : body.reason());
+    }
 }

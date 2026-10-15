@@ -135,7 +135,16 @@ public class SourceService {
                 requireStatus(s, "BROKEN", "REVIEW", "ACTIVE", "PAUSED");
                 enqueue(id, "ONBOARD", "MANUAL");
             }
-            case EXCLUDE -> setStatus(id, "EXCLUDED", "관리자 제외");
+            case EXCLUDE -> {
+                setStatus(id, "EXCLUDED", "관리자 제외");
+                // 처리 대기(REVIEW) 중이던 등록 요청은 요청자에게 결과를 알린다
+                jdbc.sql("""
+                        UPDATE registration_request
+                        SET status = 'REJECTED', step = 'REJECTED', updated_at = now(),
+                            result_message = '관리자가 확인한 결과 수집 대상에서 제외했습니다.'
+                        WHERE source_id = ? AND status IN ('RECEIVED', 'PROCESSING', 'REVIEW')
+                        """).param(id).update();
+            }
         }
         audit.log(user.id(), "SOURCE_" + action.name(), "source", id, null);
         return detail(user, id).source();

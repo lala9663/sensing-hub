@@ -84,6 +84,11 @@ curl localhost:8080/api/v1/sources -H 'X-User: admin'
 curl localhost:8080/api/v1/sources/1 -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/sources/1/actions/recheck -H 'X-User: admin'   # pause|resume|run|recheck|rediscover|exclude
 curl -X POST localhost:8080/api/v1/sources/1/configs/2/activate -H 'X-User: admin'  # 설정 버전 롤백
+
+# 관리자: 처리 대기 큐 (승인 대기 → REVIEW → BROKEN → BLOCKED, 오래 기다린 순). kind로 거를 수 있다
+curl localhost:8080/api/v1/review-queue -H 'X-User: admin'
+curl localhost:8080/api/v1/review-queue/counts -H 'X-User: admin'
+curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'      -H 'Content-Type: application/json' -d '{"reason":"업무와 관련 없는 사이트"}'
 ```
 
 ## 폴더
@@ -129,7 +134,7 @@ M1에서 바로 할 일:
 - [x] 도메인 단위 요청 간격을 워커 여러 대가 공유 (`domain_throttle` 슬롯 예약, `SENSING_SHARED_THROTTLE`)
 - [x] 소스별 평소 수집량 대비 급감(`ANOMALY_DROP`) 감지와 2회 연속 시 BROKEN 전환 (기준: 같은 설정 버전의 최근 정상 실행 평균 후보 수, 30% 미만)
 - [x] 실패 증거(응답 HTML 일부) 파일 저장과 `evidence_path` 기록 (`SENSING_EVIDENCE_DIR`/날짜/, 30일 보관)
-- [ ] 관리자용 처리 대기 큐 API (`/api/v1/review-queue`)
+- [x] 관리자용 처리 대기 큐 API (`/api/v1/review-queue`: 승인 대기·REVIEW·BROKEN·BLOCKED를 우선순위순으로)
 - [ ] 실제 사이트 10곳으로 자동 탐색 성공률 측정 (목표 8곳)
 
 ## 원칙
