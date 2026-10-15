@@ -1,0 +1,21 @@
+# Java / Gradle
+backend/build/
+backend/.gradle/
+*.class
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+worker/data/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# 환경 변수
+.env

@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: sensing_it
+          POSTGRES_USER: sensing
+          POSTGRES_PASSWORD: sensing
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sensing -d sensing_it"
+          --health-interval 5s --health-retries 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Build and test (unit + integration)
+        env:
+          SENSING_IT_DB_URL: jdbc:postgresql://localhost:5432/sensing_it
+        run: ./gradlew --no-daemon build
+
+  worker:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: sensing_test
+          POSTGRES_USER: sensing
+          POSTGRES_PASSWORD: sensing
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sensing -d sensing_test"
+          --health-interval 5s --health-retries 20
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ".[dev,extract]"
+      - name: Test (unit + DB flow)
+        env:
+          SENSING_TEST_DSN: postgresql://sensing:sensing@localhost:5432/sensing_test
+        run: pytest -q

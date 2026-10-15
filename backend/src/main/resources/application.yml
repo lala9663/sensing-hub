@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: sensing-hub
+  datasource:
+    url: ${SENSING_DB_URL:jdbc:postgresql://localhost:5432/sensing}
+    username: ${SENSING_DB_USER:sensing}
+    password: ${SENSING_DB_PASSWORD:sensing}
+    hikari:
+      maximum-pool-size: 10
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: ${SENSING_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+sensing:
+  scheduler:
+    # 주기 수집 대상 확인 간격
+    tick-ms: ${SENSING_SCHEDULER_TICK_MS:60000}
+    enabled: ${SENSING_SCHEDULER_ENABLED:true}
+  registration:
+    # VIEWER가 등록하면 관리자 승인 대기로 접수한다
+    viewer-needs-approval: true
+  auth:
+    # PoC 인증: X-User 헤더의 login_id로 사용자를 찾는다. SSO 연동 시 교체한다.
+    default-user: ${SENSING_DEFAULT_USER:registrar}

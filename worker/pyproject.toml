@@ -1,0 +1,33 @@
+[project]
+name = "sensing-worker"
+version = "0.1.0"
+description = "sensing-hub 수집 워커: 작업 큐, 수집 하네스, 자동 탐색, 추출"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+# 본문 추출 품질 향상 (없으면 기본 추출기로 동작)
+extract = ["trafilatura>=1.12"]
+# 동적 수집 (M2)
+dynamic = ["playwright>=1.47"]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+sensing-worker = "sensing_worker.main:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
