@@ -89,6 +89,9 @@ LLM 장애는 경고만 남기고 휴리스틱으로 진행하므로 LLM이 멈�
 | `ANTHROPIC_API_KEY` | (없음) | `anthropic` 제공자의 키. 게이트웨이를 거치면 `ANTHROPIC_BASE_URL`도 지정 |
 | `SENSING_LLM_FALLBACKS` | `true` | `anthropic`: 안전 분류기가 거절하면 서버가 다른 모델로 대신 답하게 한다 (`false`면 끈다) |
 | `SENSING_LLM_MAX_SAMPLE_PAGES` / `SENSING_LLM_PAGE_CHARS` / `SENSING_LLM_TIMEOUT` | `5` / `30000` / `120` | LLM에 보여 줄 샘플 페이지 수, 페이지당 글자 수 상한(script·style·svg 제거 후), 요청 제한 시간(초) |
+| `SENSING_ENRICH_ENABLED` | `true` | 수집 시점 요약·분류(보강). 큐에 작업이 없을 때 LLM이 설정돼 있으면 한 묶음씩 돌린다 (`none`이면 하지 않는다) |
+| `SENSING_ENRICH_BATCH` | `10` | 한 번의 LLM 호출에 묶는 문서 수 |
+| `SENSING_ENRICH_BODY_CHARS` | `4000` | 문서당 LLM에 보여 줄 본문 글자 수 상한 (언론 기사는 본문을 보여 주지 않는다) |
 
 ```bash
 # Claude
@@ -125,6 +128,15 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 크롤링하지 않으며, `news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다.
 네이버 키는 `client_id:client_secret` 한 문자열로 `/api/v1/api-credentials`에 넣고(provider `naver_news`), 언론 기사이므로 제목·링크·발행일만 저장합니다.
 
+### 수집 시점 요약·분류 (M2)
+
+워커는 큐에 작업이 없을 때 보강되지 않은 문서를 최신순으로 한 묶음(기본 10건) 가져와 LLM에 한 번에 보내고, 문서마다 분류
+토픽(정책·규제, 입찰·공고, 지원사업, 자사, 경쟁사, 산업동향, 인사·조직, 사건·사고, 기타)과 자유 태그(최대 5개)를 `document_enrichment`에
+둡니다. 공공기관·기타 문서는 본문(앞 4,000자)으로 2문장 이내 요약도 만들지만, 언론 기사는 제목만으로 분류하고 요약은 저장하지 않습니다.
+수집과 분리돼 있어 LLM 장애는 수집을 막지 않고(아무것도 쓰지 않고 다음 루프에 다시), 응답 검증 실패는 `FAILED`로 남겨 24시간 뒤
+다시 시도합니다. 본문이 바뀌어 문서 버전이 오르면 다시 보강 대상이 되고, 워커 여러 대는 `FOR UPDATE SKIP LOCKED`로 겹치지 않습니다.
+결과는 `/api/v1/documents`(VIEWER 이상)로 읽으며 다이제스트(M2-4)의 재료입니다.
+
 ### API 맛보기
 
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
@@ -140,6 +152,10 @@ curl localhost:8080/api/v1/registrations/mine -H 'X-User: registrar'
 # 키워드 감시 등록 (네이버 뉴스 검색 API, 60분 주기. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
 curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
 curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
+
+# 수집 문서 (요약·분류·감시 검색어 포함, 발행일 내림차순). since는 수집 시각 기준, topic·keyword·source_id로 거르고 limit 기본 50·최대 200
+curl 'localhost:8080/api/v1/documents?since=2026-10-15T00:00:00Z&topic=정책·규제&keyword=메타넷' -H 'X-User: viewer'
+curl localhost:8080/api/v1/documents/1 -H 'X-User: viewer'      # 본문·첨부 포함. GET /api/v1/documents/topics?since=... 는 토픽별 건수
 
 # 관리자: 소스 목록·상세·조치
 curl localhost:8080/api/v1/sources -H 'X-User: admin'
@@ -231,7 +247,10 @@ M2에서 한 일:
   `PUT`으로 키워드 수정 = 설정 새 버전, 네이버 뉴스 검색 커넥터(`apis/naver_news.py`: 검색어별 `sort=date` 최대 3페이지, 제목 태그 제거,
   제목·링크·발행일만), `document_watch`에 감시·검색어 기록 (같은 기사가 여러 감시에 걸려도 문서는 하나). news.naver.com을 사이트로
   등록하면 `KEYWORDS_REQUIRED`로 안내
-- [ ] 공공데이터포털 커넥터, 네이버 API 쿼터 추적, 수집 시점 요약·분류, 일간 다이제스트, 최소 화면
+- [x] 수집 시점 요약·분류: 워커 보강 단계(`enrich.py`, 큐가 비었을 때 묶음 10건을 LLM 한 번에, `SENSING_ENRICH_*`)가
+  `document_enrichment`(V6)에 토픽·태그·요약을 두고, `GET /api/v1/documents`(since·topic·keyword·source_id 필터, 상세, 토픽별 건수)로
+  읽는다. 언론 기사는 제목만 분류하고 요약을 저장하지 않으며, LLM 장애·검증 실패는 수집에 번지지 않는다
+- [ ] 공공데이터포털 커넥터, 네이버 API 쿼터 추적, 일간 다이제스트, 최소 화면
 
 ## 원칙
 
