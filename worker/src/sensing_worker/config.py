@@ -32,6 +32,8 @@ class Settings:
     connect_timeout: float = field(default_factory=lambda: float(os.getenv("SENSING_CONNECT_TIMEOUT", "10")))
     read_timeout: float = field(default_factory=lambda: float(os.getenv("SENSING_READ_TIMEOUT", "30")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_RETRIES", "3")))
+    # TLS 핸드셰이크가 실패한 호스트를 호환 컨텍스트(SECLEVEL=1, TLS 1.2+, legacy renegotiation, 인증서 검증 유지)로 한 번 더 시도
+    tls_compat: bool = field(default_factory=lambda: _bool("SENSING_TLS_COMPAT", True))
     max_body_bytes: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_BODY_BYTES", str(5 * 1024 * 1024))))
     # 실행 1회당 상한
     max_pages_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_PAGES", "60")))

@@ -1,4 +1,5 @@
 import json
+import ssl
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,7 +15,7 @@ from sensing_worker.discovery import (Discoverer, canonical_article_url, matches
 from sensing_worker.evidence import EvidenceStore
 from sensing_worker.extract import Article, extract_article, links_with_dates
 from sensing_worker.jobs import discover
-from sensing_worker.fetcher import Page, PoliteFetcher, client_redirect_target
+from sensing_worker.fetcher import Page, PoliteFetcher, client_redirect_target, compat_ssl_context
 from sensing_worker.llm import (FALLBACK_BETA, AnthropicLlm, LlmUnavailable, NoLlm, OpenAiCompatLlm, extract_json,
                                 generate_recipe, make_llm, validate_schema)
 from sensing_worker.policy import defaults_for, guess_site_type, passes_quality
@@ -134,6 +135,146 @@ def test_proxy_refusal_is_network_blocked():
     with pytest.raises(CrawlFailure) as e:
         _fetcher(handler).get("https://site.example/a")
     assert e.value.code == Code.NETWORK_BLOCKED and e.value.blocking
+
+
+def _tls_fetcher(strict_handler, compat_handler, **overrides) -> PoliteFetcher:
+    """기본 클라이언트와 호환 TLS 클라이언트에 서로 다른 MockTransport를 달아 어느 쪽으로 갔는지 구분한다."""
+    s = Settings(min_interval_seconds=0, max_retries=2, allow_private_hosts=True, **overrides)
+    return PoliteFetcher(s, transport=httpx.MockTransport(strict_handler),
+                         compat_transport=httpx.MockTransport(compat_handler))
+
+
+def _handshake_failure(request: httpx.Request) -> httpx.ConnectError:
+    err = ssl.SSLError(1, "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1010)")
+    failure = httpx.ConnectError(str(err), request=request)
+    failure.__cause__ = err
+    return failure
+
+
+def test_tls_handshake_failure_falls_back_to_compat_client_and_remembers_host():
+    strict_calls, compat_calls = [], []
+
+    def strict(request):
+        strict_calls.append(str(request.url))
+        if request.url.host == "old.example":
+            raise _handshake_failure(request)
+        return httpx.Response(404 if request.url.path == "/robots.txt" else 200, text="modern")
+
+    def compat(request):
+        compat_calls.append(str(request.url))
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, headers={"content-type": "text/html"}, text="<html><p>legacy ok</p></html>")
+
+    f = _tls_fetcher(strict, compat)
+    page = f.get("https://old.example/a")
+    assert page.status == 200 and "legacy ok" in page.text
+    # robots.txt가 첫 요청: 기본 클라이언트가 핸드셰이크에 실패하면 같은 주소를 호환 클라이언트로 한 번만 다시 보낸다
+    assert strict_calls == ["https://old.example/robots.txt"]
+    assert compat_calls == ["https://old.example/robots.txt", "https://old.example/a"]
+    assert "old.example" in f.compat_hosts
+
+    # 같은 호스트의 다음 요청은 기본 클라이언트를 거치지 않고 바로 호환 클라이언트로 간다
+    f.get("https://old.example/b")
+    assert strict_calls == ["https://old.example/robots.txt"]
+    assert compat_calls[-1] == "https://old.example/b"
+    assert f.request_count == 3
+
+    # 다른 호스트는 영향을 받지 않는다
+    assert f.get("https://fine.example/x").text == "modern"
+    assert compat_calls[-1] == "https://old.example/b"
+    assert "fine.example" not in f.compat_hosts
+
+
+def test_tls_error_on_compat_client_too_is_tls_error():
+    def strict(request):
+        raise _handshake_failure(request)
+
+    compat_calls = []
+
+    def compat(request):
+        compat_calls.append(str(request.url))
+        raise _handshake_failure(request)
+
+    f = _tls_fetcher(strict, compat)
+    with pytest.raises(CrawlFailure) as e:
+        f.get("https://old.example/a")
+    assert e.value.code == Code.TLS_ERROR
+    assert "호환 설정" in str(e.value) and "HANDSHAKE_FAILURE" in str(e.value)
+    # robots.txt와 본문 각각 호환 재시도는 한 번뿐이고, 호스트는 호환 목록에 남지 않는다
+    assert compat_calls == ["https://old.example/robots.txt", "https://old.example/a"]
+    assert f.compat_hosts == set()
+
+
+def test_certificate_verification_failure_is_not_retried_with_compat():
+    strict_calls, compat_calls = [], []
+
+    def strict(request):
+        strict_calls.append(str(request.url))
+        err = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                                              "certificate has expired (_ssl.c:1010)")
+        failure = httpx.ConnectError(str(err), request=request)
+        failure.__cause__ = err
+        raise failure
+
+    def compat(request):
+        compat_calls.append(str(request.url))
+        return httpx.Response(200, text="should not be reached")
+
+    f = _tls_fetcher(strict, compat)
+    with pytest.raises(CrawlFailure) as e:
+        f.get("https://expired.example/a")
+    assert e.value.code == Code.TLS_ERROR
+    assert "인증서 검증 실패" in str(e.value) and "expired" in str(e.value)
+    assert strict_calls == ["https://expired.example/robots.txt", "https://expired.example/a"]
+    assert compat_calls == []
+
+
+def test_certificate_failure_reported_only_as_text_is_still_not_retried():
+    # httpx는 OpenSSL 메시지를 문자열로만 넘기기도 한다 (__cause__ 없음)
+    def strict(request):
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch",
+                                 request=request)
+
+    compat_calls = []
+
+    def compat(request):
+        compat_calls.append(str(request.url))
+        return httpx.Response(200, text="no")
+
+    with pytest.raises(CrawlFailure) as e:
+        _tls_fetcher(strict, compat).get("https://mismatch.example/a")
+    assert e.value.code == Code.TLS_ERROR and "인증서 검증 실패" in str(e.value)
+    assert compat_calls == []
+
+
+def test_tls_compat_can_be_switched_off():
+    def strict(request):
+        raise _handshake_failure(request)
+
+    compat_calls = []
+
+    def compat(request):
+        compat_calls.append(str(request.url))
+        return httpx.Response(200, text="no")
+
+    f = _tls_fetcher(strict, compat, tls_compat=False)
+    with pytest.raises(CrawlFailure) as e:
+        f.get("https://old.example/a")
+    assert e.value.code == Code.TLS_ERROR and "호환 재시도 꺼짐" in str(e.value)
+    assert compat_calls == []
+    assert f.compat_hosts == set()
+
+
+def test_compat_ssl_context_keeps_certificate_verification():
+    ctx = compat_ssl_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert ctx.options & 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+    names = {c["name"] for c in ctx.get_ciphers()}
+    # RSA 키 교환(ECDHE 없음) 암호가 다시 허용된다: 용인시처럼 그것만 지원하는 서버용
+    assert "AES256-GCM-SHA384" in names
+    assert "AES256-GCM-SHA384" not in {c["name"] for c in ssl.create_default_context().get_ciphers()}
 
 
 def test_internal_address_is_blocked_without_flag():
