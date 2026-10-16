@@ -26,6 +26,8 @@ services:
       SENSING_DB_URL: jdbc:postgresql://db:5432/sensing
       SENSING_DB_USER: sensing
       SENSING_DB_PASSWORD: sensing
+      # 공개 API 키(api_credential)를 암호화하는 대칭키. 워커와 같은 값. 운영에서는 반드시 바꾼다
+      SENSING_SECRET_KEY: ${SENSING_SECRET_KEY:-sensing-dev-secret}
       JAVA_OPTS: "-Xmx1g"
     ports:
       - "8080:8080"
@@ -38,6 +40,7 @@ services:
     environment:
       SENSING_DB_DSN: postgresql://sensing:sensing@db:5432/sensing
       SENSING_MIN_INTERVAL: "2"
+      SENSING_SECRET_KEY: ${SENSING_SECRET_KEY:-sensing-dev-secret}
       # 등록 시 LLM 레시피 생성 (비우면 휴리스틱 탐색만). none | anthropic | openai — README 워커 환경 변수 참고
       SENSING_LLM_PROVIDER: ${SENSING_LLM_PROVIDER:-}
       SENSING_LLM_MODEL: ${SENSING_LLM_MODEL:-}

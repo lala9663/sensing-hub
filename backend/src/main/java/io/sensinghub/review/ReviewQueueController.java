@@ -21,7 +21,7 @@ public class ReviewQueueController {
         this.service = service;
     }
 
-    /** kind: APPROVAL | REVIEW | BROKEN | BLOCKED (없으면 전체) */
+    /** kind: APPROVAL | API_KEY | REVIEW | BROKEN | BLOCKED (없으면 전체) */
     @GetMapping
     public List<ReviewItem> list(CurrentUser user, @RequestParam(required = false) String kind) {
         return service.list(user, kind);

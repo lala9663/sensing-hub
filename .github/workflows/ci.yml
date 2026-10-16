@@ -32,6 +32,7 @@ jobs:
       - name: Build and test (unit + integration)
         env:
           SENSING_IT_DB_URL: jdbc:postgresql://localhost:5432/sensing_it
+          SENSING_SECRET_KEY: ci-secret-key
         run: ./gradlew --no-daemon build
 
   worker:
@@ -59,4 +60,5 @@ jobs:
       - name: Test (unit + DB flow)
         env:
           SENSING_TEST_DSN: postgresql://sensing:sensing@localhost:5432/sensing_test
+          SENSING_SECRET_KEY: ci-secret-key
         run: pytest -q

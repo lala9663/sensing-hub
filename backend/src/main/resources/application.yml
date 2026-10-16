@@ -31,3 +31,6 @@ sensing:
   auth:
     # PoC 인증: X-User 헤더의 login_id로 사용자를 찾는다. SSO 연동 시 교체한다.
     default-user: ${SENSING_DEFAULT_USER:registrar}
+  # 공개 API 자격 증명(api_credential)을 pgcrypto로 암호화하는 대칭키. 워커의 SENSING_SECRET_KEY와 같아야 한다.
+  # 비어 있으면 자격 증명 API는 503을 낸다.
+  secret-key: ${SENSING_SECRET_KEY:}
