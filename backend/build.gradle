@@ -8,9 +8,14 @@ group = 'io.sensinghub'
 version = '0.1.0'
 
 java {
-    // 설치된 JDK 21을 그대로 쓴다 (툴체인 자동 다운로드 없이 사내망에서도 빌드되도록)
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    // 설치된 JDK 17 이상을 그대로 쓴다 (툴체인 자동 다운로드 없이 사내망에서도 빌드되도록)
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    // JDK가 더 높아도 Java 17에 없는 API를 쓰면 컴파일이 실패하게 한다
+    options.release = 17
 }
 
 repositories {

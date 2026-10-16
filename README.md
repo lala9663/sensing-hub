@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart LR
-    U[사용자 / 관리자] -->|화면·챗봇| B[Spring Boot<br/>backend · Java 21]
+    U[사용자 / 관리자] -->|화면·챗봇| B[Spring Boot<br/>backend · Java 17]
     B -->|작업 등록·조회| DB[(PostgreSQL 16<br/>+ pgvector)]
     W[Python worker<br/>수집 하네스] -->|FOR UPDATE SKIP LOCKED| DB
     W -->|robots·간격·차단 시 중단| S[등록된 외부 사이트]
@@ -51,7 +51,7 @@ docker compose up --build
 
 ### 로컬 개발
 
-필요: JDK 21, Python 3.11+, PostgreSQL 16 + pgvector
+필요: JDK 17, Python 3.11+, PostgreSQL 16 + pgvector
 
 ```bash
 # DB
@@ -94,7 +94,7 @@ curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'    
 ## 폴더
 
 ```
-backend/   Spring Boot 3 (Java 21), Flyway 스키마: src/main/resources/db/migration
+backend/   Spring Boot 3 (Java 17), Flyway 스키마: src/main/resources/db/migration
 worker/    Python 수집 워커
   src/sensing_worker/
     fetcher.py    수집 하네스 HTTP 계층: 간격·robots·재시도·차단 분류·내부망 차단
