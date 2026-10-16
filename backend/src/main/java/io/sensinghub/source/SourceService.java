@@ -25,7 +25,7 @@ public class SourceService {
         this.audit = audit;
     }
 
-    /** kind: SITE(사이트 수집) | WATCH(키워드 감시, watchName이 감시 이름). */
+    /** kind: SITE(사이트 수집) | WATCH(키워드 감시, watchName이 감시 이름) | CHECK(회사 단위 점검, M3). */
     public record SourceSummary(long id, String kind, String watchName, String domain, String baseUrl, String siteType,
                                 String method, String status,
                                 String statusReason, Integer configVersion, int intervalMinutes,

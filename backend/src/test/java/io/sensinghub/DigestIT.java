@@ -82,8 +82,8 @@ class DigestIT {
     void clean() throws IOException {
         jdbc.sql("""
                 TRUNCATE digest_run, digest_subscription, chat_feedback, chat_citation, chat_message, chat_session, chunk,
-                         attachment, document_version, document_watch, document_enrichment, document, crawl_error,
-                         crawl_job, registration_request, audit_log, api_credential
+                         attachment, document_version, document_watch, document_enrichment, document_company, company_signal,
+                         company, document, crawl_error, crawl_job, registration_request, audit_log, api_credential
                 RESTART IDENTITY CASCADE
                 """).update();
         jdbc.sql("UPDATE source SET active_config_version_id = NULL").update();
@@ -231,15 +231,16 @@ class DigestIT {
         assertThat(sub.get("enabled").asBoolean()).isTrue();
         assertThat(sub.get("lastSentAt").isNull()).isTrue();
         assertThat(sub.get("owner").asText()).isEqualTo("일반 사용자");
-        assertThat(sub.get("filters").toString()).isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[\"정책·규제\"]}");
+        assertThat(sub.get("filters").toString())
+                .isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[\"정책·규제\"],\"companyIds\":[]}");
         assertThat(jdbc.sql("SELECT filters::text FROM digest_subscription WHERE id = ?").param(id).query(String.class).single())
-                .isEqualTo("{\"topics\": [\"정책·규제\"], \"watch_ids\": [], \"source_ids\": []}");
+                .isEqualTo("{\"topics\": [\"정책·규제\"], \"watch_ids\": [], \"source_ids\": [], \"company_ids\": []}");
 
         // 기본값: hourKst 8, filters 전체
         JsonNode defaults = read(post("registrar", "/api/v1/digests",
                 "{\"name\":\"웹훅\",\"channel\":\"WEBHOOK\",\"target\":\"https://hooks.example.com/services/T/B/x\"}").getBody());
         assertThat(defaults.get("hourKst").asInt()).isEqualTo(8);
-        assertThat(defaults.get("filters").toString()).isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[]}");
+        assertThat(defaults.get("filters").toString()).isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[],\"companyIds\":[]}");
 
         // 검증: 메일 형식, 웹훅은 절대 http(s) URL, 내부망 주소 거부, 시각 범위, 체계 밖 토픽, 없는 감시 id
         for (String body : List.of(
@@ -253,6 +254,7 @@ class DigestIT {
                 "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"hourKst\":24}",
                 "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"topics\":[\"없는토픽\"]}}",
                 "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"watchIds\":[999]}}",
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"companyIds\":[999]}}",
                 "{\"name\":\" \",\"channel\":\"EMAIL\",\"target\":\"a@b.co\"}")) {
             assertThat(post("viewer", "/api/v1/digests", body).getStatusCode()).as(body).isEqualTo(HttpStatus.BAD_REQUEST);
         }
@@ -348,6 +350,69 @@ class DigestIT {
         // 기간은 last_sent_at 이후(collected_at). 모두 그 전에 수집됐으면 0건
         jdbc.sql("UPDATE digest_subscription SET last_sent_at = now() WHERE id = ?").param(all).update();
         assertThat(read(post("viewer", "/api/v1/digests/" + all + "/preview", "").getBody()).get("documentCount").asInt()).isZero();
+    }
+
+    @Test
+    void previewPutsCompanySignalsFirstAndSendsEvenWithoutDocuments() {
+        Sample s = sample();
+        // 회사 둘 (등록은 API로: 감시·점검 소스가 함께 생긴다) + 워커가 남겼을 신호·연결
+        long nabu = read(post("registrar", "/api/v1/companies", "{\"name\":\"나부품\",\"bizNo\":\"1234567890\"}").getBody())
+                .get("id").asLong();
+        long ga = read(post("registrar", "/api/v1/companies", "{\"name\":\"가전자\"}").getBody()).get("id").asLong();
+        jdbc.sql("INSERT INTO document_company (document_id, company_id, matched_by) VALUES (?, ?, 'TAG')").params(s.rival(), ga).update();
+        jdbc.sql("""
+                INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, observed_at, document_id)
+                VALUES (?, 'NEWS', 'MEDIUM', 'h1', 'A사, 메타넷 추격', '2026-10-16T08:30:00+09:00', ?),
+                       (?, 'BIZ_STATUS', 'HIGH', '0320260930', '폐업자 (폐업일 2026-09-30)', '2026-10-16T06:00:00+09:00', NULL)
+                """).params(ga, s.rival(), nabu).update();
+
+        // 전체 구독: 거래처 신호 절이 맨 앞 (HIGH인 나부품 먼저), 그 뒤 감시·토픽 묶음은 그대로
+        long all = subscribe("viewer", "전체", "EMAIL", "viewer@example.com", null);
+        JsonNode p = read(post("viewer", "/api/v1/digests/" + all + "/preview", "").getBody());
+        assertThat(p.get("documentCount").asInt()).isEqualTo(4);
+        assertThat(p.get("signalCount").asInt()).isEqualTo(2);
+        assertThat(p.get("subject").asText()).endsWith("(문서 4건 · 신호 2건)");
+        String text = p.get("text").asText();
+        int heading = text.indexOf("*거래처 신호*");
+        int nabuAt = text.indexOf("_나부품_");
+        int high = text.indexOf("[HIGH] 폐업자 (폐업일 2026-09-30) — 사업자 상태 · 2026-10-16 06:00");
+        int gaAt = text.indexOf("_가전자_");
+        int medium = text.indexOf("[MEDIUM] A사, 메타넷 추격 — 보도 · 2026-10-16 08:30 · https://news.example.com/articleView?idxno=2");
+        int watch = text.indexOf("*감시: 자사 보도*");
+        assertThat(List.of(heading, nabuAt, high, gaAt, medium, watch)).doesNotContain(-1).isSorted();
+        assertThat(text).contains("새 문서 4건 · 거래처 신호 2건");
+        assertThat(p.get("html").asText()).contains("거래처 신호</h3>").contains("<b>나부품</b>");
+
+        // companyIds 구독: 그 회사에 연결된 문서 + 그 회사의 신호만
+        long gaOnly = subscribe("viewer", "가전자", "EMAIL", "viewer@example.com", "{\"companyIds\":[" + ga + "]}");
+        JsonNode g = read(post("viewer", "/api/v1/digests/" + gaOnly + "/preview", "").getBody());
+        assertThat(g.get("documentCount").asInt()).isEqualTo(1);
+        assertThat(g.get("signalCount").asInt()).isEqualTo(1);
+        assertThat(g.get("text").asText()).contains("_가전자_").doesNotContain("나부품").contains("A사, 메타넷 추격");
+        assertThat(jdbc.sql("SELECT filters->'company_ids' FROM digest_subscription WHERE id = ?").param(gaOnly).query(String.class).single())
+                .isEqualTo("[" + ga + "]");
+
+        // 감시만 고른 구독에는 거래처 신호가 들어가지 않는다
+        long watchOnly = subscribe("viewer", "경쟁사", "EMAIL", "viewer@example.com", "{\"watchIds\":[" + s.watchRival() + "]}");
+        JsonNode w = read(post("viewer", "/api/v1/digests/" + watchOnly + "/preview", "").getBody());
+        assertThat(w.get("signalCount").asInt()).isZero();
+        assertThat(w.get("text").asText()).doesNotContain("거래처 신호");
+
+        // 문서는 모두 지난 다이제스트 전에 수집됐고 신호만 새로 생겼다 → 문서 0건이어도 보낸다
+        long hook = subscribe("registrar", "슬랙", "WEBHOOK", hookUrl(), null);
+        jdbc.sql("UPDATE digest_subscription SET last_sent_at = now() WHERE id = ?").param(hook).update();
+        jdbc.sql("""
+                INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, observed_at, created_at)
+                VALUES (?, 'BIZ_STATUS', 'HIGH', '02', '휴업자', clock_timestamp(), clock_timestamp())
+                """).param(ga).update();
+        JsonNode run = read(post("registrar", "/api/v1/digests/" + hook + "/send-now", "").getBody());
+        assertThat(run.get("status").asText()).isEqualTo("SENT");
+        assertThat(run.get("documentCount").asInt()).isZero();
+        assertThat(hookBodies).hasSize(1);
+        assertThat(hookBodies.get(0)).contains("*거래처 신호*").contains("[HIGH] 휴업자").doesNotContain("폐업자")
+                .contains("새 문서 0건 · 거래처 신호 1건");
+        // 그 뒤에는 신호도 없어 EMPTY
+        assertThat(read(post("registrar", "/api/v1/digests/" + hook + "/send-now", "").getBody()).get("status").asText()).isEqualTo("EMPTY");
     }
 
     @Test

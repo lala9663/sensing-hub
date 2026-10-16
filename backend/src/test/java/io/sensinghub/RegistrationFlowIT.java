@@ -52,8 +52,8 @@ class RegistrationFlowIT {
     void clean() {
         jdbc.sql("""
                 TRUNCATE chat_feedback, chat_citation, chat_message, chat_session, chunk, attachment,
-                         document_version, document_watch, document_enrichment, document, crawl_error, crawl_job, registration_request,
-                         audit_log, api_credential
+                         document_version, document_watch, document_enrichment, document_company, company_signal, company,
+                         document, crawl_error, crawl_job, registration_request, audit_log, api_credential
                 RESTART IDENTITY CASCADE
                 """).update();
         jdbc.sql("UPDATE source SET active_config_version_id = NULL").update();
