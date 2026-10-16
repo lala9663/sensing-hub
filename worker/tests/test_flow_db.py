@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+from urllib.parse import urlsplit
 
 import psycopg
 import pytest
@@ -283,3 +284,29 @@ def test_same_site_goes_to_review_without_llm(env):
     assert process_one(store, runner, settings) == "FAILED"                    # NoLlm: 날짜를 못 찾아 품질 불합격
     assert q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)["status_reason"] == "QUALITY_FAILED"
     assert q(store, "SELECT status FROM registration_request")["status"] == "REVIEW"
+
+
+def test_broken_section_keeps_crawl_partial_and_source_active(env):
+    store, runner, settings, sites = env
+    site = Site(news_site_routes()); sites.append(site)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    # 섹션 하나가 사라져 404: 홈과 다른 섹션은 그대로라 주기 수집은 계속되어야 한다
+    hubs = q(store, "SELECT v.config->'hubs' AS hubs FROM source s "
+                    "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", source_id)["hubs"]
+    gone = next(h for h in hubs if "sc_section_code=S1N1" in h)
+    parts = urlsplit(gone)
+    site.routes[parts.path + "?" + parts.query] = (404, "text/html", "<html><body>section removed</body></html>")
+    site.hits.clear()
+
+    assert crawl(store, runner, settings, source_id) == "PARTIAL"
+    src = q(store, "SELECT status, consecutive_failures FROM source WHERE id = %s", source_id)
+    assert src["status"] == "ACTIVE" and src["consecutive_failures"] == 0
+    job = q(store, "SELECT status, found_count, error_count FROM crawl_job WHERE job_type = 'CRAWL'")
+    assert job["status"] == "PARTIAL" and job["found_count"] == 6 and job["error_count"] == 1
+    errs = store.conn.execute("SELECT code, stage, http_status, url FROM crawl_error").fetchall()
+    assert len(errs) == 1
+    assert errs[0]["code"] == "HTTP_4XX" and errs[0]["stage"] == "LIST" and errs[0]["http_status"] == 404
+    assert errs[0]["url"] == gone
+    assert any("sc_section_code=S1N2" in h for h in site.hits)  # 다음 허브는 계속 방문했다

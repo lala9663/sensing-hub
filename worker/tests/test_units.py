@@ -615,3 +615,71 @@ def test_extract_uses_recipe_selectors_and_date_format():
     assert art.published_at == datetime(2026, 10, 13, 15, 0, tzinfo=timezone.utc) and art.body_length >= 200
     # 형식이 맞지 않으면 공통 해석으로 넘어간다
     assert extract_article(html, "https://p.go.kr/x", {"date": ".reg"}, date_format="%d/%m/%Y").published_at is not None
+
+
+def _crawl_runner(tmp_path, handler):
+    """가짜 사이트(MockTransport)와 MagicMock 저장소로 JobRunner._crawl만 돌린다."""
+    from sensing_worker.db import Job
+    from sensing_worker.jobs import JobRunner
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True, evidence_dir=str(tmp_path))
+    store = MagicMock()
+    store.found_baseline.return_value = None
+    store.known_urls.return_value = set()
+    store.upsert_document.return_value = (1, "NEW")
+    runner = JobRunner(store, PoliteFetcher(s, transport=httpx.MockTransport(handler)), s, llm=NoLlm())
+    job = Job(id=7, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=None, attempt=1)
+    return runner, store, job
+
+
+def _news_handler(statuses: dict[str, int]):
+    items = "".join(f"<li><a href='/news/articleView.html?idxno={i}'>기사 {i}</a></li>" for i in range(1, 4))
+    article = ("<html><head><title>기사</title><meta property='og:title' content='기사 제목'>"
+               "<meta property='article:published_time' content='2026-10-01T09:00:00+09:00'></head>"
+               "<body><article><p>본문</p></article></body></html>")
+
+    def handler(request):
+        key = request.url.path + ("?" + request.url.query.decode() if request.url.query else "")
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        if key in statuses:
+            return httpx.Response(statuses[key], text="<html><body>oops</body></html>")
+        if request.url.path == "/news/articleView.html":
+            return httpx.Response(200, text=article)
+        return httpx.Response(200, text=f"<html><body><ul>{items}</ul></body></html>")
+    return handler
+
+
+NEWS_CONFIG = {"method": "STATIC", "store_scope": "TITLE_LINK",
+               "hubs": ["https://site.example/", "https://site.example/news/articleList.html?sc=A",
+                        "https://site.example/news/articleList.html?sc=B"],
+               "article_pattern": pattern_from_signature("/news/articleView.html?idxno={n}")}
+SOURCE = {"domain": "site.example", "interval_minutes": 60, "active_config_version_id": None}
+
+
+def test_crawl_skips_hub_that_fails_without_blocking(tmp_path):
+    runner, store, job = _crawl_runner(tmp_path, _news_handler({"/news/articleList.html?sc=A": 404}))
+    stats = runner._crawl(job, SOURCE, NEWS_CONFIG)
+    assert stats.found == 3 and stats.new == 3 and stats.errors == 1
+    store.record_error.assert_called_once()
+    failure = store.record_error.call_args.args[1]
+    assert failure.code == Code.HTTP_4XX and failure.stage == "LIST" and failure.url.endswith("?sc=A")
+
+
+def test_crawl_fails_with_last_error_when_no_hub_opens(tmp_path):
+    runner, store, job = _crawl_runner(tmp_path, _news_handler({
+        "/": 404, "/news/articleList.html?sc=A": 404, "/news/articleList.html?sc=B": 503}))
+    with pytest.raises(CrawlFailure) as e:
+        runner._crawl(job, SOURCE, NEWS_CONFIG)
+    assert e.value.code == Code.HTTP_5XX and e.value.stage == "LIST"       # 마지막 오류가 실패 사유
+    assert store.record_error.call_count == 2                              # 앞의 두 허브 오류만 여기서 기록 (마지막은 run()이)
+    assert [c.args[1].code for c in store.record_error.call_args_list] == [Code.HTTP_4XX, Code.HTTP_4XX]
+
+
+def test_crawl_stops_at_blocking_hub(tmp_path):
+    runner, store, job = _crawl_runner(tmp_path, _news_handler({
+        "/news/articleList.html?sc=A": 404, "/news/articleList.html?sc=B": 403}))
+    with pytest.raises(CrawlFailure) as e:
+        runner._crawl(job, SOURCE, NEWS_CONFIG)
+    assert e.value.code == Code.BOT_CHALLENGE and e.value.blocking
+    assert store.record_error.call_count == 1                              # 앞서 건너뛴 허브의 404는 남긴다
+    assert store.record_error.call_args.args[1].code == Code.HTTP_4XX

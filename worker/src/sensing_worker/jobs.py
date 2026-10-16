@@ -135,8 +135,22 @@ class JobRunner:
         candidates: list[str] = []
         hints: dict[str, str] = {}  # 기사 URL → 목록·피드에 보인 날짜 (상세에 날짜가 없을 때 씀)
         first_hub_html: str | None = None
+        opened = 0  # 실제로 연 허브 수
+        hub_failures: list[CrawlFailure] = []  # 못 연 허브의 비차단 오류 (섹션 하나가 404여도 수집은 계속한다)
         for hub in config["hubs"]:
-            page = self.f.get(hub)
+            try:
+                page = self.f.get(hub)
+            except CrawlFailure as e:
+                e.stage = "LIST"
+                if e.blocking:
+                    # 차단 신호는 즉시 중단. 앞서 못 연 허브의 오류는 기록만 남긴다 (실패 자체는 run()이 기록)
+                    for hf in hub_failures:
+                        self._record(job, hf)
+                    raise
+                log.warning("hub skipped source=%s url=%s code=%s", job.source_id, hub, e.code.value)
+                hub_failures.append(e)
+                continue
+            opened += 1
             first_hub_html = first_hub_html if first_hub_html is not None else page.text
             if looks_like_feed(page.text):
                 entries = parse_feed_entries(page.text)
@@ -150,6 +164,14 @@ class JobRunner:
                     candidates.append(c)
                     if date and c not in hints:
                         hints[c] = date
+        if not opened and hub_failures:
+            # 허브를 하나도 못 열었다 → 마지막 오류로 실패 처리 (run()이 기록·반영). 앞의 오류는 여기서 남긴다
+            for hf in hub_failures[:-1]:
+                self._record(job, hf)
+            raise hub_failures[-1]
+        for hf in hub_failures:
+            self._record(job, hf)
+            stats.errors += 1
         candidates = list(dict.fromkeys(candidates))
         stats.found = len(candidates)
 
