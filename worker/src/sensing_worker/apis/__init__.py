@@ -15,11 +15,13 @@ from .base import ApiConnector, ApiItem, mask_secret
 from .catalog import Provider, lookup
 from .dart import DartConnector
 from .naver_news import NaverNewsConnector
+from .nts_status import BizStatus, NtsStatusConnector
 
 # httpx는 요청마다 전체 URL을 INFO로 남긴다. API 키가 쿼리에 실리므로 끈다
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-CONNECTORS: dict[str, type] = {DartConnector.provider: DartConnector, NaverNewsConnector.provider: NaverNewsConnector}
+CONNECTORS: dict[str, type] = {DartConnector.provider: DartConnector, NaverNewsConnector.provider: NaverNewsConnector,
+                               NtsStatusConnector.provider: NtsStatusConnector}
 
 
 def make_connector(provider_id: str, fetcher: PoliteFetcher) -> ApiConnector:
@@ -29,5 +31,5 @@ def make_connector(provider_id: str, fetcher: PoliteFetcher) -> ApiConnector:
         raise ValueError(f"커넥터가 없는 API 제공자: {provider_id}") from None
 
 
-__all__ = ["ApiConnector", "ApiItem", "DartConnector", "NaverNewsConnector", "Provider", "lookup", "make_connector",
-           "mask_secret"]
+__all__ = ["ApiConnector", "ApiItem", "BizStatus", "DartConnector", "NaverNewsConnector", "NtsStatusConnector", "Provider",
+           "lookup", "make_connector", "mask_secret"]

@@ -160,8 +160,13 @@ class PoliteFetcher:
         headers: 헤더로 인증하는 API(네이버 X-Naver-Client-Id 등)용. 로그에 남기지 않는다."""
         return self._request(url, check_robots=False, classify=False, headers=headers)
 
+    def post_api(self, url: str, json_body, headers: dict[str, str] | None = None) -> Page:
+        """JSON 본문을 POST하는 공개 API 호출 (국세청 사업자 상태조회 등). 그 밖은 get_api와 같다.
+        리다이렉트는 따라가지 않는다 (POST 본문을 다른 호스트로 다시 보내지 않기 위해)."""
+        return self._request(url, check_robots=False, classify=False, headers=headers, method="POST", json_body=json_body)
+
     def _request(self, url: str, *, check_robots: bool, classify: bool, redirects: int = 0,
-                 headers: dict[str, str] | None = None) -> Page:
+                 headers: dict[str, str] | None = None, method: str = "GET", json_body=None) -> Page:
         if check_robots and not self.allowed(url):
             raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=url)
         self._guard_host(url)
@@ -174,7 +179,7 @@ class PoliteFetcher:
             self._throttle(url)
             client = self._compat() if use_compat else self._client
             try:
-                with client.stream("GET", url, headers=headers) as resp:
+                with client.stream(method, url, headers=headers, json=json_body) as resp:
                     self.request_count += 1
                     if use_compat:
                         self.compat_hosts.add(host)
@@ -212,6 +217,8 @@ class PoliteFetcher:
             except httpx.HTTPError as e:
                 raise CrawlFailure(Code.UNEXPECTED, f"{type(e).__name__}: {e}"[:500], url=url, retryable=True) from e
 
+            if method == "POST":
+                return page
             # 리다이렉트는 직접 따라가며 매번 내부망·robots를 확인한다
             if page.status in (301, 302, 303, 307, 308) and "location" in page.headers:
                 target = urljoin(url, page.headers["location"])

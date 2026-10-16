@@ -1307,6 +1307,33 @@ class _FakeEnrichStore:
     def save_enrichment(self, document_id, document_version, **fields):
         self.saved.append((document_id, document_version, fields))
 
+    # 회사 레이어 (M3): companies=[{id, name, aliases}], links={document_id: [(company_id, matched_by)]}
+    companies: list = []
+    links: dict = {}
+    signals: list = []
+
+    def load_company_names(self):
+        return list(self.companies)
+
+    def add_document_company(self, document_id, company_id, matched_by):
+        pairs = self.links.setdefault(document_id, [])
+        if any(c == company_id for c, _ in pairs):
+            return False
+        pairs.append((company_id, matched_by))
+        return True
+
+    def companies_of_documents(self, ids):
+        return {i: list(self.links[i]) for i in ids if i in self.links}
+
+    def add_company_signal(self, company_id, kind, severity, fingerprint, title, detail, observed_at, document_id=None,
+                           source_id=None):
+        key = (company_id, kind, fingerprint)
+        if any((s["company_id"], s["kind"], s["fingerprint"]) == key for s in self.signals):
+            return False
+        self.signals.append(dict(company_id=company_id, kind=kind, severity=severity, fingerprint=fingerprint, title=title,
+                                 detail=detail, observed_at=observed_at, document_id=document_id, source_id=source_id))
+        return True
+
 
 def _rows(n, **kw):
     rows = []
@@ -1364,3 +1391,169 @@ def test_main_loop_runs_enrich_only_when_idle_and_llm_is_configured(monkeypatch)
         raise RuntimeError("db down")
     monkeypatch.setattr(m, "enrich_pending", boom)
     m.enrich_idle(None, FakeLlm(["{}"]), Settings())     # 보강 오류는 루프를 죽이지 않는다
+
+
+# ---------------------------------------------------------------- 회사 레이어 (M3): 국세청 상태 커넥터, 태그 매칭, 신호 규칙
+
+def test_data_go_kr_is_a_shared_portal_provider():
+    from sensing_worker.apis import catalog
+    p = catalog.lookup("api.odcloud.kr")
+    assert p.id == "data_go_kr" and p.needs_key and not p.keyword_based
+    assert catalog.lookup("apis.data.go.kr").id == "data_go_kr"
+    assert "국세청 사업자등록 상태조회 활용신청 필요" in p.description and "data.go.kr" in p.signup_url
+    assert catalog.lookup("www.data.go.kr") is None                     # 포털 홈 자체는 API 도메인이 아니다
+
+
+def test_nts_connector_checks_in_batches_and_classifies_statuses_without_leaking_key():
+    from fakents import GOOD_KEY, closed, continuing, nts_handler, suspended, unregistered
+    from sensing_worker.apis.nts_status import BATCH_SIZE, NtsStatusConnector
+    nos = [f"{1000000000 + i:010d}" for i in range(0, 250)]              # 250건 → 100·100·50 세 번
+    handler = nts_handler({nos[0]: closed(nos[0]), nos[1]: suspended(nos[1]), nos[2]: unregistered(nos[2]),
+                           nos[3]: continuing(nos[3], "부가가치세 간이과세자", "02")})
+    c = NtsStatusConnector(_api_fetcher(handler))
+    c.verify(GOOD_KEY)
+    assert handler.calls[0] == (["0000000000"], "POST")
+    assert c.default_config() == {"method": "API", "provider": "data_go_kr", "check": "nts_status"}
+    assert c.fetch(GOOD_KEY, {}, datetime.now(timezone.utc).date(), 10) == []   # 문서를 만들지 않는다
+
+    statuses = c.check(GOOD_KEY, ["123-45-67890"] + nos[1:] + [nos[0], "bad"])   # 하이픈 정규화·중복·잘못된 형식
+    assert [len(b) for b, _ in handler.calls[1:]] == [BATCH_SIZE, BATCH_SIZE, 51]
+    assert handler.calls[1][0][0] == "1234567890"
+    by_no = {s.biz_no: s for s in statuses}
+    assert len(statuses) == 251 and len(by_no) == 251                       # 응답 순서와 무관하게 요청 순서, 중복 없음
+    assert by_no[nos[0]].status_code == "03" and by_no[nos[0]].end_dt == "20260930" and not by_no[nos[0]].continuing
+    assert by_no[nos[1]].status_code == "02" and by_no[nos[1]].status == "휴업자"
+    assert by_no[nos[2]].status_code == "" and not by_no[nos[2]].registered and by_no[nos[2]].status == "미등록"
+    assert "등록되지 않은" in by_no[nos[2]].tax_type
+    assert by_no[nos[3]].continuing and by_no[nos[3]].tax_type_code == "02"
+    assert by_no["1234567890"].status_code == "" and by_no[nos[0]].as_detail()["b_stt"] == "폐업자"
+    # 키는 요청 URL에만 실린다 (인코딩되어). 응답·오류 어디에도 남지 않는다 (아래 테스트)
+    assert all("serviceKey=" in u and GOOD_KEY not in u for u in handler.urls)
+
+
+def test_nts_connector_classifies_key_errors_and_outages_and_masks_key():
+    from fakents import GOOD_KEY, nts_handler
+    from sensing_worker.apis.nts_status import NtsStatusConnector
+
+    with pytest.raises(CrawlFailure) as e:                                   # 잘못된 키 → API_KEY_INVALID, 본문·URL 모두 가림
+        NtsStatusConnector(_api_fetcher(nts_handler())).verify("wrong-service-key")
+    assert e.value.code == Code.API_KEY_INVALID and not e.value.retryable and e.value.http_status == 401
+    assert "등록되지 않은 인증키" in str(e.value) and "wrong-service-key" not in str(e.value)
+    assert "serviceKey=***" in e.value.url and "wrong-service-key" not in e.value.url
+
+    with pytest.raises(CrawlFailure) as e:                                   # 한도 초과 → API_ERROR(재시도)
+        NtsStatusConnector(_api_fetcher(nts_handler(http_status=429))).check(GOOD_KEY, ["1234567890"])
+    assert e.value.code == Code.API_ERROR and e.value.retryable and e.value.http_status == 429
+    assert GOOD_KEY not in (e.value.url + str(e.value) + (e.value.evidence or ""))
+
+    with pytest.raises(CrawlFailure) as e:                                   # 서버 장애도 재시도
+        NtsStatusConnector(_api_fetcher(nts_handler(http_status=503))).check(GOOD_KEY, ["1234567890"])
+    assert e.value.code == Code.API_ERROR and e.value.retryable
+
+    def down(request):
+        raise httpx.ConnectError("boom", request=request)
+    with pytest.raises(CrawlFailure) as e:
+        NtsStatusConnector(_api_fetcher(down)).verify(GOOD_KEY)
+    assert e.value.code == Code.TIMEOUT and GOOD_KEY not in e.value.url and "serviceKey=***" in e.value.url
+
+    assert NtsStatusConnector(_api_fetcher(nts_handler())).check(GOOD_KEY, ["bad", ""]) == []   # 보낼 번호가 없으면 호출 없음
+
+
+def test_post_api_does_not_follow_redirects_and_keeps_private_host_guard():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, str(request.url)))
+        return httpx.Response(302, headers={"location": "https://evil.example.com/"}, json={})
+    page = _api_fetcher(handler).post_api("https://api.odcloud.kr/x", {"a": 1}, headers={"Accept": "application/json"})
+    assert page.status == 302 and seen == [("POST", "https://api.odcloud.kr/x")]
+
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=False)
+    with pytest.raises(CrawlFailure) as e:
+        PoliteFetcher(s, transport=httpx.MockTransport(handler)).post_api("http://10.0.0.5/api", {})
+    assert e.value.code == Code.INTERNAL_ADDRESS
+
+
+def test_tags_link_to_companies_only_on_exact_name_or_alias_match():
+    from sensing_worker.company import build_name_index, match_companies_by_tags, normalize_name
+    index = build_name_index([
+        {"id": 1, "name": "가전자", "aliases": ["GA Electronics", "가전자(주)"]},
+        {"id": 2, "name": "나부품", "aliases": []},
+        {"id": 3, "name": "가전자", "aliases": ["중복이름"]},                      # 같은 이름은 먼저 온 회사가 이긴다
+    ])
+    assert normalize_name("  GA  Electronics ") == "gaelectronics"
+    assert match_companies_by_tags(["가전자", "나부품", "가전자"], index) == [1, 2]
+    assert match_companies_by_tags(["ga electronics", "가 전 자 (주)", "중복이름"], index) == [1, 3]   # 대소문자·공백 무시
+    assert match_companies_by_tags(["가전자 반도체", "주식회사 가전자", "나부", "전자", "GA"], index) == []   # 부분 일치는 안 된다
+    assert match_companies_by_tags([None, 3, ""], index) == [] and match_companies_by_tags([], {}) == []
+
+
+def test_biz_status_signal_severity_and_fingerprint_rules():
+    from fakents import closed, continuing, suspended, unregistered
+    from sensing_worker.apis.nts_status import _to_status
+    from sensing_worker.company import biz_status_signal
+
+    s = biz_status_signal(_to_status(closed("1234567890", "20260930")), None)
+    assert (s.kind, s.severity, s.fingerprint) == ("BIZ_STATUS", "HIGH", "0320260930")
+    assert s.title == "폐업자 (폐업일 2026-09-30)" and s.detail["b_stt_cd"] == "03"
+    assert biz_status_signal(_to_status(suspended("1234567890")), {"b_stt_cd": "01"}).severity == "HIGH"
+    assert biz_status_signal(_to_status(suspended("1234567890")), None).fingerprint == "02"
+    u = biz_status_signal(_to_status(unregistered("1234567890")), None)
+    assert u.severity == "MEDIUM" and u.fingerprint == "unregistered" and "등록되지 않은" in u.title
+    # 같은 폐업 상태는 다음 날에도 같은 fingerprint → DB unique가 중복을 막는다
+    again = biz_status_signal(_to_status(closed("1234567890", "20260930")), {"b_stt_cd": "03", "end_dt": "20260930"})
+    assert again.fingerprint == "0320260930"
+
+    ok = _to_status(continuing("1234567890"))
+    assert biz_status_signal(ok, None) is None                                           # 처음 확인한 정상 사업자: 신호 없음
+    assert biz_status_signal(ok, {"b_stt_cd": "01", "tax_type_cd": "01"}) is None        # 변화 없음
+    tax = biz_status_signal(_to_status(continuing("1234567890", "부가가치세 일반과세자", "01")),
+                            {"b_stt_cd": "01", "tax_type": "부가가치세 간이과세자", "tax_type_cd": "02"})
+    assert tax.severity == "LOW" and tax.fingerprint == "tax:01" and tax.title == "과세유형 변경: 부가가치세 간이과세자 → 부가가치세 일반과세자"
+    resumed = biz_status_signal(ok, {"b_stt_cd": "02", "tax_type_cd": "01"})
+    assert resumed.severity == "LOW" and "영업 재개" in resumed.title and resumed.fingerprint == "01"
+
+
+def test_news_signal_only_for_incident_and_personnel_topics():
+    from sensing_worker.company import news_signal
+    s = news_signal("h" * 64, "  나부품 공장 화재 ", ["사건·사고", "산업동향"], url="https://n/1", matched_by="WATCH")
+    assert (s.kind, s.severity, s.fingerprint, s.title) == ("NEWS", "MEDIUM", "h" * 64, "나부품 공장 화재")
+    assert s.detail == {"topics": ["사건·사고"], "url": "https://n/1", "matched_by": "WATCH"}
+    assert news_signal("h", "임원 인사", ["인사·조직"]).severity == "MEDIUM"
+    assert news_signal("h", "신제품", ["자사", "산업동향"]) is None and news_signal("h", "x", []) is None
+    assert news_signal("h", None, ["사건·사고"]).title == "(제목 없음)"
+
+
+def test_enrich_links_tags_to_companies_and_raises_news_signals_in_the_same_pass():
+    from fakellm import BatchFakeLlm
+    from sensing_worker.db import sha256
+    from sensing_worker.enrich import enrich_pending
+    rows = _rows(3)
+    store = _FakeEnrichStore(rows)
+    store.companies = [{"id": 1, "name": "가전자", "aliases": ["GA"]}, {"id": 2, "name": "나부품", "aliases": []}]
+    store.links = {2: [(2, "WATCH")]}                                             # 2번 기사는 나부품 감시로 이미 연결됨
+    store.signals = []
+
+    def make(idx, prompt):
+        if idx == 1:
+            return {"idx": 1, "summary": None, "topics": ["사건·사고"], "tags": ["가전자", "가전자 반도체사업부"]}   # 태그 정확 일치 → 1번 회사
+        if idx == 2:
+            return {"idx": 2, "summary": None, "topics": ["인사·조직"], "tags": ["누군가"]}                   # 감시 연결 → 신호
+        return {"idx": 3, "summary": None, "topics": ["사건·사고"], "tags": ["전자"]}                       # 부분 일치뿐 → 연결 없음
+    outcome = enrich_pending(store, BatchFakeLlm(make), Settings(), limit=10)
+    assert (outcome.done, outcome.company_links, outcome.company_signals) == (3, 1, 2)
+    assert store.links == {2: [(2, "WATCH")], 1: [(1, "TAG")]}
+    assert sorted((s["company_id"], s["kind"], s["severity"], s["fingerprint"], s["document_id"], s["detail"]["matched_by"])
+                  for s in store.signals) == [(1, "NEWS", "MEDIUM", sha256("https://n.example.com/1"), 1, "TAG"),
+                                              (2, "NEWS", "MEDIUM", sha256("https://n.example.com/2"), 2, "WATCH")]
+    assert {s["title"] for s in store.signals} == {"기사 1", "기사 2"}
+
+    # 같은 묶음을 다시 보강해도(본문 변경 등) 신호는 같은 fingerprint라 늘지 않는다
+    again = enrich_pending(store, BatchFakeLlm(make), Settings(), limit=10)
+    assert again.company_signals == 0 and again.company_links == 0 and len(store.signals) == 2
+
+    # 회사가 하나도 없으면 아무것도 연결하지 않는다
+    empty = _FakeEnrichStore(_rows(1))
+    empty.companies, empty.links, empty.signals = [], {}, []
+    enrich_pending(empty, BatchFakeLlm(make), Settings(), limit=10)
+    assert empty.links == {} and empty.signals == []

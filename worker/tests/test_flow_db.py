@@ -642,3 +642,181 @@ def test_two_workers_do_not_enrich_the_same_documents(env):
         assert len(enrichments(store)) == 3
     finally:
         other.close()
+
+
+# ---------------------------------------------------------------- 회사 레이어 (M3): 회사 감시 → 문서 연결, 보강 → NEWS 신호, 점검 소스 → BIZ_STATUS 신호
+
+def register_company(store: Store, name: str, aliases: list[str], biz_no: str | None, user_id: int = 2) -> tuple[int, int]:
+    """백엔드 CompanyService.create와 같은 행: company + 회사 감시(WATCH, 360분) + watch_source_id. (company_id, watch_source_id)."""
+    import json as _json
+    watch_id = register_watch(store, "회사:" + name, [name, *aliases], user_id=user_id)
+    store.conn.execute("UPDATE source SET interval_minutes = 360 WHERE id = %s", (watch_id,))
+    company_id = store.conn.execute(
+        "INSERT INTO company (name, aliases, biz_no, watch_source_id, created_by) VALUES (%s, %s::jsonb, %s, %s, %s) RETURNING id",
+        (name, _json.dumps(aliases, ensure_ascii=False), biz_no, watch_id, user_id)).fetchone()["id"]
+    return company_id, watch_id
+
+
+def register_check_source(store: Store, user_id: int = 2) -> int:
+    """백엔드 CompanyService.ensureCheckSource와 같은 행: site api.odcloud.kr + source(kind CHECK, 1440분) + 설정 v1 + ONBOARD."""
+    c = store.conn
+    site_id = c.execute("INSERT INTO site (domain, base_url, site_type, risk_flags) VALUES (%s, %s, 'PUBLIC', %s::jsonb) "
+                        "ON CONFLICT (domain) DO UPDATE SET domain = EXCLUDED.domain RETURNING id",
+                        ("api.odcloud.kr", "https://api.odcloud.kr", '{"api_provider":"data_go_kr"}')).fetchone()["id"]
+    source_id = c.execute(
+        "INSERT INTO source (site_id, name, kind, method, status, interval_minutes, requested_by) "
+        "VALUES (%s, 'check:nts_status', 'CHECK', 'API', 'PENDING', 1440, %s) RETURNING id", (site_id, user_id)).fetchone()["id"]
+    config_id = c.execute(
+        "INSERT INTO source_config_version (source_id, version, config, status, change_note, created_by) "
+        "VALUES (%s, 1, %s::jsonb, 'ACTIVE', '회사 점검 소스 생성', %s) RETURNING id",
+        (source_id, '{"method": "API", "provider": "data_go_kr", "check": "nts_status"}', user_id)).fetchone()["id"]
+    c.execute("UPDATE source SET active_config_version_id = %s WHERE id = %s", (config_id, source_id))
+    c.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'REGISTRATION')", (source_id,))
+    return source_id
+
+
+def signals(store: Store, company_id: int | None = None) -> list[dict]:
+    where = "WHERE company_id = %s" if company_id else ""
+    return store.conn.execute(f"SELECT * FROM company_signal {where} ORDER BY id", (company_id,) if company_id else ()).fetchall()
+
+
+def test_company_watch_links_articles_and_enrichment_raises_news_signal(env):
+    from fakellm import BatchFakeLlm
+    from fakenaver import GOOD_KEY, article, articles, naver_handler
+    from sensing_worker.enrich import enrich_pending
+    store, _, settings, _ = env
+    put_credential(store, "naver_news", GOOD_KEY)
+    handler = naver_handler({"나부품": [article("나부품", 1, title="<b>나부품</b> 공장 화재로 생산 중단"),
+                                     article("나부품", 2, title="<b>나부품</b> 신제품 출시")],
+                             "NABU": [article("NABU", 3, title="NABU 대표이사 교체")],
+                             "가전자": articles("가전자", 1)})
+    runner, s = api_runner(store, settings, handler)
+    nabu, nabu_watch = register_company(store, "나부품", ["NABU"], "1234567890")
+    ga, ga_watch = register_company(store, "가전자", [], None)
+    plain_watch = register_watch(store, "경쟁사", ["가전자"], user_id=3)        # 회사가 아닌 일반 감시
+
+    assert process_one(store, runner, s) == "SUCCESS" and process_one(store, runner, s) == "SUCCESS"
+    assert process_one(store, runner, s) == "SUCCESS"
+    assert q(store, "SELECT interval_minutes FROM source WHERE id = %s", nabu_watch)["interval_minutes"] == 360   # 회사 감시 주기 유지
+    links = store.conn.execute("SELECT dc.company_id, dc.matched_by, d.title FROM document_company dc "
+                               "JOIN document d ON d.id = dc.document_id ORDER BY dc.company_id, d.id").fetchall()
+    assert [(l["company_id"], l["matched_by"]) for l in links] == [(nabu, "WATCH")] * 3 + [(ga, "WATCH")]
+    assert signals(store) == []                                                   # 보강 전에는 신호가 없다
+
+    def classify(idx, prompt):
+        topics = ["사건·사고"] if "화재" in _doc_block(prompt, idx) else ["인사·조직"] if "교체" in _doc_block(prompt, idx) else ["자사"]
+        return {"idx": idx, "summary": None, "topics": topics, "tags": []}
+    outcome = enrich_pending(store, BatchFakeLlm(classify), s, limit=10)
+    assert outcome.done == 4 and outcome.company_signals == 2 and outcome.company_links == 0
+    rows = signals(store, nabu)
+    assert [(r["kind"], r["severity"], r["title"]) for r in rows] == [("NEWS", "MEDIUM", "나부품 공장 화재로 생산 중단"),
+                                                                     ("NEWS", "MEDIUM", "NABU 대표이사 교체")]
+    assert all(r["document_id"] is not None and len(r["fingerprint"]) == 64 and r["detail"]["matched_by"] == "WATCH" for r in rows)
+    assert signals(store, ga) == []                                                # 가전자 기사는 토픽이 자사라 신호 없음
+
+    # 다시 수집해도 연결·신호는 늘지 않는다
+    assert crawl(store, runner, s, nabu_watch) == "SUCCESS"
+    assert q(store, "SELECT count(*) AS c FROM document_company")["c"] == 4
+    assert enrich_pending(store, BatchFakeLlm(classify), s, limit=10).fetched == 0 and len(signals(store)) == 2
+
+
+def _doc_block(prompt: str, idx: int) -> str:
+    start = prompt.index(f"[문서 {idx}]")
+    end = prompt.find("[문서 ", start + 1)
+    return prompt[start:end if end > 0 else None]
+
+
+def test_enrichment_tags_link_documents_to_companies_by_exact_name(env):
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    store, runner, settings, sites = env
+    gov = gov_site(sites)
+    register(store, gov.base)
+    assert process_one(store, runner, settings) == "SUCCESS"                    # 공공기관 문서 5건 (회사 감시와 무관)
+    nabu, _ = register_company(store, "나부품", ["NABU"], None)
+    process_one(store, runner, settings)                                        # 회사 감시 ONBOARD는 키가 없어 REVIEW (상관없음)
+
+    calls = iter([["나부품", "중소벤처기업부"], ["nabu"], ["나부품 협력사"], ["전자"], []])
+    tags = {}
+
+    def classify(idx, prompt):
+        tags[idx] = next(calls)
+        return {"idx": idx, "summary": f"요약 {idx}", "topics": ["사건·사고"], "tags": tags[idx]}
+    outcome = enrich_pending(store, BatchFakeLlm(classify), settings, limit=10)
+    assert outcome.done == 5 and outcome.company_links == 2 and outcome.company_signals == 2   # 정확 일치 2건만 (대소문자 무시)
+    links = store.conn.execute("SELECT matched_by FROM document_company WHERE company_id = %s", (nabu,)).fetchall()
+    assert [l["matched_by"] for l in links] == ["TAG", "TAG"]
+    assert all(r["detail"]["matched_by"] == "TAG" for r in signals(store, nabu))
+
+
+def test_check_source_records_biz_status_signals_once_and_waits_for_portal_key(env):
+    from fakents import GOOD_KEY, closed, continuing, nts_handler, suspended
+    from sensing_worker.apis import catalog
+    store, _, settings, _ = env
+    nabu, _ = register_company(store, "나부품", [], "1234567890")
+    ga, _ = register_company(store, "가전자", [], "1018112345")
+    nobiz, _ = register_company(store, "번호없음", [], None)
+    check_id = register_check_source(store)
+    # 회사 감시 ONBOARD 세 건은 네이버 키가 없어 REVIEW로 빠진다 (이 테스트의 관심사는 점검 소스)
+    handler = nts_handler({"1234567890": continuing("1234567890"), "1018112345": closed("1018112345", "20260930")})
+    runner, s = api_runner(store, settings, handler)
+    for _ in range(3):
+        assert process_one(store, runner, s) == "FAILED"
+
+    # ① 공공데이터포털 키가 없다 → 호출 없이 REVIEW/API_KEY_REQUIRED (관리자 큐 API_KEY, provider data_go_kr)
+    assert process_one(store, runner, s) == "FAILED"
+    assert handler.calls == []
+    src = q(store, "SELECT s.status, s.status_reason, s.kind, t.risk_flags FROM source s JOIN site t ON t.id = s.site_id WHERE s.id = %s",
+            check_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_REQUIRED" and src["kind"] == "CHECK"
+    assert src["risk_flags"] == {"api_provider": "data_go_kr"}
+    err = q(store, "SELECT code, message FROM crawl_error WHERE job_id = (SELECT max(id) FROM crawl_job WHERE source_id = %s)", check_id)
+    assert err["code"] == "API_KEY_REQUIRED" and "data.go.kr" in err["message"]
+    assert catalog.get("data_go_kr").key_required_message == err["message"]
+
+    # ② 관리자가 서비스키를 넣는다 → 검증 → 설정 v1 그대로 ACTIVE(1440분) → 첫 점검: 가전자 폐업 HIGH 1건
+    put_credential(store, "data_go_kr", GOOD_KEY)
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'MANUAL')", (check_id,))
+    assert process_one(store, runner, s) == "SUCCESS"
+    src = q(store, "SELECT s.status, s.status_reason, s.interval_minutes, v.version, v.config FROM source s "
+                   "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", check_id)
+    assert src["status"] == "ACTIVE" and src["status_reason"] is None and src["interval_minutes"] == 1440 and src["version"] == 1
+    assert src["config"] == {"method": "API", "provider": "data_go_kr", "check": "nts_status"}
+    assert handler.calls[0][0] == ["0000000000"] and sorted(handler.calls[1][0]) == ["1018112345", "1234567890"]   # 번호 없는 회사는 안 보냄
+    job = q(store, "SELECT status, found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", check_id)
+    assert (job["status"], job["found_count"], job["new_count"]) == ("SUCCESS", 2, 1)        # 확인 2곳, 새 신호 1건
+    rows = signals(store)
+    assert len(rows) == 1 and rows[0]["company_id"] == ga and rows[0]["kind"] == "BIZ_STATUS" and rows[0]["severity"] == "HIGH"
+    assert rows[0]["title"] == "폐업자 (폐업일 2026-09-30)" and rows[0]["fingerprint"] == "0320260930" and rows[0]["source_id"] == check_id
+    assert rows[0]["detail"]["b_stt_cd"] == "03" and rows[0]["detail"]["end_dt"] == "20260930"
+    last = q(store, "SELECT last_biz_status FROM company WHERE id = %s", ga)["last_biz_status"]
+    assert last["b_stt"] == "폐업자" and last["tax_type"] == "부가가치세 일반과세자" and "checked_at" in last
+    assert q(store, "SELECT last_biz_status->>'b_stt' AS s FROM company WHERE id = %s", nabu)["s"] == "계속사업자"
+    assert q(store, "SELECT last_biz_status FROM company WHERE id = %s", nobiz)["last_biz_status"] is None
+    assert q(store, "SELECT status FROM api_credential WHERE provider = 'data_go_kr'")["status"] == "VALID"
+    blob = " ".join((r["message"] or "") + (r["url"] or "") for r in store.conn.execute("SELECT message, url FROM crawl_error"))
+    assert GOOD_KEY not in blob
+
+    # ③ 다음 날 같은 상태 → fingerprint가 같아 신호가 늘지 않는다 (found 2, new 0). 급감 감지도 없다
+    assert crawl(store, runner, s, check_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", check_id)
+    assert (job["found_count"], job["new_count"]) == (2, 0) and len(signals(store)) == 1
+    assert q(store, "SELECT consecutive_anomalies FROM source WHERE id = %s", check_id)["consecutive_anomalies"] == 0
+
+    # ④ 나부품이 휴업으로 바뀌면 HIGH 신호 1건 추가, 가전자는 그대로
+    handler2 = nts_handler({"1234567890": suspended("1234567890"), "1018112345": closed("1018112345", "20260930")})
+    runner2, s2 = api_runner(store, settings, handler2)
+    assert crawl(store, runner2, s2, check_id) == "SUCCESS"
+    rows = signals(store)
+    assert [(r["company_id"], r["severity"], r["fingerprint"]) for r in rows] == [(ga, "HIGH", "0320260930"), (nabu, "HIGH", "02")]
+    assert q(store, "SELECT new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", check_id)["new_count"] == 1
+
+    # ⑤ 키가 폐기됐다 → REVIEW/API_KEY_INVALID, 자격 증명 INVALID, 키는 어디에도 없다
+    put_credential(store, "data_go_kr", "revoked-key")
+    assert crawl(store, runner2, s2, check_id) == "FAILED"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", check_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_INVALID"
+    cred = q(store, "SELECT status, last_error FROM api_credential WHERE provider = 'data_go_kr'")
+    assert cred["status"] == "INVALID" and "revoked-key" not in cred["last_error"]
+    err = q(store, "SELECT code, url FROM crawl_error ORDER BY id DESC LIMIT 1")
+    assert err["code"] == "API_KEY_INVALID" and "serviceKey=***" in err["url"]

@@ -258,6 +258,67 @@ class Store:
             ON CONFLICT (document_id, source_id) DO NOTHING
             """, (document_id, source_id, (keyword or "")[:200] or None))
 
+    # ------------------------------------------------------------------ 회사 (M3)
+    def company_of_watch(self, source_id: int) -> int | None:
+        """이 키워드 감시가 어느 회사의 감시(company.watch_source_id)인지. 아니면 None."""
+        row = self.conn.execute("SELECT id FROM company WHERE watch_source_id = %s AND status = 'ACTIVE' ORDER BY id LIMIT 1",
+                                (source_id,)).fetchone()
+        return row["id"] if row else None
+
+    def add_document_company(self, document_id: int, company_id: int, matched_by: str) -> bool:
+        """문서 → 회사 연결. 이미 있으면 처음 연결한 방식(matched_by)을 그대로 둔다. 새로 넣었으면 True."""
+        row = self.conn.execute(
+            """
+            INSERT INTO document_company (document_id, company_id, matched_by) VALUES (%s, %s, %s)
+            ON CONFLICT (document_id, company_id) DO NOTHING RETURNING document_id
+            """, (document_id, company_id, matched_by)).fetchone()
+        return row is not None
+
+    def load_company_names(self) -> list[dict]:
+        """태그 매칭용: ACTIVE 회사의 id·이름·별칭 (id 순)."""
+        return self.conn.execute(
+            "SELECT id, name, aliases FROM company WHERE status = 'ACTIVE' ORDER BY id").fetchall()
+
+    def companies_of_documents(self, document_ids: list[int]) -> dict[int, list[tuple[int, str]]]:
+        """문서별 [(company_id, matched_by)]."""
+        if not document_ids:
+            return {}
+        rows = self.conn.execute(
+            """
+            SELECT c.document_id, c.company_id, c.matched_by FROM document_company c
+            JOIN company k ON k.id = c.company_id AND k.status = 'ACTIVE'
+            WHERE c.document_id = ANY(%s) ORDER BY c.matched_at, c.company_id
+            """, (document_ids,)).fetchall()
+        out: dict[int, list[tuple[int, str]]] = {}
+        for r in rows:
+            out.setdefault(r["document_id"], []).append((r["company_id"], r["matched_by"]))
+        return out
+
+    def add_company_signal(self, company_id: int, kind: str, severity: str, fingerprint: str, title: str,
+                           detail: dict | None, observed_at: datetime, document_id: int | None = None,
+                           source_id: int | None = None) -> bool:
+        """회사 신호 한 건. 같은 (company_id, kind, fingerprint)가 이미 있으면 넣지 않는다 (False)."""
+        row = self.conn.execute(
+            """
+            INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, detail, observed_at, document_id, source_id)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+            ON CONFLICT (company_id, kind, fingerprint) DO NOTHING RETURNING id
+            """, (company_id, kind, severity, fingerprint[:200], (title or "")[:500] or "(제목 없음)",
+                  json.dumps(detail or {}, ensure_ascii=False), observed_at, document_id, source_id)).fetchone()
+        return row is not None
+
+    def companies_with_biz_no(self) -> list[dict]:
+        """국세청 상태 확인 대상: ACTIVE이고 사업자번호가 있는 회사 (id, name, biz_no, last_biz_status)."""
+        return self.conn.execute(
+            """
+            SELECT id, name, biz_no, last_biz_status FROM company
+            WHERE status = 'ACTIVE' AND biz_no IS NOT NULL ORDER BY id
+            """).fetchall()
+
+    def save_biz_status(self, company_id: int, detail: dict) -> None:
+        self.conn.execute("UPDATE company SET last_biz_status = %s::jsonb, updated_at = now() WHERE id = %s",
+                          (json.dumps(detail, ensure_ascii=False), company_id))
+
     def add_attachment(self, document_id: int, url: str, file_name: str) -> None:
         self.conn.execute(
             """
@@ -275,7 +336,7 @@ class Store:
         """
         return self.conn.execute(
             """
-            SELECT d.id, d.version, d.url, d.title, d.body_text, d.section, t.domain, t.site_type
+            SELECT d.id, d.version, d.url, d.title, d.body_text, d.section, d.published_at, t.domain, t.site_type
             FROM document d
             JOIN source s ON s.id = d.source_id
             JOIN site t ON t.id = s.site_id
