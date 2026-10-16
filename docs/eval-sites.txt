@@ -1,4 +1,5 @@
 # 자동 탐색 성공률 측정용 표본 (M1 목표: 10곳 중 8곳 자동 등록)
+# 한 줄에 "사이트 [샘플기사]". 샘플 기사 주소를 붙이면 고른 패턴이 그 기사를 잡는지(sample_match)도 잰다 (예: docs/eval-samples.txt).
 # 실제 운영 대상이 정해지면 이 목록을 바꿔 다시 측정한다:
 #   cd worker && sensing-discovery-eval ../docs/eval-sites.txt --target 8 --json ../docs/eval-result.json
 https://www.korea.kr          # 정책브리핑 (공공)

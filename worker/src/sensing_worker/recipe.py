@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup, Comment
 
 from .codes import Code, CrawlFailure
 from .config import Settings
-from .discovery import (SKIP_PATH, Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed,
+from .discovery import (SKIP_PATH, Discoverer, DiscoveryResult, canonical_article_url, has_identifier, looks_like_feed,
                         looks_like_sitemap, matches, parse_feed_entries, pattern_from_signature, same_site, signature,
                         sitemap_urls)
 from .extract import links_with_dates
@@ -40,7 +40,7 @@ RECIPE_SCHEMA: dict = {
         "hubs": {"type": "array", "items": {"type": "string"},
                  "description": "새 글이 가장 먼저 보이는 목록 페이지나 RSS 주소 (절대 URL, 같은 사이트)"},
         "article_signature": {"type": "string",
-                              "description": "기사 상세 URL 서명. 숫자는 {n}, 영숫자 식별자는 {id}, 쿼리 값은 숫자면 {n} 아니면 *"},
+                              "description": "기사 상세 URL 서명. 숫자는 {n}, 영숫자 식별자는 {id}, 소문자 단어 3개 이상의 슬러그는 {slug}, 섹션처럼 기사마다 다른 조각은 {*}, 쿼리 값은 숫자면 {n} 아니면 *"},
         "selectors": {
             "type": "object", "additionalProperties": False,
             "required": ["title", "date", "body", "attachment"],
@@ -71,9 +71,11 @@ SYSTEM_PROMPT = f"""당신은 한국 언론사·공공기관 게시판 사이트
 - hubs: 새 글이 가장 먼저 나타나는 목록 페이지(보도자료·공지·뉴스 섹션)나 RSS 주소를 2~{MAX_HUBS}개. 절대 URL이고 같은 사이트여야 합니다.
   기사 상세 주소는 허브가 아닙니다.
 - article_signature: 기사 상세 URL을 일반화한 서명입니다. 경로에서 숫자만으로 된 조각은 {{n}}, 숫자가 3개 이상 섞인
-  6자 이상의 영숫자 식별자는 {{id}}, 그 밖의 조각 안의 숫자는 {{n}}으로 바꿉니다. 쿼리는 키를 알파벳순으로 정렬하고
+  6자 이상의 영숫자 식별자는 {{id}}, 하이픈으로 이어진 소문자 단어 3개 이상의 슬러그는 {{slug}}, 그 밖의 조각 안의 숫자는
+  {{n}}으로 바꿉니다. 섹션 이름처럼 기사마다 다른 고정 조각은 {{*}}로 쓸 수 있습니다. 쿼리는 키를 알파벳순으로 정렬하고
   값이 숫자면 {{n}}, 아니면 *로 씁니다 (utm_*·page 같은 추적·쪽수 파라미터는 뺍니다).
   예) /news/articleView.html?idxno={{n}}  /bbs/board.php?bo_table=*&wr_id={{n}}  /kor/article/{{id}}/{{n}}/view?mno=*
+      /news/{{*}}/{{n}}  /{{slug}}/
   "링크 서명 통계"에 있는 서명을 그대로 고르는 것이 가장 안전합니다. 목록(list·section) 주소를 고르지 마세요.
 - selectors: BeautifulSoup.select(soupsieve) 문법의 CSS 셀렉터. title은 글 제목 텍스트만, date는 발행일·등록일 텍스트가
   든 요소, body는 본문 컨테이너, attachment는 첨부파일 <a> 요소를 가리켜야 합니다. 샘플 페이지에서 실제로 확인한 것만 쓰고
@@ -116,7 +118,7 @@ def signature_rows(urls: list[str], limit: int = MAX_SIGNATURE_ROWS) -> list[tup
         if SKIP_PATH.search(urlsplit(u).path):
             continue
         groups.setdefault(signature(u), []).append(u)
-    rows = [(sig, len(us), us[0]) for sig, us in groups.items() if "{n}" in sig or "{id}" in sig]
+    rows = [(sig, len(us), us[0]) for sig, us in groups.items() if has_identifier(sig)]
     rows.sort(key=lambda r: -r[1])
     return rows[:limit]
 
@@ -147,7 +149,7 @@ def pick_sample_urls(candidates: list[DiscoveryResult], home_entries: list[tuple
     for c in candidates:
         out += c.sample_urls
     dated = [u for u, d in home_entries if d]
-    ided = [u for u, _ in home_entries if ("{n}" in signature(u) or "{id}" in signature(u))
+    ided = [u for u, _ in home_entries if has_identifier(signature(u))
             and not SKIP_PATH.search(urlsplit(u).path)]
     return list(dict.fromkeys(out + dated + ided))[:limit]
 
@@ -181,8 +183,8 @@ def quick_check(data: dict, domain: str) -> list[str]:
     sig = data.get("article_signature") or ""
     if not sig.startswith("/") or re.search(r"\s", sig):
         errors.append(f"article_signature: '/'로 시작하는 경로 서명이어야 합니다 ({sig!r})")
-    elif "{n}" not in sig and "{id}" not in sig:
-        errors.append("article_signature: 기사를 구분하는 {n} 또는 {id} 자리가 있어야 합니다")
+    elif not has_identifier(sig):
+        errors.append("article_signature: 기사를 구분하는 {n}, {id} 또는 {slug} 자리가 있어야 합니다")
     else:
         try:
             re.compile(pattern_from_signature(sig)["path"])

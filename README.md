@@ -180,6 +180,9 @@ M1에서 한 일:
     후보를 유력한 순서로 품질 검사해 첫 합격 채택, 목록 행의 날짜를 상세에 넘기기, 게시판 제목·등록일·스크립트 첨부 추출,
     자기 하위 페이지로 링크하는 목록 페이지는 기사로 보지 않기, 공공기관은 본문 대신 첨부가 있어도 통과
 - [x] 등록 시 LLM 레시피 생성 (`SENSING_LLM_PROVIDER`: Claude 또는 OpenAI 호환 API, 스키마·샘플 품질 검사를 통과한 것만 설정으로 저장, 실패·장애 시 휴리스틱)
+- [x] 현업 샘플 기사가 등록된 패턴에 잡히는지 측정 — `docs/eval-sites.txt`에 "사이트 [샘플기사]"로 적으면 결과 표에 `샘플` 열(`sample_match`)이 붙는다.
+  섹션 조각 병합(`/news/economy/{n}`+`/news/society/{n}` → `/news/{*}/{n}`)과 숫자 없는 슬러그(`/{slug}/`) 패턴화로
+  2026-10-16 매일경제·EE Times·Tom's Hardware 샘플 **3/3 적중** (`docs/eval-samples.txt`, `docs/eval-samples-result.json`), 기존 표본 9/10 유지
 
 ## 원칙
 

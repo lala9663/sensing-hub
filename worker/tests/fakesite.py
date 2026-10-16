@@ -197,3 +197,26 @@ def portal_cms_routes(post_ids=range(1, 7)) -> dict:
         <p class="reg">{(datetime.now(timezone(timedelta(hours=9))) - timedelta(days=i)).strftime("%Y.%m.%d")}</p>
         <div class="cont-area"><p>{BODY}</p></div></div></body></html>""")
     return routes
+
+
+def sectioned_news_routes(sections=("economy", "society"), per_section=4) -> dict:
+    """섹션별 경로를 쓰는 언론사(매경형): 기사 주소가 /news/<섹션>/<번호>라 섹션마다 서명이 갈린다.
+    홈에 두 섹션의 기사가 섞여 있고 RSS·사이트맵은 없다. 자동 탐색이 /news/{*}/{n} 하나로 합쳐야 두 섹션을 다 잡는다."""
+    ids = {sec: [1000 * (k + 1) + i for i in range(1, per_section + 1)] for k, sec in enumerate(sections)}
+    items = "".join(f'<li><a href="/news/{sec}/{i}">{sec} 기사 {i}번</a></li>' for sec in sections for i in ids[sec])
+    nav = "".join(f'<a href="/news/{sec}">{sec}</a>' for sec in sections)
+    routes = {
+        "/": (200, "text/html; charset=utf-8",
+              f'<html><head><title>섹션 테스트 뉴스</title></head><body><nav>{nav}</nav><ul>{items}</ul></body></html>'),
+        "/robots.txt": (404, "text/plain", ""),
+    }
+    for sec in sections:
+        rows = "".join(f'<li><a href="/news/{sec}/{i}">{sec} 기사 {i}번</a></li>' for i in ids[sec])
+        routes[f"/news/{sec}"] = (200, "text/html; charset=utf-8", f"<html><body><ul>{rows}</ul></body></html>")
+        for i in ids[sec]:
+            routes[f"/news/{sec}/{i}"] = (200, "text/html; charset=utf-8", f"""<html><head>
+            <title>{sec} 기사 {i}번 - 섹션 테스트 뉴스</title>
+            <meta property="og:type" content="article"><meta property="og:title" content="{sec} 기사 {i}번">
+            <meta property="article:published_time" content="{_iso(1)}"></head>
+            <body><article><p>{BODY}</p><p>{BODY}</p></article></body></html>""")
+    return routes

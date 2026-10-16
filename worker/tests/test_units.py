@@ -9,8 +9,8 @@ import pytest
 from fakellm import FakeLlm, portal_recipe
 from sensing_worker.codes import Code, CrawlFailure
 from sensing_worker.config import Settings
-from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, parse_sitemap, pattern_from_signature,
-                                      signature, sitemap_urls)
+from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, merge_signatures, parse_sitemap,
+                                      pattern_from_signature, signature, sitemap_urls)
 from sensing_worker.evidence import EvidenceStore
 from sensing_worker.extract import Article, extract_article, links_with_dates
 from sensing_worker.jobs import discover
@@ -180,18 +180,34 @@ def test_discovery_eval_classifies_sites_like_onboarding():
     settings = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True)
     news, blocked = Site(news_site_routes()), Site(blocked_site_routes())
     try:
-        ok = evaluate_site(news.base + "/news/articleView.html?idxno=101", settings)
+        ok = evaluate_site(news.base + "/news/articleView.html?idxno=101", settings,
+                           sample_url=news.base + "/news/articleView.html?idxno=106")
         assert ok.outcome == "OK" and ok.method == "STATIC" and ok.site_type == "NEWS" and ok.requests > 0
         assert ok.recipe_source == "heuristic"                      # LLM 설정이 없으면 휴리스틱
         assert ok.url == news.base                                   # 기사 주소를 넣어도 사이트 단위로 본다
-        bad = evaluate_site(blocked.base, settings)
-        assert bad.outcome == "BLOCKED" and bad.code == "BOT_CHALLENGE"
-        text = summarize([ok, bad], target=2)
-        assert "자동 등록 성공 1/2곳 (목표 2곳: 미달)" in text
+        assert ok.sample_match is True                               # 고른 패턴이 현업 샘플 기사를 잡는다
+        miss = evaluate_site(news.base, settings, sample_url=news.base + "/news/photoView.html?idxno=1")
+        assert miss.outcome == "OK" and miss.sample_match is False
+        bad = evaluate_site(blocked.base, settings, sample_url=blocked.base + "/a/1")
+        assert bad.outcome == "BLOCKED" and bad.code == "BOT_CHALLENGE" and bad.sample_match is None
+        text = summarize([ok, miss, bad], target=3)
+        assert "자동 등록 성공 2/3곳 (목표 3곳: 미달)" in text and "샘플 기사 적중 1/3곳" in text
+        assert [line.split()[5] for line in text.splitlines()[1:4]] == ["O", "X", "-"]
     finally:
         news.close()
         blocked.close()
     assert read_sites(["a.com", "a.com", "b.com"]) == ["a.com", "b.com"]
+
+
+def test_eval_site_list_carries_sample_article_urls(tmp_path):
+    from sensing_worker.evaluate import read_site_entries, read_sites
+
+    listing = tmp_path / "sites.txt"
+    listing.write_text("# 표본\nhttps://a.com   # 샘플 없음\nhttps://b.com https://b.com/news/economy/1  # 샘플 있음\n"
+                       "https://a.com https://a.com/view/2\n", encoding="utf-8")
+    assert read_site_entries([str(listing), "c.com"]) == [("https://a.com", "https://a.com/view/2"),
+                                                          ("https://b.com", "https://b.com/news/economy/1"), ("c.com", None)]
+    assert read_sites([str(listing)]) == ["https://a.com", "https://b.com"]
 
 
 def test_signature_generalizes_alphanumeric_ids():
@@ -306,6 +322,86 @@ def test_sections_found_by_korean_board_names():
             '<a href="/news/articleView.html?idxno=102">올해 뉴스 결산 발표</a>')
     assert [s["name"] for s in d._sections(html, "https://m.go.kr/")] == ["목록", "보도자료", "알림/소식"]
     f.close()
+
+
+def test_signature_generalizes_slugs_and_patterns_accept_wildcards():
+    assert signature("https://www.eetimes.com/samsung-lays-out-ai-memory-roadmap/") == "/{slug}/"
+    assert signature("https://www.tomshardware.com/pc-components/dram/samsung-debuts-three-memory-technologies") \
+        == "/pc-components/dram/{slug}"
+    assert signature("https://a.com/news/hbm4-2026-roadmap-1234") == "/news/{slug}"   # 숫자가 섞여도 단어 3개면 슬러그
+    assert signature("https://a.com/tech-industry/semiconductors") == "/tech-industry/semiconductors"  # 두 단어는 고정 조각
+    assert signature("https://a.com/Samsung-Lays-Out-Roadmap") == "/Samsung-Lays-Out-Roadmap"          # 소문자만 슬러그
+    assert signature("https://a.com/2026-10-16/story") == "/{id}/story"                                 # 날짜는 식별자
+
+    slug = pattern_from_signature("/{slug}/")
+    assert slug["path"] == "^/[a-z0-9]+(?:-[a-z0-9]+){2,}/$"
+    assert matches("https://www.eetimes.com/samsung-lays-out-ai-memory-roadmap/", slug)
+    assert not matches("https://www.eetimes.com/about-us/", slug) and not matches("https://www.eetimes.com/news/", slug)
+    assert canonical_article_url("https://www.eetimes.com/samsung-lays-out-ai-memory-roadmap/?utm_source=x", slug) \
+        == "https://www.eetimes.com/samsung-lays-out-ai-memory-roadmap/"
+
+    wild = pattern_from_signature("/news/{*}/{n}")
+    assert wild["path"] == r"^/news/[^/]+/\d+$"
+    assert matches("https://www.mk.co.kr/news/economy/12175940", wild)
+    assert matches("https://www.mk.co.kr/news/society/12175941?utm_source=x", wild)
+    assert not matches("https://www.mk.co.kr/news/economy/sub/12175940", wild)
+    assert not matches("https://www.mk.co.kr/news/12175940", wild)
+    assert canonical_article_url("https://www.mk.co.kr/news/economy/12175940?utm_source=x", wild) \
+        == "https://www.mk.co.kr/news/economy/12175940"
+    two = pattern_from_signature("/{*}/{*}/{slug}")
+    assert matches("https://www.tomshardware.com/pc-components/dram/samsung-debuts-three-memory-technologies", two)
+    assert not matches("https://www.tomshardware.com/news/samsung-debuts-three-memory-technologies", two)
+
+
+def test_ranked_patterns_merge_signatures_that_differ_only_in_section():
+    econ = [f"https://m.com/news/economy/{i}" for i in range(3)]
+    soc = [f"https://m.com/news/society/{i}" for i in range(3)]
+    lists = [f"https://m.com/news/list/{i}" for i in range(5)]           # 목록 서명은 후보도, 병합 대상도 아니다
+    ranked = [p["signature"] for p in Discoverer._ranked_patterns(econ + soc + lists, 5)]
+    assert ranked == ["/news/{*}/{n}", "/news/society/{n}", "/news/economy/{n}"]  # 병합 서명이 앞, 원래 서명도 남는다
+
+    # 이어진 두 조각이 다르면 둘 다 {*}. 원래 서명은 3건 미만이라 떨어지고 병합 서명만 남는다
+    toms = [f"https://t.com/tech-industry/semiconductors/samsung-foo-bar-{i}" for i in range(2)] \
+        + [f"https://t.com/pc-components/dram/samsung-foo-bar-{i}" for i in range(2)]
+    assert [p["signature"] for p in Discoverer._ranked_patterns(toms, 5)] == ["/{*}/{*}/{slug}"]
+
+    # 식별자 자리가 다르거나 조각 수가 다르면 합치지 않는다. /{*} 같은 서명은 생기지 않는다
+    assert merge_signatures({"/{n}": 3, "/{id}": 3}) == {}
+    assert merge_signatures({"/a/{n}": 3, "/b/{id}": 3}) == {}
+    assert merge_signatures({"/a/{n}": 3, "/a/b/{n}": 3}) == {}
+    assert merge_signatures({"/news{n}.html": 3, "/view{n}.html": 3}) == {}
+    assert merge_signatures({"/a/b/c/{n}": 3, "/x/y/z/{n}": 3}) == {}      # 세 조각이 다르면 너무 넓다
+    # 섹션 이름은 식별자보다 앞에 온다: 번호 뒤에 페이지 이름이 오는 메뉴 주소(산업부 /kor/{n}/headquarters)나
+    # 쿼리에만 식별자가 있는 서명은 합치지 않는다
+    assert merge_signatures({"/kor/{n}/headquarters": 28, "/kor/{n}/sitemap": 18, "/kor/{n}/inderstry": 22}) == {}
+    assert merge_signatures({"/a/v.do?id={n}": 2, "/b/v.do?id={n}": 2}) == {}
+    # 쿼리가 있으면 같아야 하고, 병합 횟수는 덮는 서명들의 합이다
+    assert merge_signatures({"/a/x/{n}?p=*": 2, "/b/x/{n}?p=*": 2, "/c/x/{n}?p=*&x=*": 2}) == {"/{*}/x/{n}?p=*": 4}
+
+    # 합친 서명은 원래 서명의 자리를 뺏지 않는다: limit는 원래 서명에만 적용돼 기사 서명이 밀려나지 않는다
+    menus = [f"https://m.com/kor/{i}/{name}" for name in ("economy", "society", "culture") for i in range(3)]
+    posts = [f"https://m.com/kor/article/ATCL{i:08d}/{i}/view" for i in range(3)]
+    ranked = [p["signature"] for p in Discoverer._ranked_patterns(menus + posts, 3)]
+    assert "/kor/article/{id}/{n}/view" in ranked and "/kor/{n}/{*}" not in ranked
+    ranked = [p["signature"] for p in Discoverer._ranked_patterns(
+        [f"https://m.com/{sec}/{i}" for sec in ("a", "b", "c", "d") for i in range(5)], 2)]
+    assert ranked == ["/{*}/{n}", "/d/{n}", "/c/{n}"]                      # 원래 서명 2개 + 병합 서명
+
+
+def test_discover_merges_section_paths_into_one_article_pattern():
+    from fakesite import Site, sectioned_news_routes
+    site = Site(sectioned_news_routes())
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, detail = discover(f, "127.0.0.1", site.base, "NEWS")
+        assert result.method == "STATIC" and result.article_pattern["signature"] == "/news/{*}/{n}"
+        assert "5건 통과" in detail
+        for sec in ("economy", "society"):
+            assert matches(f"{site.base}/news/{sec}/9999", result.article_pattern)
+        assert {u.split("/")[-2] for u in result.sample_urls} == {"economy", "society"}   # 두 섹션의 기사를 다 잡는다
+    finally:
+        f.close()
+        site.close()
 
 
 def test_page_params_are_not_part_of_identity():

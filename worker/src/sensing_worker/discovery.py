@@ -69,18 +69,30 @@ class DiscoveryResult:
 # ---------------------------------------------------------------------- URL 서명
 
 ID_SEGMENT_RE = re.compile(r"^(?=.*\d.*\d.*\d)[A-Za-z0-9_-]{6,}$")  # 숫자 3개 이상 섞인 6자 이상 토큰
+# 하이픈으로 이어진 소문자 단어 3개 이상 (samsung-lays-out-ai-memory-roadmap). 영문 매체의 숫자 없는 기사 슬러그
+SLUG_SEGMENT_RE = re.compile(r"^(?=.*[a-z])[a-z0-9]+(?:-[a-z0-9]+){2,}$")
+SLUG_REGEX = r"[a-z0-9]+(?:-[a-z0-9]+){2,}"
+WILDCARD_REGEX = r"[^/]+"                      # {*}: 경로 조각 하나 (섹션 이름처럼 기사마다 다른 고정 단어)
+ID_PLACEHOLDERS = ("{n}", "{id}", "{slug}")     # 기사를 구분하는 자리. 이 중 하나는 있어야 기사 패턴이다
 
 
 def _generalize_segment(seg: str) -> str:
     if seg.isdigit():
         return "{n}"
+    if SLUG_SEGMENT_RE.match(seg):
+        return "{slug}"
     if ID_SEGMENT_RE.match(seg) and not seg.isalpha():
         return "{id}"
     return re.sub(r"\d+", "{n}", seg)
 
 
+def has_identifier(sig: str) -> bool:
+    return any(p in sig for p in ID_PLACEHOLDERS)
+
+
 def signature(url: str) -> str:
-    """URL을 패턴 서명으로 바꾼다. 숫자는 {n}, 영숫자 식별자는 {id}, 쿼리 값은 숫자면 {n} 아니면 *."""
+    """URL을 패턴 서명으로 바꾼다. 숫자는 {n}, 영숫자 식별자는 {id}, 소문자 단어 3개 이상의 슬러그는 {slug},
+    쿼리 값은 숫자면 {n} 아니면 *. (서명끼리 합칠 때 생기는 {*}는 signature()가 직접 내지 않는다)"""
     parts = urlsplit(url)
     path = "/".join(_generalize_segment(seg) for seg in (parts.path or "/").split("/"))
     q = sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not TRACKING_PARAM.match(k))
@@ -93,7 +105,9 @@ def signature(url: str) -> str:
 def pattern_from_signature(sig: str) -> dict:
     path, _, query = sig.partition("?")
     regex = ("^" + re.escape(path).replace(re.escape("{n}"), r"\d+")
-             .replace(re.escape("{id}"), r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*") + "$")
+             .replace(re.escape("{id}"), r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*")
+             .replace(re.escape("{slug}"), SLUG_REGEX)
+             .replace(re.escape("{*}"), WILDCARD_REGEX) + "$")
     keys = [kv.split("=", 1)[0] for kv in query.split("&") if kv]
     id_keys = [kv.split("=", 1)[0] for kv in query.split("&") if kv.endswith("={n}")]
     return {"path": regex, "query_keys": keys, "id_keys": id_keys, "signature": sig}
@@ -377,21 +391,82 @@ class Discoverer:
         if not urls:
             return []
         sigs = Counter(signature(u) for u in urls)
-        scored: list[tuple[float, str]] = []
-        for sig, count in sigs.items():
-            if ("{n}" not in sig and "{id}" not in sig) or count < 3:
+        article_like = {sig: count for sig, count in sigs.items() if has_identifier(sig) and not _is_list_signature(sig)}
+        # 섹션 이름만 다른 같은 형태의 서명(/news/economy/{n} + /news/society/{n})은 {*}로 합친 서명도 후보에 넣는다.
+        # 합친 서명은 원래 것들의 횟수를 모두 더해 받으므로 보통 앞에 온다. limit는 원래 서명에만 적용해 병합이
+        # 틀려도 전과 같은 후보가 남고, 품질 검사가 그중에서 고른다
+        originals = _score_signatures(article_like)[:limit]
+        merged = _score_signatures(merge_signatures(article_like))[:MAX_MERGED_PATTERNS]
+        ranked = sorted(originals + merged, reverse=True)
+        return [pattern_from_signature(sig) for _, sig in ranked]
+
+
+MAX_MERGED_PATTERNS = 2
+
+
+def _score_signatures(counts: dict[str, int]) -> list[tuple[float, str]]:
+    scored: list[tuple[float, str]] = []
+    for sig, count in counts.items():
+        if count < 3:
+            continue
+        score = float(count)
+        if any(_sig_matches_known(sig, known) for known in KNOWN_ARTICLE_SIGNATURES):
+            score *= 3
+        if re.search(r"(view|article|detail|news|read|show)", sig, re.I):
+            score *= 1.5
+        scored.append((score, sig))
+    scored.sort(reverse=True)
+    return scored
+
+
+def _is_list_signature(sig: str) -> bool:
+    path = sig.split("?", 1)[0]
+    return bool(LIST_PATH.search(path)) and not any(sig.startswith(k.split("?")[0]) for k in KNOWN_ARTICLE_SIGNATURES)
+
+
+def _is_placeholder_piece(piece: str) -> bool:
+    return "{" in piece or piece == ""
+
+
+def merge_signatures(counts: dict[str, int]) -> dict[str, int]:
+    """조각 수가 같고 정확히 한 조각(또는 이어진 두 조각)만 다른 서명 쌍을 {*}로 합친 서명과, 그 서명이 덮는 횟수의 합.
+
+    다른 조각은 양쪽 모두 고정 단어여야 하고(식별자 자리 {n}·{id}·{slug}나 빈 조각이 다르면 합치지 않는다), 섹션 이름은
+    기사 식별자보다 앞에 오므로 그 뒤 경로에 식별자 자리가 있어야 한다. /kor/{n}/headquarters + /kor/{n}/sitemap 같은
+    메뉴 페이지(번호 뒤에 페이지 이름)나 쿼리에만 식별자가 있는 /a/view.do?id={n} + /b/view.do?id={n}은 합치지 않는다.
+    쿼리가 있으면 같아야 한다. 조각이 하나뿐인 /{*}처럼 식별자가 남지 않는 서명은 만들지 않는다.
+    예) /news/economy/{n} + /news/society/{n} → /news/{*}/{n}
+        /tech-industry/semiconductors/{slug} + /pc-components/dram/{slug} → /{*}/{*}/{slug}
+    """
+    split = {sig: (sig.partition("?")[0].split("/"), sig.partition("?")[2]) for sig in counts}
+    templates: set[str] = set()
+    sigs = list(counts)
+    for i, a in enumerate(sigs):
+        pa, qa = split[a]
+        for b in sigs[i + 1:]:
+            pb, qb = split[b]
+            if qa != qb or len(pa) != len(pb):
                 continue
-            path = sig.split("?", 1)[0]
-            if LIST_PATH.search(path) and not any(sig.startswith(k.split("?")[0]) for k in KNOWN_ARTICLE_SIGNATURES):
+            diff = [k for k in range(len(pa)) if pa[k] != pb[k]]
+            if not 1 <= len(diff) <= 2 or (len(diff) == 2 and diff[1] != diff[0] + 1):
                 continue
-            score = float(count)
-            if any(_sig_matches_known(sig, known) for known in KNOWN_ARTICLE_SIGNATURES):
-                score *= 3
-            if re.search(r"(view|article|detail|news|read|show)", sig, re.I):
-                score *= 1.5
-            scored.append((score, sig))
-        scored.sort(reverse=True)
-        return [pattern_from_signature(sig) for _, sig in scored[:limit]]
+            if any(_is_placeholder_piece(pa[k]) or _is_placeholder_piece(pb[k]) for k in diff):
+                continue
+            if not any(has_identifier(piece) for piece in pa[diff[-1] + 1:]):
+                continue
+            merged_path = "/".join("{*}" if k in diff else pa[k] for k in range(len(pa)))
+            merged = merged_path + (f"?{qa}" if qa else "")
+            if not has_identifier(merged) or merged_path.strip("/") == "{*}":
+                continue
+            templates.add(merged)
+    out: dict[str, int] = {}
+    for merged in templates:
+        mp, mq = merged.partition("?")[0].split("/"), merged.partition("?")[2]
+        covered = sum(count for sig, count in counts.items()
+                      if split[sig][1] == mq and len(split[sig][0]) == len(mp)
+                      and all(t == "{*}" or t == p for t, p in zip(mp, split[sig][0])))
+        out[merged] = covered
+    return out
 
 
 def _sig_matches_known(sig: str, known: str) -> bool:

@@ -1,0 +1,50 @@
+[
+  {
+    "url": "https://www.mk.co.kr",
+    "outcome": "OK",
+    "code": null,
+    "message": null,
+    "site_type": "NEWS",
+    "method": "RSS",
+    "hubs": 5,
+    "pattern": "/news/{*}/{n}",
+    "quality": "샘플 5건 중 5건 통과",
+    "requests": 13,
+    "seconds": 24.2,
+    "recipe_source": "heuristic",
+    "sample_url": "https://www.mk.co.kr/news/economy/12175940",
+    "sample_match": true
+  },
+  {
+    "url": "https://www.eetimes.com",
+    "outcome": "OK",
+    "code": null,
+    "message": null,
+    "site_type": "NEWS",
+    "method": "RSS",
+    "hubs": 2,
+    "pattern": "/{slug}/",
+    "quality": "샘플 5건 중 5건 통과",
+    "requests": 10,
+    "seconds": 74.5,
+    "recipe_source": "heuristic",
+    "sample_url": "https://www.eetimes.com/samsung-lays-out-ai-memory-roadmap/",
+    "sample_match": true
+  },
+  {
+    "url": "https://www.tomshardware.com",
+    "outcome": "OK",
+    "code": null,
+    "message": null,
+    "site_type": "ETC",
+    "method": "RSS",
+    "hubs": 1,
+    "pattern": "/{*}/{*}/{slug}",
+    "quality": "샘플 5건 중 5건 통과",
+    "requests": 9,
+    "seconds": 16.4,
+    "recipe_source": "heuristic",
+    "sample_url": "https://www.tomshardware.com/pc-components/dram/samsung-debuts-three-next-generation-memory-technologies-for-ai-data-centers-zhbm-znand-o-and-bv-nand-all-rely-on-advanced-wafer-bonding-technologies",
+    "sample_match": true
+  }
+]

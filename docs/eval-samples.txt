@@ -1,0 +1,6 @@
+# 현업 Confluence 표의 샘플 기사가 자동 탐색 패턴에 잡히는지 보는 표본 (2026-10-16, 등록은 되지만 샘플을 못 잡던 3곳)
+# 한 줄에 "사이트 [샘플기사]". CI에서는 돌리지 않고 손으로 확인한다:
+#   cd worker && sensing-discovery-eval ../docs/eval-samples.txt --json ../docs/eval-samples-result.json
+https://www.mk.co.kr          https://www.mk.co.kr/news/economy/12175940                     # 매일경제: 섹션 조각이 다른 /news/{*}/{n}
+https://www.eetimes.com       https://www.eetimes.com/samsung-lays-out-ai-memory-roadmap/    # EE Times: 숫자 없는 슬러그 /{slug}/
+https://www.tomshardware.com  https://www.tomshardware.com/pc-components/dram/samsung-debuts-three-next-generation-memory-technologies-for-ai-data-centers-zhbm-znand-o-and-bv-nand-all-rely-on-advanced-wafer-bonding-technologies  # Tom's Hardware: /{*}/{*}/{slug}
