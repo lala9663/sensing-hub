@@ -866,8 +866,7 @@ def test_dart_checks_fill_corp_codes_and_record_disclosure_signals_once(env):
     codes = {r["name"]: r["corp_code"] for r in store.conn.execute("SELECT name, corp_code FROM company")}
     assert codes == {"나부품": "00000001", "가전자": "00000002", "다중복": None}
     assert sum("corpCode.xml" in u for u in handler.calls) == 1
-    reg = q(store, "SELECT status, result_message FROM registration_request WHERE source_id = %s", map_id)
-    assert reg["status"] == "COMPLETED" and "2곳 중 1곳" in reg["result_message"]
+    # 점검 소스는 백엔드가 registration_request 없이 만든다(시스템 소스): 진행 메시지는 소스 상태·작업 기록으로 본다
     assert q(store, "SELECT status FROM api_credential WHERE provider = 'dart'")["status"] == "VALID"
 
     # ② 회사별 공시 (6시간): corp_code가 있는 회사마다 받아 문서 3건(API 연결), 신호 2건 (회생 HIGH, 유상증자 MEDIUM). 사업보고서는 문서만
@@ -937,7 +936,6 @@ def test_g2b_check_records_debarment_signal_once_and_skips_companies_without_biz
     assert rows[0]["detail"]["raw"]["bizno"] == "1234567890" and rows[0]["detail"]["agency"] == "조달청"
     assert rows[0]["observed_at"] == datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=9)))
     assert q(store, "SELECT status FROM api_credential WHERE provider = 'data_go_kr'")["status"] == "VALID"
-    assert "2곳을 확인해 신호 1건" in q(store, "SELECT result_message FROM registration_request WHERE source_id = %s", check_id)["result_message"]
 
     # ② 다음 날 같은 제재 → 신호가 늘지 않는다
     assert crawl(store, runner, s, check_id) == "SUCCESS"
