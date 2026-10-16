@@ -52,7 +52,7 @@ class RegistrationFlowIT {
     void clean() {
         jdbc.sql("""
                 TRUNCATE chat_feedback, chat_citation, chat_message, chat_session, chunk, attachment,
-                         document_version, document_watch, document, crawl_error, crawl_job, registration_request,
+                         document_version, document_watch, document_enrichment, document, crawl_error, crawl_job, registration_request,
                          audit_log, api_credential
                 RESTART IDENTITY CASCADE
                 """).update();
@@ -406,5 +406,112 @@ class RegistrationFlowIT {
         jdbc.sql("UPDATE crawl_job SET status = 'RUNNING', attempt = 1, lease_until = now() - interval '1 minute'").update();
         new CrawlScheduler(jdbc).reclaimExpiredLeases();
         assertThat(jdbc.sql("SELECT status FROM crawl_job").query(String.class).single()).isEqualTo("QUEUED");
+    }
+
+    /** 워커가 수집·보강한 결과를 흉내 낸다: site + source + document (+ enrichment, watch, attachment). */
+    private long siteSource(String domain, String siteType) {
+        long siteId = jdbc.sql("INSERT INTO site (domain, base_url, site_type) VALUES (?, ?, ?) RETURNING id")
+                .params(domain, "https://" + domain, siteType).query(Long.class).single();
+        return jdbc.sql("INSERT INTO source (site_id, name, status) VALUES (?, ?, 'ACTIVE') RETURNING id")
+                .params(siteId, domain).query(Long.class).single();
+    }
+
+    private long document(long sourceId, String url, String title, String section, String publishedAt,
+                          String collectedAt, String body) {
+        return jdbc.sql("""
+                INSERT INTO document (source_id, url, url_hash, title, section, published_at, collected_at, body_text)
+                VALUES (?, ?, md5(?) || md5(?), ?, ?, CAST(? AS timestamptz), CAST(? AS timestamptz), ?) RETURNING id
+                """).params(sourceId, url, url, url, title, section, publishedAt, collectedAt, body)
+                .query(Long.class).single();
+    }
+
+    private void enrichment(long documentId, String summary, String topics, String tags) {
+        jdbc.sql("""
+                INSERT INTO document_enrichment (document_id, document_version, summary, topics, tags, model)
+                VALUES (?, 1, ?, CAST(? AS jsonb), CAST(? AS jsonb), 'fake fake-1')
+                """).params(documentId, summary, topics, tags).update();
+    }
+
+    @Test
+    void documentsApiListsEnrichedDocumentsWithFilters() {
+        long gov = siteSource("gov.example.go.kr", "PUBLIC");
+        long press = siteSource("news.example.com", "NEWS");
+        long notice = document(gov, "https://gov.example.go.kr/view/1", "2026년 지원사업 공고", "공고",
+                "2026-10-14T09:00:00+09:00", "2026-10-14T10:00:00+09:00", "공고 본문입니다. ".repeat(20));
+        long article = document(press, "https://news.example.com/articleView?idxno=1", "메타넷, 신제품 공개", null,
+                "2026-10-16T09:00:00+09:00", "2026-10-16T10:00:00+09:00", null);
+        long raw = document(press, "https://news.example.com/articleView?idxno=2", "아직 보강 전", null,
+                null, "2026-10-16T11:00:00+09:00", null);
+        enrichment(notice, "중소벤처기업부가 10월 31일까지 지원사업 신청을 받는다.", "[\"지원사업\",\"정책·규제\"]",
+                "[\"중소벤처기업부\"]");
+        enrichment(article, null, "[\"자사\",\"산업동향\"]", "[\"메타넷\"]");
+        jdbc.sql("INSERT INTO attachment (document_id, url, file_name) VALUES (?, ?, ?)")
+                .params(notice, "https://gov.example.go.kr/files/1.hwp", "공고문.hwp").update();
+        long watch = jdbc.sql("INSERT INTO source (site_id, name, kind, watch_name, method, status) "
+                + "SELECT site_id, 'watch:자사 보도', 'WATCH', '자사 보도', 'API', 'ACTIVE' FROM source WHERE id = ? RETURNING id")
+                .param(press).query(Long.class).single();
+        jdbc.sql("INSERT INTO document_watch (document_id, source_id, keyword) VALUES (?, ?, '메타넷')")
+                .params(article, watch).update();
+
+        // 목록: VIEWER도 읽고, 발행일 내림차순(null은 뒤), 보강 전 문서도 나온다
+        JsonNode all = get("viewer", "/api/v1/documents");
+        assertThat(all).hasSize(3);
+        assertThat(all.findValuesAsText("id")).containsExactly(String.valueOf(article), String.valueOf(notice),
+                String.valueOf(raw));
+        JsonNode first = all.get(0);
+        assertThat(first.get("title").asText()).isEqualTo("메타넷, 신제품 공개");
+        assertThat(first.get("domain").asText()).isEqualTo("news.example.com");
+        assertThat(first.get("sourceId").asLong()).isEqualTo(press);
+        assertThat(first.get("summary").isNull()).isTrue();                              // 언론 기사: 요약 없음
+        assertThat(first.get("topics").toString()).isEqualTo("[\"자사\",\"산업동향\"]");
+        assertThat(first.get("tags").toString()).isEqualTo("[\"메타넷\"]");
+        assertThat(first.get("keywords").toString()).isEqualTo("[\"메타넷\"]");
+        assertThat(first.has("bodyText")).isFalse();
+        JsonNode second = all.get(1);
+        assertThat(second.get("summary").asText()).startsWith("중소벤처기업부가");
+        assertThat(second.get("section").asText()).isEqualTo("공고");
+        assertThat(second.get("keywords").toString()).isEqualTo("[]");
+        JsonNode last = all.get(2);
+        assertThat(last.get("publishedAt").isNull()).isTrue();
+        assertThat(last.get("summary").isNull()).isTrue();
+        assertThat(last.get("topics").toString()).isEqualTo("[]");
+
+        // 필터: topic(포함), keyword(감시 검색어), since(수집 시각), source_id, limit
+        assertThat(get("viewer", "/api/v1/documents?topic=지원사업").findValuesAsText("id")).containsExactly(String.valueOf(notice));
+        assertThat(get("viewer", "/api/v1/documents?topic=정책·규제")).hasSize(1);
+        assertThat(get("viewer", "/api/v1/documents?topic=경쟁사")).isEmpty();
+        assertThat(get("viewer", "/api/v1/documents?keyword=메타넷").findValuesAsText("id")).containsExactly(String.valueOf(article));
+        assertThat(get("viewer", "/api/v1/documents?keyword=없는검색어")).isEmpty();
+        assertThat(get("viewer", "/api/v1/documents?since=2026-10-16T00:00:00Z")).hasSize(2);
+        assertThat(get("viewer", "/api/v1/documents?since=2026-10-16T10:30:00+09:00").findValuesAsText("id"))
+                .containsExactly(String.valueOf(raw));
+        assertThat(get("viewer", "/api/v1/documents?since=2026-10-17")).isEmpty();
+        assertThat(get("viewer", "/api/v1/documents?source_id=" + gov)).hasSize(1);
+        assertThat(get("viewer", "/api/v1/documents?limit=1")).hasSize(1);
+        assertThat(get("viewer", "/api/v1/documents?limit=0")).hasSize(1);
+        assertThat(get("viewer", "/api/v1/documents?topic=자사&keyword=메타넷&since=2026-10-16")).hasSize(1);
+        HttpHeaders viewer = new HttpHeaders();
+        viewer.set("X-User", "viewer");
+        assertThat(http.exchange("/api/v1/documents?since=어제", HttpMethod.GET, new HttpEntity<>(viewer), String.class)
+                .getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+
+        // 상세: 본문·첨부가 붙는다. 언론 기사는 bodyText가 null
+        JsonNode detail = get("viewer", "/api/v1/documents/" + notice);
+        assertThat(detail.get("bodyText").asText()).startsWith("공고 본문입니다.");
+        assertThat(detail.get("summary").asText()).startsWith("중소벤처기업부가");
+        assertThat(detail.get("attachments").toString())
+                .isEqualTo("[{\"url\":\"https://gov.example.go.kr/files/1.hwp\",\"fileName\":\"공고문.hwp\"}]");
+        JsonNode pressDetail = get("viewer", "/api/v1/documents/" + article);
+        assertThat(pressDetail.get("bodyText").isNull()).isTrue();
+        assertThat(pressDetail.get("attachments")).isEmpty();
+        assertThat(pressDetail.get("keywords").toString()).isEqualTo("[\"메타넷\"]");
+        assertThat(http.exchange("/api/v1/documents/999999", HttpMethod.GET, new HttpEntity<>(viewer), String.class)
+                .getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        // 토픽별 건수 (많은 순, 같으면 이름순). since는 수집 시각 기준
+        assertThat(get("viewer", "/api/v1/documents/topics").toString())
+                .isEqualTo("{\"산업동향\":1,\"자사\":1,\"정책·규제\":1,\"지원사업\":1}");
+        assertThat(get("viewer", "/api/v1/documents/topics?since=2026-10-16").toString())
+                .isEqualTo("{\"산업동향\":1,\"자사\":1}");
     }
 }
