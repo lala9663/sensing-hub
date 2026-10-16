@@ -1,1 +1,10 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        // 플러그인이 끌어오는 라이브러리(spring-core 등)는 Maven Central에서 직접 받는다.
+        // 플러그인 포털의 중계가 실패하면 CI 빌드가 설정 단계에서 멈추기 때문이다.
+        mavenCentral()
+    }
+}
+
 rootProject.name = 'sensing-hub-backend'
