@@ -40,6 +40,8 @@ JS_REDIRECT_RE = re.compile(r"""(?:location|window\.location|document\.location)
                             r"""|location\.replace\(\s*["']([^"']+)["']\s*\)""", re.I)
 # 실패 증거로 남길 응답 본문 길이 (문자)
 EVIDENCE_CHARS = 20000
+# 바이너리 요청(get_api_bytes)에서 텍스트로도 풀어 두는 최대 크기: 오류 응답(JSON·XML)은 이보다 작고 ZIP은 이보다 크다
+BINARY_TEXT_PEEK_BYTES = 65536
 # OpenSSL SSL_OP_LEGACY_SERVER_CONNECT. Python 3.12부터 ssl 모듈에 상수가 있다
 _OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
@@ -51,6 +53,10 @@ class Page:
     content_type: str
     text: str
     headers: dict[str, str]
+    # get_api_bytes로 받은 원본 바이트 (ZIP 등 바이너리 응답). 텍스트 요청에서는 비어 있다
+    body: bytes = b""
+    # 응답이 크기 상한(max_body_bytes 또는 호출자가 준 max_bytes)을 넘어 잘렸는지
+    truncated: bool = False
 
 
 def compat_ssl_context() -> ssl.SSLContext:
@@ -165,8 +171,14 @@ class PoliteFetcher:
         리다이렉트는 따라가지 않는다 (POST 본문을 다른 호스트로 다시 보내지 않기 위해)."""
         return self._request(url, check_robots=False, classify=False, headers=headers, method="POST", json_body=json_body)
 
+    def get_api_bytes(self, url: str, headers: dict[str, str] | None = None, max_bytes: int | None = None) -> Page:
+        """바이너리 응답(DART corpCode.xml ZIP 등)을 받는 공개 API 호출. 원본은 Page.body에, 텍스트 디코딩은
+        작은 응답(오류 JSON·XML, 64KB 이하)에만 한다. max_bytes를 넘으면 Page.truncated가 True다 (커넥터가 실패로 분류)."""
+        return self._request(url, check_robots=False, classify=False, headers=headers, binary=True, max_bytes=max_bytes)
+
     def _request(self, url: str, *, check_robots: bool, classify: bool, redirects: int = 0,
-                 headers: dict[str, str] | None = None, method: str = "GET", json_body=None) -> Page:
+                 headers: dict[str, str] | None = None, method: str = "GET", json_body=None,
+                 binary: bool = False, max_bytes: int | None = None) -> Page:
         if check_robots and not self.allowed(url):
             raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=url)
         self._guard_host(url)
@@ -183,10 +195,11 @@ class PoliteFetcher:
                     self.request_count += 1
                     if use_compat:
                         self.compat_hosts.add(host)
-                    body = self._read_limited(resp)
+                    body, truncated = self._read_limited(resp, max_bytes or self.s.max_body_bytes)
+                    text = _decode(body, resp) if (not binary or len(body) <= BINARY_TEXT_PEEK_BYTES) else ""
                     page = Page(url=str(resp.url), status=resp.status_code,
                                 content_type=resp.headers.get("content-type", ""),
-                                text=_decode(body, resp), headers=dict(resp.headers))
+                                text=text, headers=dict(resp.headers), body=body if binary else b"", truncated=truncated)
             except httpx.ConnectError as e:
                 if _is_dns_error(e):
                     raise CrawlFailure(Code.DNS_FAIL, url=url) from e
@@ -227,7 +240,7 @@ class PoliteFetcher:
                 if redirects >= 5:
                     raise CrawlFailure(Code.HTTP_4XX, "리다이렉트가 너무 많습니다.", url=url)
                 return self._request(target, check_robots=check_robots, classify=classify, redirects=redirects + 1,
-                                     headers=headers if same_host(url, target) else None)
+                                     headers=headers if same_host(url, target) else None, binary=binary, max_bytes=max_bytes)
 
             if not classify:
                 return page
@@ -260,14 +273,15 @@ class PoliteFetcher:
                 raise CrawlFailure(Code.LOGIN_REQUIRED, url=url, http_status=page.status, evidence=evidence)
             return page
 
-    def _read_limited(self, resp: httpx.Response) -> bytes:
+    def _read_limited(self, resp: httpx.Response, limit: int) -> tuple[bytes, bool]:
+        """(본문, 잘렸는지). limit를 넘는 응답은 거기까지만 읽고 멈춘다."""
         chunks, size = [], 0
         for chunk in resp.iter_bytes():
             size += len(chunk)
-            if size > self.s.max_body_bytes:
-                break
+            if size > limit:
+                return b"".join(chunks), True
             chunks.append(chunk)
-        return b"".join(chunks)
+        return b"".join(chunks), False
 
     def _throttle(self, url: str) -> None:
         self.throttle.wait(urlsplit(url).hostname or "")
