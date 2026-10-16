@@ -32,6 +32,11 @@ management:
     web:
       exposure:
         include: health,info
+  health:
+    mail:
+      # 메일 헬스 체크를 끈다. 켜 두면 /actuator/health가 호출될 때마다 SMTP에 접속하고, 다이제스트 전송 실패는
+      # digest_run에 따로 남는다. (테스트에서 JavaMailSender를 목으로 바꾸면 이 체크가 컨텍스트 기동을 막기도 한다)
+      enabled: false
 
 sensing:
   scheduler:
