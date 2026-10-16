@@ -15,8 +15,11 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
+from .company import build_name_index, match_companies_by_tags, news_signal
 from .config import Settings
+from .db import sha256
 from .llm import Generation, LlmClient, LlmUnavailable, describe, generate_recipe
 
 log = logging.getLogger(__name__)
@@ -95,6 +98,7 @@ class PendingDoc:
     section: str | None = None
     site_type: str = "UNKNOWN"
     watches: list[tuple[str | None, str | None]] = field(default_factory=list)   # (감시 이름, 검색어)
+    published_at: datetime | None = None
 
     @property
     def is_press(self) -> bool:
@@ -123,6 +127,8 @@ class EnrichOutcome:
     skipped: int = 0
     llm_unavailable: bool = False
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    company_links: int = 0     # 태그로 새로 연결한 문서→회사 수 (M3)
+    company_signals: int = 0   # 새로 만든 회사 NEWS 신호 수 (M3)
 
 
 # ---------------------------------------------------------------------- 입력 만들기
@@ -230,7 +236,37 @@ def enrich_batch(llm: LlmClient, docs: list[PendingDoc], settings: Settings) -> 
 def _to_pending(row: dict, watches: dict[int, list[tuple[str | None, str | None]]]) -> PendingDoc:
     return PendingDoc(id=row["id"], version=row["version"], url=row["url"], title=row["title"], body=row["body_text"],
                       domain=row["domain"], section=row["section"], site_type=row["site_type"] or "UNKNOWN",
-                      watches=watches.get(row["id"], []))
+                      watches=watches.get(row["id"], []), published_at=row.get("published_at"))
+
+
+def link_companies(store, docs: list[PendingDoc], results: dict[int, Enrichment], outcome: EnrichOutcome) -> None:
+    """보강 저장 직후 (같은 트랜잭션): ① 태그가 회사 이름·별칭과 정확히 일치하면 document_company(TAG),
+    ② 회사에 연결된(감시·태그) 문서의 토픽이 사건·사고·인사·조직이면 company_signal(NEWS, fingerprint url_hash).
+
+    results는 {document_id: Enrichment}. 회사가 하나도 없으면 아무것도 하지 않는다. 신호는 DONE 보강만 본다 (FAILED는 토픽이 없다).
+    """
+    index = build_name_index(store.load_company_names())
+    if not index:
+        return
+    done = {doc_id: r for doc_id, r in results.items() if r.status == "DONE"}
+    if not done:
+        return
+    for doc_id, r in done.items():
+        for company_id in match_companies_by_tags(r.tags, index):
+            if store.add_document_company(doc_id, company_id, "TAG"):
+                outcome.company_links += 1
+    linked = store.companies_of_documents(list(done))
+    by_id = {d.id: d for d in docs}
+    for doc_id, companies in linked.items():
+        d, r = by_id[doc_id], done[doc_id]
+        for company_id, matched_by in companies:
+            sig = news_signal(sha256(d.url), d.title, r.topics, url=d.url, matched_by=matched_by)
+            if sig is None:
+                continue
+            observed = d.published_at or datetime.now(timezone.utc)
+            if store.add_company_signal(company_id, sig.kind, sig.severity, sig.fingerprint, sig.title, sig.detail,
+                                        observed, document_id=doc_id):
+                outcome.company_signals += 1
 
 
 def enrich_pending(store, llm: LlmClient, settings: Settings, limit: int | None = None) -> EnrichOutcome:
@@ -262,6 +298,7 @@ def enrich_pending(store, llm: LlmClient, settings: Settings, limit: int | None 
                 return outcome
             outcome.usage = dict(gen.usage)
 
+        saved: dict[int, Enrichment] = {}
         for d in docs:
             if d.is_empty:
                 store.save_enrichment(d.id, d.version, summary=None, topics=[], tags=[], model=model,
@@ -273,11 +310,14 @@ def enrich_pending(store, llm: LlmClient, settings: Settings, limit: int | None 
                 r = Enrichment(None, [], [], status="FAILED", error="LLM 응답에 이 문서의 항목이 없습니다")
             store.save_enrichment(d.id, d.version, summary=r.summary, topics=r.topics, tags=r.tags, model=model,
                                   status=r.status, error=r.error)
+            saved[d.id] = r
             if r.status == "DONE":
                 outcome.done += 1
             else:
                 outcome.failed += 1
-    log.info("enrich: fetched=%s done=%s failed=%s skipped=%s llm=%s attempts=%s %s",
-             outcome.fetched, outcome.done, outcome.failed, outcome.skipped, model,
-             gen.attempts if gen else 0, gen.usage_text() if gen else "")
+        # 회사 레이어 (M3): 태그 → 회사 연결, 사건·사고·인사·조직 기사 → 회사 신호
+        link_companies(store, docs, saved, outcome)
+    log.info("enrich: fetched=%s done=%s failed=%s skipped=%s company_links=%s company_signals=%s llm=%s attempts=%s %s",
+             outcome.fetched, outcome.done, outcome.failed, outcome.skipped, outcome.company_links,
+             outcome.company_signals, model, gen.attempts if gen else 0, gen.usage_text() if gen else "")
     return outcome

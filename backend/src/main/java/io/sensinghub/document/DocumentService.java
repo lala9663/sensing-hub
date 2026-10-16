@@ -138,7 +138,8 @@ public class DocumentService {
     }
 
     /** ISO 시각(2026-10-15T09:00:00+09:00, ...Z), 시간대 없는 시각(서버 시간대), 날짜(2026-10-15)를 받는다. 비면 null. */
-    static OffsetDateTime parseSince(String since) {
+    /** since 파라미터 해석 (회사 신호 API도 같은 규칙을 쓴다). */
+    public static OffsetDateTime parseSince(String since) {
         if (since == null || since.isBlank()) {
             return null;
         }

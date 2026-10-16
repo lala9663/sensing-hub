@@ -43,6 +43,8 @@ public class WatchService {
     public static final String BASE_URL = "https://news.naver.com";
     static final int DEFAULT_INTERVAL_MINUTES = 60;
     static final int MAX_KEYWORDS = 50;
+    /** 회사(거래처) 감시의 이름 접두어 (M3). */
+    public static final String COMPANY_PREFIX = "회사:";
 
     public record WatchView(long id, String name, List<String> keywords, List<String> exclude, String status,
                             String statusReason, Integer configVersion, int intervalMinutes,
@@ -66,6 +68,49 @@ public class WatchService {
 
     @Transactional
     public WatchView create(CurrentUser user, String name, List<String> keywords, List<String> exclude) {
+        return create(user, name, keywords, exclude, DEFAULT_INTERVAL_MINUTES, "키워드 감시 생성");
+    }
+
+    /**
+     * 회사(거래처) 마스터의 감시 (M3): 이름 "회사:&lt;회사명&gt;", 키워드는 회사 이름·별칭, 주기는 호출자가 정한다(360분).
+     * 등록 규칙(REGISTRAR 이상 즉시 진행, 키 없으면 API_KEY_REQUIRED 큐)은 일반 감시와 같다.
+     */
+    @Transactional
+    public WatchView createForCompany(CurrentUser user, String companyName, List<String> keywords, int intervalMinutes) {
+        return create(user, COMPANY_PREFIX + companyName, keywords, List.of(), intervalMinutes, "회사 감시 생성");
+    }
+
+    /** 회사 이름·별칭이 바뀌면 그 감시의 이름과 키워드를 새 설정 버전으로 갱신한다 (소유자 검사 없음: 회사 API가 권한을 검사한다). */
+    @Transactional
+    public void updateForCompany(CurrentUser user, long sourceId, String companyName, List<String> keywords) {
+        List<String> terms = cleanTerms(keywords, "keywords");
+        if (terms.isEmpty()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", "키워드를 하나 이상 넣어 주세요.");
+        }
+        String watchName = cleanName(COMPANY_PREFIX + companyName);
+        jdbc.sql("UPDATE source SET watch_name = ?, name = ?, updated_at = now() WHERE id = ?")
+                .params(watchName, "watch:" + watchName, sourceId).update();
+        int version = activateVersion(sourceId, user, terms, List.of(), "회사 이름·별칭 수정");
+        jdbc.sql("UPDATE source SET next_run_at = now(), updated_at = now() WHERE id = ? AND status = 'ACTIVE'")
+                .param(sourceId).update();
+        audit.log(user.id(), "WATCH_UPDATED", "source", sourceId,
+                "{\"version\":" + version + ",\"keywords\":" + terms.size() + ",\"company\":true}");
+    }
+
+    /** 회사를 보관(ARCHIVED)하면 그 감시는 제외(EXCLUDED)한다. 같은 이름으로 다시 만들 수 있게 열린 감시에서 빠진다. */
+    @Transactional
+    public void excludeForCompany(CurrentUser user, long sourceId, String reason) {
+        jdbc.sql("UPDATE source SET status = 'EXCLUDED', status_reason = ?, updated_at = now() WHERE id = ?")
+                .params(reason, sourceId).update();
+        jdbc.sql("""
+                UPDATE registration_request SET status = 'REJECTED', step = 'REJECTED', result_message = ?, updated_at = now()
+                WHERE source_id = ? AND status IN ('RECEIVED', 'PROCESSING', 'REVIEW', 'AWAITING_APPROVAL')
+                """).params(reason, sourceId).update();
+        audit.log(user.id(), "WATCH_EXCLUDED", "source", sourceId, "{\"reason\":" + quote(reason) + "}");
+    }
+
+    private WatchView create(CurrentUser user, String name, List<String> keywords, List<String> exclude,
+                             int intervalMinutes, String note) {
         String watchName = cleanName(name);
         List<String> terms = cleanTerms(keywords, "keywords");
         List<String> excluded = cleanTerms(exclude, "exclude");
@@ -88,9 +133,9 @@ public class WatchService {
                 INSERT INTO source (site_id, name, kind, watch_name, method, status, interval_minutes, requested_by)
                 VALUES (?, ?, 'WATCH', ?, 'API', 'PENDING', ?, ?) RETURNING id
                 """)
-                .params(siteId, "watch:" + watchName, watchName, DEFAULT_INTERVAL_MINUTES, user.id())
+                .params(siteId, "watch:" + watchName, watchName, intervalMinutes, user.id())
                 .query(Long.class).single();
-        activateVersion(sourceId, user, terms, excluded, "키워드 감시 생성");
+        activateVersion(sourceId, user, terms, excluded, note);
 
         boolean needsApproval = viewerNeedsApproval && !user.role().atLeast(Role.REGISTRAR);
         long requestId = jdbc.sql("""

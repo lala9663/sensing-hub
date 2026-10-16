@@ -1,4 +1,4 @@
-"""작업 실행: ONBOARD(등록 자동 처리)와 CRAWL(주기 수집)."""
+"""작업 실행: ONBOARD(등록 자동 처리)와 CRAWL(주기 수집). 점검 소스(kind CHECK)의 CRAWL은 회사 단위 상태 확인이다."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from .apis import ApiConnector, Provider, catalog as api_catalog, make_connector
 from .apis import lookup as api_lookup
 from .codes import API_KEY_CODES, Code, CrawlFailure, MESSAGES
+from .company import biz_status_signal
 from .config import Settings
 from .db import Job, Store, sha256
 from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, looks_like_sitemap,
@@ -23,6 +24,7 @@ from .policy import defaults_for, guess_site_type, passes_quality
 from .recipe import propose_recipe
 
 LLM_STEP_MESSAGE = "사이트 구조를 분석해 수집 방법을 만드는 중입니다."
+CHECK_INTERVAL_MINUTES = 1440   # 회사 단위 점검(국세청 사업자 상태)은 하루 1회
 
 log = logging.getLogger(__name__)
 
@@ -122,10 +124,12 @@ class JobRunner:
 
         키가 없으면 REVIEW/API_KEY_REQUIRED로 멈춘다 (관리자가 키를 넣으면 백엔드가 ONBOARD를 다시 넣는다).
         키가 틀리면 자격 증명을 INVALID로 표시하고 REVIEW/API_KEY_INVALID로 멈춘다.
-        키워드 감시(source.kind WATCH)는 백엔드가 만든 활성 설정(keywords)을 그대로 쓰고 새 버전을 만들지 않는다.
+        키워드 감시(source.kind WATCH)와 점검 소스(kind CHECK)는 백엔드가 만든 활성 설정을 그대로 쓰고 새 버전을 만들지 않는다.
         키워드 제공자(네이버 뉴스)의 도메인을 사이트처럼 등록하면 REVIEW/KEYWORDS_REQUIRED로 멈춘다.
+        점검 소스의 첫 실행은 수집이 아니라 회사 상태 확인(_check)이다.
         """
         watch = source.get("kind") == "WATCH"
+        check = source.get("kind") == "CHECK"
         self.db.update_site(source["site_id"], site_type="NEWS" if provider.keyword_based else "PUBLIC",
                             risk_flags={"api_provider": provider.id})
         if provider.keyword_based and not watch:
@@ -144,9 +148,15 @@ class JobRunner:
             raise
         self.db.mark_credential(provider.id, "VALID", None)
 
-        # 공시·공공 API는 6시간, 키워드 감시(보도 모니터링)는 60분 주기
-        interval = 60 if provider.keyword_based else defaults_for("PUBLIC")["interval_minutes"]
-        if watch and source.get("config"):
+        # 공시·공공 API는 6시간, 키워드 감시(보도 모니터링)는 60분, 회사 점검은 하루 1회(백엔드가 정한 주기 유지)
+        if check:
+            interval = source.get("interval_minutes") or CHECK_INTERVAL_MINUTES
+        elif watch:
+            # 백엔드가 정한 주기를 지킨다 (일반 감시 60분, 회사 감시 360분)
+            interval = source.get("interval_minutes") or 60
+        else:
+            interval = defaults_for("PUBLIC")["interval_minutes"]
+        if (watch or check) and source.get("config"):
             config = source["config"]
             config_id = source["active_config_version_id"]
             version = source["config_version"]
@@ -158,14 +168,18 @@ class JobRunner:
                 job.source_id, config, f"{provider.name} API로 {'생성' if first else '다시 생성'} (키 검증 통과)", interval)
 
         self.db.update_registration(job.source_id, step="FIRST_CRAWL", message="첫 수집 중입니다.")
-        stats = self._crawl_api(job, source, config, connector=connector, secret=secret)
+        if check:
+            stats = self._check(job, source, config, connector=connector, secret=secret)
+        else:
+            stats = self._crawl_api(job, source, config, connector=connector, secret=secret)
         self.db.mark_crawl_result(job.source_id, True, interval)
         status = "PARTIAL" if stats.errors else "SUCCESS"
         self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors, config_id)
-        what = "감시 등록 완료" if watch else "등록 완료"
+        what = "감시 등록 완료" if watch else "점검 등록 완료" if check else "등록 완료"
+        done = (f"회사 {stats.found}곳을 확인해 신호 {stats.new}건을 남겼고" if check
+                else f"{provider.name} API로 {stats.new}건을 받았고")
         self.db.update_registration(
-            job.source_id, status="COMPLETED", step="DONE",
-            message=f"{what}. {provider.name} API로 {stats.new}건을 받았고 {interval}분마다 업데이트합니다.")
+            job.source_id, status="COMPLETED", step="DONE", message=f"{what}. {done} {interval}분마다 업데이트합니다.")
         log.info("onboard ok source=%s provider=%s kind=%s method=API v%s new=%s", job.source_id, provider.id,
                  source.get("kind", "SITE"), version, stats.new)
         return status
@@ -185,6 +199,8 @@ class JobRunner:
     def _crawl_job(self, job: Job, source: dict) -> str:
         if not source.get("config"):
             raise CrawlFailure(Code.DISCOVERY_FAILED, "활성 설정이 없습니다.", stage="LIST")
+        if source.get("kind") == "CHECK":
+            return self._check_job(job, source)
         if source["config"].get("method") == "API":
             stats = self._crawl_api(job, source, source["config"])
         else:
@@ -334,6 +350,8 @@ class JobRunner:
             stats.errors += 1
             stats.anomalies += 1
 
+        # 이 감시가 회사(거래처)의 감시면 걸린 기사를 그 회사에 연결한다 (NEWS 신호는 보강이 토픽을 붙인 뒤 enrich가 만든다)
+        company_id = self.db.company_of_watch(job.source_id) if source.get("kind") == "WATCH" else None
         for item in items:
             doc_id, result = self.db.upsert_document(
                 source_id=job.source_id, job_id=job.id, url=item.url, title=item.title, author=item.author,
@@ -345,8 +363,61 @@ class JobRunner:
             if item.keyword:
                 # 같은 기사가 다른 감시에서도 잡히면 문서는 하나, 감시별 기록은 각각 (document_watch)
                 self.db.add_watch_hit(doc_id, job.source_id, item.keyword)
+                if company_id is not None:
+                    self.db.add_document_company(doc_id, company_id, "WATCH")
             for att_url, name in item.attachments:
                 self.db.add_attachment(doc_id, att_url, name)
+        return stats
+
+    # ------------------------------------------------------------------ CHECK (회사 단위 점검, M3)
+    def _check_job(self, job: Job, source: dict) -> str:
+        """점검 소스의 주기 실행: 모든 ACTIVE 회사의 사업자 상태를 확인한다. 급감 감지는 적용하지 않는다."""
+        config = source["config"]
+        provider_id = config["provider"]
+        secret = self._load_secret(provider_id, api_catalog.get(provider_id), stage="LIST")
+        connector = make_connector(provider_id, self.f)
+        stats = self._check(job, source, config, connector=connector, secret=secret)
+        if source["status"] in ("BLOCKED", "BROKEN"):   # 관리자 재점검 통과
+            self.db.set_source_status(job.source_id, "ACTIVE")
+        self.db.mark_crawl_result(job.source_id, True, source["interval_minutes"])
+        status = "PARTIAL" if stats.errors else "SUCCESS"
+        self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors, source["active_config_version_id"])
+        return status
+
+    def _check(self, job: Job, source: dict, config: dict, *, connector, secret: str) -> CrawlStats:
+        """국세청 사업자등록 상태 확인. found는 확인한 회사 수, new는 새로 남긴 신호 수.
+
+        회사마다 마지막 상태를 company.last_biz_status에 두고, 계속사업자가 아니거나 이전 확인과 달라졌으면
+        company_signal(BIZ_STATUS)을 남긴다. fingerprint(b_stt_cd + end_dt)가 같으면 다시 기록하지 않는다.
+        """
+        stats = CrawlStats()
+        kind = config.get("check", "nts_status")
+        if kind != "nts_status":
+            raise CrawlFailure(Code.UNEXPECTED, f"지원하지 않는 점검 종류: {kind}", stage="LIST")
+        companies = self.db.companies_with_biz_no()
+        if not companies:
+            log.info("check source=%s: no company with biz_no", job.source_id)
+            return stats
+        try:
+            statuses = connector.check(secret, [c["biz_no"] for c in companies])
+        except CrawlFailure as e:
+            if e.code == Code.API_KEY_INVALID:
+                self.db.mark_credential(config["provider"], "INVALID", str(e))
+            raise
+        by_no = {s.biz_no: s for s in statuses}
+        now = datetime.now(timezone.utc)
+        for c in companies:
+            st = by_no.get(c["biz_no"])
+            if st is None:
+                continue   # 응답에 없는 번호: 다음 주기에 다시
+            stats.found += 1
+            signal = biz_status_signal(st, c["last_biz_status"])
+            self.db.save_biz_status(c["id"], {**st.as_detail(), "checked_at": now.isoformat()})
+            if signal is not None and self.db.add_company_signal(
+                    c["id"], signal.kind, signal.severity, signal.fingerprint, signal.title, signal.detail, now,
+                    source_id=job.source_id):
+                stats.new += 1
+                log.info("company %s (%s) signal %s/%s: %s", c["id"], c["name"], signal.kind, signal.severity, signal.title)
         return stats
 
     # ------------------------------------------------------------------ 실패 처리

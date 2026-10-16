@@ -28,6 +28,7 @@ import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.common.UrlNormalizer;
+import io.sensinghub.digest.DigestComposer.CompanySignal;
 import io.sensinghub.digest.DigestComposer.Digest;
 import io.sensinghub.digest.DigestComposer.Document;
 import io.sensinghub.digest.DigestComposer.WatchHit;
@@ -36,10 +37,12 @@ import io.sensinghub.digest.DigestComposer.WatchHit;
  * 일간 다이제스트 구독 (M2-4). 사용자가 "어떤 감시·토픽·소스를 몇 시에 어디로" 받을지 등록하면 스케줄러가 매일 그 시각(KST)에
  * 지난 다이제스트 이후(last_sent_at, 없으면 24시간 전) 새로 수집된(collected_at) 문서를 묶어 보낸다.
  * <ul>
- *   <li>필터 {@code {"watch_ids":[...],"source_ids":[...],"topics":[...]}}: 세 목록 중 하나라도 맞으면 포함(합집합), 모두 비면 전체.
- *       watch_ids는 {@code document_watch.source_id}(어느 감시에 걸렸나), source_ids는 {@code document.source_id}, topics는
- *       보강 토픽 포함 여부다. 상한 200건(발행일 내림차순).</li>
- *   <li>문서가 0건이면 보내지 않고 EMPTY로 기록한다. 그래도 last_sent_at은 갱신해 빈 날이 기간을 늘리지 않게 한다.
+ *   <li>필터 {@code {"watch_ids":[...],"source_ids":[...],"topics":[...],"company_ids":[...]}}: 네 목록 중 하나라도 맞으면 포함(합집합),
+ *       모두 비면 전체. watch_ids는 {@code document_watch.source_id}(어느 감시에 걸렸나), source_ids는 {@code document.source_id}, topics는
+ *       보강 토픽 포함 여부, company_ids는 {@code document_company}(어느 회사에 연결됐나)다. 상한 200건(발행일 내림차순).</li>
+ *   <li>회사 신호(M3, {@code company_signal}, 기간 안에 새로 기록된 것)는 전체 구독이거나 company_ids를 지정한 구독에 "거래처 신호" 절로
+ *       맨 앞에 들어간다. 신호가 있으면 문서가 0건이어도 보낸다.</li>
+ *   <li>문서도 신호도 0건이면 보내지 않고 EMPTY로 기록한다. 그래도 last_sent_at은 갱신해 빈 날이 기간을 늘리지 않게 한다.
  *       FAILED는 last_sent_at을 두어 다음 틱(같은 시간대 안)에 다시 시도한다.</li>
  *   <li>보낸 본문은 digest_run.body_text에 남는다 (화면·감사에서 다시 본다).</li>
  * </ul>
@@ -49,22 +52,34 @@ public class DigestService {
 
     private static final Logger log = LoggerFactory.getLogger(DigestService.class);
     static final int MAX_DOCUMENTS = 200;
+    static final int MAX_SIGNALS = 200;
     static final Duration FIRST_PERIOD = Duration.ofHours(24);
     static final Set<String> CHANNELS = Set.of("EMAIL", "WEBHOOK");
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
     private static final TypeReference<List<String>> STRINGS = new TypeReference<>() { };
     private static final TypeReference<List<Map<String, Object>>> OBJECTS = new TypeReference<>() { };
 
+    /** companyIds(M3): 그 회사들에 연결된 문서와 그 회사들의 신호. 네 목록이 모두 비면 전체(문서 전부 + 모든 회사 신호). */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public record Filters(List<Long> watchIds, List<Long> sourceIds, List<String> topics) {
+    public record Filters(List<Long> watchIds, List<Long> sourceIds, List<String> topics, List<Long> companyIds) {
         public Filters {
             watchIds = distinct(watchIds);
             sourceIds = distinct(sourceIds);
             topics = distinct(topics);
+            companyIds = distinct(companyIds);
         }
 
         public static Filters empty() {
-            return new Filters(null, null, null);
+            return new Filters(null, null, null, null);
+        }
+
+        public boolean isEmpty() {
+            return watchIds.isEmpty() && sourceIds.isEmpty() && topics.isEmpty() && companyIds.isEmpty();
+        }
+
+        /** 회사 신호를 넣을지: 전체 구독이거나 회사를 지정한 구독. 감시·소스·토픽만 고른 구독에는 넣지 않는다. */
+        public boolean includesCompanySignals() {
+            return isEmpty() || !companyIds.isEmpty();
         }
 
         private static <T> List<T> distinct(List<T> values) {
@@ -81,8 +96,8 @@ public class DigestService {
                           int documentCount, String status, String error, String bodyText, OffsetDateTime sentAt) {
     }
 
-    public record Preview(OffsetDateTime periodFrom, OffsetDateTime periodTo, int documentCount, boolean truncated,
-                          String subject, String text, String html) {
+    public record Preview(OffsetDateTime periodFrom, OffsetDateTime periodTo, int documentCount, int signalCount,
+                          boolean truncated, String subject, String text, String html) {
     }
 
     private final JdbcClient jdbc;
@@ -193,7 +208,8 @@ public class DigestService {
     public Preview preview(CurrentUser user, long id) {
         SubscriptionView s = get(user, id);
         Digest d = compose(s, OffsetDateTime.now());
-        return new Preview(d.periodFrom(), d.periodTo(), d.documentCount(), d.truncated(), d.subject(), d.text(), d.html());
+        return new Preview(d.periodFrom(), d.periodTo(), d.documentCount(), d.signalCount(), d.truncated(), d.subject(),
+                d.text(), d.html());
     }
 
     /** 즉시 한 번 보낸다 (테스트용). 기록·last_sent_at 갱신은 스케줄 전송과 같다. */
@@ -214,7 +230,7 @@ public class DigestService {
             log.error("digest {} compose failed", s.id(), e);
             return record(s, actorId, from(s, now), now, 0, "FAILED", "본문 생성 실패: " + brief(e), null, false);
         }
-        if (digest.documentCount() == 0) {
+        if (digest.documentCount() == 0 && digest.signalCount() == 0) {   // 회사 신호가 있으면 문서가 0건이어도 보낸다
             return record(s, actorId, digest.periodFrom(), digest.periodTo(), 0, "EMPTY", null, null, true);
         }
         try {
@@ -263,7 +279,32 @@ public class DigestService {
         if (truncated) {
             docs = docs.subList(0, MAX_DOCUMENTS);
         }
-        return composer.compose(s.name(), from, now, docs, new LinkedHashSet<>(s.filters().watchIds()), truncated);
+        List<CompanySignal> signals = s.filters().includesCompanySignals()
+                ? loadSignals(s.filters().companyIds(), from, now, MAX_SIGNALS) : List.of();
+        return composer.compose(s.name(), from, now, docs, new LinkedHashSet<>(s.filters().watchIds()), truncated, signals);
+    }
+
+    /** 기간(created_at, from 초과 to 이하)에 새로 기록된 회사 신호. companyIds가 비면 ACTIVE 회사 전부. 심각도 → 시각 내림차순. */
+    List<CompanySignal> loadSignals(List<Long> companyIds, OffsetDateTime from, OffsetDateTime to, int limit) {
+        StringBuilder sql = new StringBuilder("""
+                SELECT g.company_id, c.name AS company_name, g.kind, g.severity, g.title, g.observed_at, d.url
+                FROM company_signal g
+                JOIN company c ON c.id = g.company_id
+                LEFT JOIN document d ON d.id = g.document_id
+                WHERE g.created_at > ? AND g.created_at <= ? AND c.status = 'ACTIVE'
+                """);
+        List<Object> params = new ArrayList<>();
+        params.add(from);
+        params.add(to);
+        if (!companyIds.isEmpty()) {
+            sql.append(" AND g.company_id IN (").append(placeholders(companyIds.size())).append(")");
+            params.addAll(companyIds);
+        }
+        sql.append(" ORDER BY CASE g.severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, g.observed_at DESC, g.id DESC LIMIT ?");
+        params.add(limit);
+        return jdbc.sql(sql.toString()).params(params).query((rs, n) -> new CompanySignal(rs.getLong("company_id"),
+                rs.getString("company_name"), rs.getString("kind"), rs.getString("severity"), rs.getString("title"),
+                rs.getObject("observed_at", OffsetDateTime.class), rs.getString("url"))).list();
     }
 
     private static OffsetDateTime from(SubscriptionView s, OffsetDateTime now) {
@@ -305,6 +346,11 @@ public class DigestService {
         for (String topic : f.topics()) {
             any.add("e.topics @> CAST(? AS jsonb)");
             params.add(toJson(List.of(topic)));
+        }
+        if (!f.companyIds().isEmpty()) {
+            any.add("EXISTS (SELECT 1 FROM document_company dc WHERE dc.document_id = d.id AND dc.company_id IN ("
+                    + placeholders(f.companyIds().size()) + "))");
+            params.addAll(f.companyIds());
         }
         if (!any.isEmpty()) {
             sql.append(" AND (").append(String.join(" OR ", any)).append(")");
@@ -385,6 +431,13 @@ public class DigestService {
                 throw bad("없는 소스 id가 있습니다: " + f.sourceIds());
             }
         }
+        if (!f.companyIds().isEmpty()) {
+            long found = jdbc.sql("SELECT count(*) FROM company WHERE id IN (" + placeholders(f.companyIds().size()) + ")")
+                    .params(new ArrayList<Object>(f.companyIds())).query(Long.class).single();
+            if (found != f.companyIds().size()) {
+                throw bad("없는 회사 id가 있습니다: " + f.companyIds());
+            }
+        }
         return f;
     }
 
@@ -449,7 +502,8 @@ public class DigestService {
         }
         try {
             Map<String, Object> m = json.readValue(jsonText, new TypeReference<Map<String, Object>>() { });
-            return new Filters(longs(m.get("watch_ids")), longs(m.get("source_ids")), stringList(m.get("topics")));
+            return new Filters(longs(m.get("watch_ids")), longs(m.get("source_ids")), stringList(m.get("topics")),
+                    longs(m.get("company_ids")));
         } catch (JsonProcessingException e) {
             return Filters.empty();
         }
@@ -484,6 +538,7 @@ public class DigestService {
         m.put("watch_ids", f.watchIds());
         m.put("source_ids", f.sourceIds());
         m.put("topics", f.topics());
+        m.put("company_ids", f.companyIds());
         return toJson(m);
     }
 

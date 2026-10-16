@@ -45,6 +45,18 @@ PROVIDERS: tuple[Provider, ...] = (
                              "등록하면 진행됩니다. 발급: https://developers.naver.com/apps/#/register",
         keyword_based=True,
     ),
+    Provider(
+        id="data_go_kr",
+        name="공공데이터포털",
+        domains=("api.odcloud.kr", "apis.data.go.kr"),
+        signup_url="https://www.data.go.kr",
+        needs_key=True,
+        description="공공데이터포털(data.go.kr) 오픈API. 서비스키 하나를 여러 API가 공유한다. 첫 용도는 국세청 사업자등록 상태조회"
+                    "(회사 마스터의 사업자번호로 휴업·폐업·과세유형 변경을 매일 확인, kind CHECK 점검 소스). "
+                    "국세청 사업자등록 상태조회 활용신청 필요.",
+        key_required_message="공공데이터포털 서비스키가 필요합니다. 관리자가 data.go.kr에서 국세청 사업자등록 상태조회 활용신청 후 "
+                             "서비스키를 등록하면 자동으로 진행됩니다. 발급: https://www.data.go.kr",
+    ),
 )
 
 

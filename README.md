@@ -156,6 +156,18 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 | `SENSING_MAIL_AUTH` / `SENSING_MAIL_STARTTLS` | `true` / `true` | 인증 없는 사내 릴레이(25번 포트)면 둘 다 `false` |
 | `SENSING_DIGEST_ENABLED` / `SENSING_DIGEST_TICK_MS` | `true` / `300000` | 다이제스트 스케줄러 켜기·확인 간격 |
 
+### 회사(거래처) 마스터와 공급사 리스크 신호 (M3)
+
+현업이 구매 SaaS 케이던시아를 함께 쓰므로, 문서 중심 위에 **회사 중심**("어느 거래처에 무슨 일")을 한 층 얹습니다. 회사(`company`: 이름·별칭·
+사업자등록번호·DART 고유번호·외부 ID·태그)를 등록하면 ① 이름+별칭을 키워드로 한 네이버 뉴스 감시(`회사:<이름>`, 360분)가 생겨 걸린 기사를
+`document_company`(WATCH)로 연결하고, ② 보강 태그(고유명사)가 회사 이름·별칭과 **정확히**(대소문자·공백 무시) 일치하면 TAG로 연결하며
+(부분 일치·유사도 매칭은 오탐 때문에 하지 않습니다), ③ 연결된 기사의 토픽이 사건·사고·인사·조직이면 `company_signal`(NEWS, MEDIUM)을 남깁니다.
+④ 첫 회사를 만들 때 **점검 소스**(`source.kind = CHECK`, 하루 1회)가 하나 생겨 사업자번호가 있는 모든 회사의 국세청 사업자등록 상태를
+공공데이터포털 API로 확인하고, 폐업·휴업(HIGH)·미등록(MEDIUM)·과세유형 변경(LOW)을 `company_signal`(BIZ_STATUS)로 남깁니다. 같은 상태는
+fingerprint(상태 코드+폐업일)로 매일 중복 기록하지 않습니다. 공공데이터포털 서비스키(provider `data_go_kr`, 국세청 사업자등록 상태조회
+활용신청 필요)가 없으면 점검 소스는 다른 API 소스처럼 관리자 큐 `API_KEY`에서 기다립니다. 다이제스트는 기간 안의 회사 신호를 맨 앞 "거래처 신호"
+절로 넣고(HIGH 먼저), 신호가 있으면 문서가 0건이어도 보냅니다. 삭제는 보관(ARCHIVED)이며 그 감시는 제외됩니다.
+
 ### API 맛보기
 
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
@@ -181,6 +193,11 @@ curl -X POST localhost:8080/api/v1/digests -H 'X-User: viewer' -H 'Content-Type:
 curl localhost:8080/api/v1/digests -H 'X-User: viewer'          # PUT /api/v1/digests/1 -d '{"channel":"WEBHOOK","target":"https://hooks.slack.com/services/..."}', DELETE /api/v1/digests/1
 curl -X POST localhost:8080/api/v1/digests/1/preview -H 'X-User: viewer'   # text·html·documentCount. /send-now 는 바로 보내고 digest_run에 기록, /runs 는 보낸 기록
 
+# 회사(거래처) 마스터 (REGISTRAR 이상. 회사 감시 + 점검 소스가 함께 생긴다) · 목록(신호 수·최근 신호·연결 문서 수)과 상세 · 회사 신호(심각도 → 시각 내림차순)
+curl -X POST localhost:8080/api/v1/companies -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"나부품","aliases":["NABU"],"bizNo":"123-45-67890","corpCode":"00123456","externalId":"CAI-001","tags":["1차 공급사"]}'
+curl localhost:8080/api/v1/companies -H 'X-User: viewer'            # GET /api/v1/companies/1 (최근 신호·문서 20건), PUT /api/v1/companies/1, DELETE 는 보관. POST /api/v1/companies/import 는 JSON 배열 또는 CSV(name,aliases(;구분),biz_no,...) upsert
+curl 'localhost:8080/api/v1/company-signals?since=2026-10-15&severity=HIGH' -H 'X-User: viewer'   # kind=BIZ_STATUS|NEWS|... · GET /api/v1/companies/1/signals?since=
+
 # 관리자: 소스 목록·상세·조치
 curl localhost:8080/api/v1/sources -H 'X-User: admin'
 curl localhost:8080/api/v1/sources/1 -H 'X-User: admin'
@@ -195,6 +212,7 @@ curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'    
 # 관리자: 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"dart","secret":"<발급받은 키>","label":"공시 API"}'
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"naver_news","secret":"<client_id>:<client_secret>","label":"네이버 검색"}'
+curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"data_go_kr","secret":"<공공데이터포털 서비스키>","label":"공공데이터포털"}'
 curl localhost:8080/api/v1/api-credentials -H 'X-User: admin'   # DELETE /api/v1/api-credentials/dart
 ```
 
@@ -210,9 +228,10 @@ worker/    Python 수집 워커
     llm.py        LLM 클라이언트 (Claude · OpenAI 호환 · 없음), JSON 꺼내기·스키마 검증·재요청
     extract.py    기사 추출: og/article/JSON-LD 메타 + 본문 + 첨부 링크 (설정 selectors 우선)
     policy.py     사이트 유형 판정, 기본값, 품질 검사
-    apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록·네이버 뉴스 검색 커넥터
-    jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록)
-    db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전
+    apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록·네이버 뉴스 검색·국세청 사업자 상태 커넥터
+    company.py    회사 레이어 규칙: 태그 → 회사 정확 일치, 회사 신호(BIZ_STATUS·NEWS)의 심각도·fingerprint
+    jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록, CHECK 소스는 회사 상태 점검)
+    db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전, 회사 연결·신호
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
 docs/      설계 메모
 ```
@@ -236,7 +255,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 | M0 골격·환경 | 스키마, 등록 API, 스케줄러, 작업 큐, 워커 골격 | 완료 |
 | M1 하네스·탐색 | 자동 탐색 고도화, 도메인 단위 간격(워커 간 공유), 이상 감지, 관리자 처리 대기 API, LLM 레시피 생성 | 완료 (허브 한 곳 실패 내성만 남음) |
 | M2 외부 API·키워드 감시 | API 카탈로그·자격 증명 저장소·API 수집기(뉴스 검색·DART·공공데이터포털), 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트 알림, 최소 화면(등록·내 요청·관리자 큐) | 진행 중 |
-| M3 회사 레이어·공급사 리스크 소스 | 회사(거래처) 마스터와 별칭 매칭, 문서→회사 연결, 리스크 신호 분류(재무·제재·사고·경영 변동), 공공 API 커넥터(국세청 사업자 상태, 조달청 부정당업자, DART 기업개황·재무), 회사별 다이제스트, 케이던시아 연동(마스터 동기화·이벤트 전달, SDS API 확인 뒤) | 다음 |
+| M3 회사 레이어·공급사 리스크 소스 | 회사(거래처) 마스터와 별칭 매칭, 문서→회사 연결, 리스크 신호 분류(재무·제재·사고·경영 변동), 공공 API 커넥터(국세청 사업자 상태, 조달청 부정당업자, DART 기업개황·재무), 회사별 다이제스트, 케이던시아 연동(마스터 동기화·이벤트 전달, SDS API 확인 뒤) | 진행 중 |
 | M4 동적·첨부 | Playwright 동적 수집, 첨부 다운로드·HWP/PDF 텍스트 추출, 원문 삭제(GONE) 감지, (합의 시) 회사 계정 로그인 세션 | |
 | M5 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 모달·tool calling(`register_source`·`get_source_status`·`submit_api_key`), 대화 저장 | |
 | M6 관리자·운영 | 레시피 수정·미리보기, 설정 백필, 감사 로그 화면, 운영 지표 | |
@@ -282,7 +301,15 @@ M2에서 한 일:
   스케줄러가 매일 그 시각(KST)에 처리해 지난 다이제스트 이후 새로 수집된 문서를 감시별(검색어별) → 토픽별 → 분류 전으로 묶어
   메일(HTML, `SENSING_MAIL_*`) 또는 웹훅(`{"text":...}`)으로 보낸다. 미리보기·즉시 전송 API, 보낸 본문과 결과(`SENT`·`EMPTY`·`FAILED`)는
   `digest_run`에 남고, 구독 하나의 실패는 다른 구독을 막지 않는다
-- [ ] 공공데이터포털 커넥터, 네이버 API 쿼터 추적, Teams 등 다른 웹훅 형식, 최소 화면
+- [ ] 네이버 API 쿼터 추적, Teams 등 다른 웹훅 형식, 최소 화면
+
+M3에서 한 일:
+
+- [x] 회사 마스터·문서→회사 연결·국세청 사업자 상태 신호: `company`·`document_company`·`company_signal`(V8), `/api/v1/companies`(등록·import upsert·
+  목록·상세·수정·보관)와 `/api/v1/company-signals`, 회사 감시(`회사:<이름>`, 360분)로 걸린 기사와 보강 태그 정확 일치로 연결, 사건·사고·인사·조직
+  기사는 NEWS 신호, 점검 소스(`kind = CHECK`, 하루 1회)가 공공데이터포털(`data_go_kr`) 국세청 사업자등록 상태조회로 폐업·휴업·미등록·과세유형
+  변경을 BIZ_STATUS 신호로 기록(fingerprint로 중복 없음), 다이제스트 맨 앞 "거래처 신호" 절과 `companyIds` 필터
+- [ ] 조달청 부정당업자 제재(DEBARMENT), DART 기업개황·재무(FINANCIAL)와 회사별 공시(corp_code), 회사별 다이제스트 구독 화면, 케이던시아 연동
 
 ## 원칙
 
