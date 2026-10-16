@@ -114,6 +114,16 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 | --- | --- | --- |
 | `SENSING_SECRET_KEY` | (없음) | 백엔드·워커 공통. API 키를 암호화·복호화하는 대칭키(`pgp_sym_encrypt`). 비우면 백엔드 자격 증명 API는 503, 워커는 API 소스를 관리자 큐로 보낸다 |
 | `SENSING_MAX_API_ITEMS` | `500` | 워커. API 소스 실행 1회당 받을 항목 수 상한 |
+| `SENSING_NAVER_DAILY_LIMIT` | `20000` | 워커. 네이버 검색 API 일 호출 상한(공식 25,000). 지금은 호출 수를 로그에 남기는 기준이고 정확한 쿼터 추적은 후속 |
+
+### 키워드 감시 (M2)
+
+현업(대외협력·커뮤니케이션)은 사이트가 아니라 키워드(자사·경쟁사·이슈) 단위로 보도를 봅니다. 키워드 묶음을 등록하면 네이버 뉴스 검색 API로
+60분마다 받아 문서로 저장하고, 어느 감시의 어느 검색어에 걸렸는지 `document_watch`에 남깁니다 (다이제스트가 이 표를 읽습니다).
+감시 하나는 `source` 한 행(`kind = WATCH`, `watch_name`)이고 키워드는 설정 버전 config(`{"method":"API","provider":"naver_news","keywords":[...],"exclude":[...]}`)에
+두므로, 키워드 수정은 설정 새 버전 활성화이고 롤백·일시정지·제외 같은 소스 조치를 그대로 씁니다. 네이버 뉴스 웹은 robots.txt가 전체 차단이라
+크롤링하지 않으며, `news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다.
+네이버 키는 `client_id:client_secret` 한 문자열로 `/api/v1/api-credentials`에 넣고(provider `naver_news`), 언론 기사이므로 제목·링크·발행일만 저장합니다.
 
 ### API 맛보기
 
@@ -126,6 +136,10 @@ curl -X POST localhost:8080/api/v1/registrations -H 'X-User: registrar' \
 
 # 내 등록 요청과 진행 단계
 curl localhost:8080/api/v1/registrations/mine -H 'X-User: registrar'
+
+# 키워드 감시 등록 (네이버 뉴스 검색 API, 60분 주기. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
+curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
+curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
 
 # 관리자: 소스 목록·상세·조치
 curl localhost:8080/api/v1/sources -H 'X-User: admin'
@@ -140,6 +154,7 @@ curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'    
 
 # 관리자: 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"dart","secret":"<발급받은 키>","label":"공시 API"}'
+curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"naver_news","secret":"<client_id>:<client_secret>","label":"네이버 검색"}'
 curl localhost:8080/api/v1/api-credentials -H 'X-User: admin'   # DELETE /api/v1/api-credentials/dart
 ```
 
@@ -155,8 +170,8 @@ worker/    Python 수집 워커
     llm.py        LLM 클라이언트 (Claude · OpenAI 호환 · 없음), JSON 꺼내기·스키마 검증·재요청
     extract.py    기사 추출: og/article/JSON-LD 메타 + 본문 + 첨부 링크 (설정 selectors 우선)
     policy.py     사이트 유형 판정, 기본값, 품질 검사
-    apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록 커넥터
-    jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로)
+    apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록·네이버 뉴스 검색 커넥터
+    jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록)
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
 docs/      설계 메모
@@ -212,7 +227,11 @@ M2에서 한 일:
 - [x] API 소스 기반·DART: API 카탈로그(`worker/src/sensing_worker/apis/`), 자격 증명 저장소(`api_credential`, pgcrypto 암호화,
   `/api/v1/api-credentials`), 관리자 큐 `API_KEY` 종류, DART 공시 목록 커넥터. dart.fss.or.kr을 등록하면 크롤링 없이
   "공시 API 키 발급 필요"로 큐에 가고, 관리자가 키를 넣으면 검증 → `method: API` 설정 → 첫 수집 → 6시간 주기 수집이 자동으로 이어진다
-- [ ] 네이버 뉴스 검색·공공데이터포털 커넥터, 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트, 최소 화면
+- [x] 키워드 감시·네이버 뉴스 검색 API: `source.kind = WATCH`(V5), `POST /api/v1/watches`(이름·키워드·제외어, VIEWER는 승인 대기),
+  `PUT`으로 키워드 수정 = 설정 새 버전, 네이버 뉴스 검색 커넥터(`apis/naver_news.py`: 검색어별 `sort=date` 최대 3페이지, 제목 태그 제거,
+  제목·링크·발행일만), `document_watch`에 감시·검색어 기록 (같은 기사가 여러 감시에 걸려도 문서는 하나). news.naver.com을 사이트로
+  등록하면 `KEYWORDS_REQUIRED`로 안내
+- [ ] 공공데이터포털 커넥터, 네이버 API 쿼터 추적, 수집 시점 요약·분류, 일간 다이제스트, 최소 화면
 
 ## 원칙
 
