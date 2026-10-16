@@ -32,8 +32,10 @@ import io.sensinghub.watch.WatchService;
  *   <li>회사를 만들면 이름+별칭을 키워드로 한 네이버 뉴스 감시({@link WatchService#createForCompany}, "회사:&lt;이름&gt;", 360분)를
  *       만들어 {@code company.watch_source_id}에 둔다. 걸린 기사는 워커가 {@code document_company}(WATCH)로 연결하고,
  *       보강 토픽이 사건·사고·인사·조직이면 {@code company_signal}(NEWS)을 남긴다. 네이버 키가 없으면 감시는 API_KEY_REQUIRED 큐에 간다.</li>
- *   <li>처음 회사를 만들 때 국세청 사업자등록 상태를 하루 1회 확인하는 점검 소스({@code source.kind = CHECK}, site api.odcloud.kr,
- *       config {@code {"provider":"data_go_kr","check":"nts_status"}})를 하나 만든다. 공공데이터포털 서비스키가 없으면 그것도 큐에 간다.</li>
+ *   <li>처음 회사를 만들 때 점검 소스({@code source.kind = CHECK}, {@link #CHECK_KINDS}) 네 개를 없을 때만 만든다: 국세청 사업자등록 상태
+ *       (nts_status, api.odcloud.kr, 하루 1회), DART 고유번호 매핑(dart_corp_map, opendart.fss.or.kr, 주 1회), DART 회사별 공시
+ *       (dart_disclosure, opendart.fss.or.kr, 6시간), 조달청 부정당업자(g2b_debarment, apis.data.go.kr, 하루 1회).
+ *       config는 {@code {"method":"API","provider":...,"check":...}}이고 워커가 check 종류대로 돈다. 키가 없으면 그 소스는 API_KEY_REQUIRED 큐에 간다.</li>
  *   <li>사업자등록번호는 숫자 10자리로 정규화(하이픈 제거)하고 형식이 틀리면 400, 중복이면 409. import는 사업자번호가 같으면 갱신(upsert).</li>
  *   <li>삭제는 ARCHIVED 처리이고 그 감시는 EXCLUDED로 바뀐다. 신호·연결은 남는다.</li>
  * </ul>
@@ -42,11 +44,24 @@ import io.sensinghub.watch.WatchService;
 @Service
 public class CompanyService {
 
-    public static final String CHECK_PROVIDER = "data_go_kr";
-    public static final String CHECK_DOMAIN = "api.odcloud.kr";
-    public static final String CHECK_BASE_URL = "https://api.odcloud.kr";
-    public static final String CHECK_NAME = "check:nts_status";
-    static final int CHECK_INTERVAL_MINUTES = 1440;
+    /** 점검 소스 한 종류. source.name은 "check:&lt;check&gt;", site는 domain, 설정은 {method API, provider, check (+ extra)}. */
+    public record CheckKind(String check, String provider, String domain, int intervalMinutes, String label,
+                            Map<String, Object> extra) {
+        public String name() {
+            return "check:" + check;
+        }
+
+        public String baseUrl() {
+            return "https://" + domain;
+        }
+    }
+
+    /** 회사가 하나라도 있으면 있어야 하는 점검 소스들 (워커 jobs.CHECK_INTERVALS와 같은 주기). */
+    public static final List<CheckKind> CHECK_KINDS = List.of(
+            new CheckKind("nts_status", "data_go_kr", "api.odcloud.kr", 1440, "국세청 사업자등록 상태", Map.of()),
+            new CheckKind("dart_corp_map", "dart", "opendart.fss.or.kr", 10080, "DART 고유번호 매핑", Map.of()),
+            new CheckKind("dart_disclosure", "dart", "opendart.fss.or.kr", 360, "DART 회사별 공시", Map.of("days", 3)),
+            new CheckKind("g2b_debarment", "data_go_kr", "apis.data.go.kr", 1440, "조달청 부정당업자 제재", Map.of("days", 7)));
     static final int WATCH_INTERVAL_MINUTES = 360;
     static final int MAX_ALIASES = 49;   // 이름과 합쳐 감시 키워드 50개 이하
     static final int MAX_TAGS = 20;
@@ -81,7 +96,9 @@ public class CompanyService {
                               String matchedBy, OffsetDateTime matchedAt, List<String> topics) {
     }
 
-    public record CompanyDetail(CompanyView company, List<SignalView> signals, List<DocumentRef> documents) {
+    /** 상세: 최근 신호 20건, 종류별 최근 1건 요약(kind → 신호, observed_at 최신), 최근 연결 문서 20건. */
+    public record CompanyDetail(CompanyView company, List<SignalView> signals, Map<String, SignalBrief> latestByKind,
+                                List<DocumentRef> documents) {
     }
 
     public record ImportResult(int created, int updated, List<Long> ids) {
@@ -185,7 +202,7 @@ public class CompanyService {
                 .query(Long.class).single();
         long watchId = watches.createForCompany(user, in.name(), keywordsOf(in.name(), in.aliases()), WATCH_INTERVAL_MINUTES).id();
         jdbc.sql("UPDATE company SET watch_source_id = ? WHERE id = ?").params(watchId, id).update();
-        ensureCheckSource(user);
+        ensureCheckSources(user);
         return id;
     }
 
@@ -225,12 +242,18 @@ public class CompanyService {
     }
 
     /**
-     * 점검 소스(kind CHECK, 국세청 사업자 상태)가 없으면 만든다: site api.odcloud.kr + source PENDING + 설정 v1 + ONBOARD.
-     * 워커가 키를 확인하고(없으면 REVIEW/API_KEY_REQUIRED, 관리자 큐 API_KEY) ACTIVE로 만들며 하루 1회 돈다.
-     * 관리자가 EXCLUDED로 끈 점검은 다시 만들지 않는다.
+     * 점검 소스(kind CHECK) 네 종류({@link #CHECK_KINDS})를 없을 때만 만든다: site + source PENDING + 설정 v1 + ONBOARD.
+     * 워커가 키를 확인하고(없으면 REVIEW/API_KEY_REQUIRED, 관리자 큐 API_KEY) ACTIVE로 만들며 종류별 주기로 돈다.
+     * 관리자가 EXCLUDED로 끈 점검은 이름이 남아 있으므로 다시 만들지 않는다. 같은 site(opendart.fss.or.kr)를 두 점검이 공유하고 name으로 구분한다.
      */
-    void ensureCheckSource(CurrentUser user) {
-        boolean exists = jdbc.sql("SELECT count(*) FROM source WHERE kind = 'CHECK' AND name = ?").param(CHECK_NAME)
+    void ensureCheckSources(CurrentUser user) {
+        for (CheckKind kind : CHECK_KINDS) {
+            ensureCheckSource(user, kind);
+        }
+    }
+
+    private void ensureCheckSource(CurrentUser user, CheckKind kind) {
+        boolean exists = jdbc.sql("SELECT count(*) FROM source WHERE kind = 'CHECK' AND name = ?").param(kind.name())
                 .query(Long.class).single() > 0;
         if (exists) {
             return;
@@ -241,28 +264,29 @@ public class CompanyService {
                 ON CONFLICT (domain) DO UPDATE SET domain = EXCLUDED.domain
                 RETURNING id
                 """)
-                .params(CHECK_DOMAIN, CHECK_BASE_URL, "{\"api_provider\":\"" + CHECK_PROVIDER + "\"}")
+                .params(kind.domain(), kind.baseUrl(), "{\"api_provider\":\"" + kind.provider() + "\"}")
                 .query(Long.class).single();
         long sourceId = jdbc.sql("""
                 INSERT INTO source (site_id, name, kind, method, status, interval_minutes, requested_by)
                 VALUES (?, ?, 'CHECK', 'API', 'PENDING', ?, ?) RETURNING id
                 """)
-                .params(siteId, CHECK_NAME, CHECK_INTERVAL_MINUTES, user.id())
+                .params(siteId, kind.name(), kind.intervalMinutes(), user.id())
                 .query(Long.class).single();
         Map<String, Object> config = new LinkedHashMap<>();
         config.put("method", "API");
-        config.put("provider", CHECK_PROVIDER);
-        config.put("check", "nts_status");
+        config.put("provider", kind.provider());
+        config.put("check", kind.check());
+        config.putAll(kind.extra());
         long configId = jdbc.sql("""
                 INSERT INTO source_config_version (source_id, version, config, status, change_note, created_by)
-                VALUES (?, 1, CAST(? AS jsonb), 'ACTIVE', '회사 점검 소스 생성 (국세청 사업자등록 상태)', ?) RETURNING id
+                VALUES (?, 1, CAST(? AS jsonb), 'ACTIVE', ?, ?) RETURNING id
                 """)
-                .params(sourceId, toJson(config), user.id())
+                .params(sourceId, toJson(config), "회사 점검 소스 생성 (" + kind.label() + ")", user.id())
                 .query(Long.class).single();
         jdbc.sql("UPDATE source SET active_config_version_id = ? WHERE id = ?").params(configId, sourceId).update();
         jdbc.sql("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', 'REGISTRATION')")
                 .param(sourceId).update();
-        audit.log(user.id(), "CHECK_SOURCE_CREATED", "source", sourceId, "{\"check\":\"nts_status\"}");
+        audit.log(user.id(), "CHECK_SOURCE_CREATED", "source", sourceId, "{\"check\":" + quote(kind.check()) + "}");
     }
 
     // ------------------------------------------------------------------ 조회
@@ -280,10 +304,19 @@ public class CompanyService {
                 .orElseThrow(() -> ApiException.notFound("회사"));
     }
 
-    /** 상세: 최근 신호 20건(심각도·시각 내림차순) + 최근 연결 문서 20건. */
+    /** 상세: 최근 신호 20건(심각도·시각 내림차순) + 종류별 최근 1건(KINDS 순, 없는 종류는 빠진다) + 최근 연결 문서 20건. */
     public CompanyDetail detail(CurrentUser user, long id) {
         CompanyView c = get(user, id);
         List<SignalView> signals = signals(user, id, null, 20);
+        Map<String, SignalBrief> latestByKind = new LinkedHashMap<>();
+        List<SignalBrief> latest = jdbc.sql("""
+                SELECT DISTINCT ON (kind) id, kind, severity, title, observed_at FROM company_signal
+                WHERE company_id = ? ORDER BY kind, observed_at DESC, id DESC
+                """).param(id).query((rs, n) -> new SignalBrief(rs.getLong("id"), rs.getString("kind"), rs.getString("severity"),
+                        rs.getString("title"), rs.getObject("observed_at", OffsetDateTime.class))).list();
+        for (String kind : KINDS) {
+            latest.stream().filter(b -> b.kind().equals(kind)).findFirst().ifPresent(b -> latestByKind.put(kind, b));
+        }
         List<DocumentRef> documents = jdbc.sql("""
                 SELECT d.id, d.url, d.title, d.published_at, t.domain, dc.matched_by, dc.matched_at,
                        COALESCE(e.topics::text, '[]') AS topics
@@ -297,7 +330,7 @@ public class CompanyService {
                 """).param(id).query((rs, n) -> new DocumentRef(rs.getLong("id"), rs.getString("url"), rs.getString("title"),
                         rs.getObject("published_at", OffsetDateTime.class), rs.getString("domain"), rs.getString("matched_by"),
                         rs.getObject("matched_at", OffsetDateTime.class), strings(rs.getString("topics")))).list();
-        return new CompanyDetail(c, signals, documents);
+        return new CompanyDetail(c, signals, latestByKind, documents);
     }
 
     /** 회사 하나의 신호. since(observed_at 초과) 선택, 심각도 → 시각 내림차순. */

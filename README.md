@@ -162,11 +162,17 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 사업자등록번호·DART 고유번호·외부 ID·태그)를 등록하면 ① 이름+별칭을 키워드로 한 네이버 뉴스 감시(`회사:<이름>`, 360분)가 생겨 걸린 기사를
 `document_company`(WATCH)로 연결하고, ② 보강 태그(고유명사)가 회사 이름·별칭과 **정확히**(대소문자·공백 무시) 일치하면 TAG로 연결하며
 (부분 일치·유사도 매칭은 오탐 때문에 하지 않습니다), ③ 연결된 기사의 토픽이 사건·사고·인사·조직이면 `company_signal`(NEWS, MEDIUM)을 남깁니다.
-④ 첫 회사를 만들 때 **점검 소스**(`source.kind = CHECK`, 하루 1회)가 하나 생겨 사업자번호가 있는 모든 회사의 국세청 사업자등록 상태를
-공공데이터포털 API로 확인하고, 폐업·휴업(HIGH)·미등록(MEDIUM)·과세유형 변경(LOW)을 `company_signal`(BIZ_STATUS)로 남깁니다. 같은 상태는
-fingerprint(상태 코드+폐업일)로 매일 중복 기록하지 않습니다. 공공데이터포털 서비스키(provider `data_go_kr`, 국세청 사업자등록 상태조회
-활용신청 필요)가 없으면 점검 소스는 다른 API 소스처럼 관리자 큐 `API_KEY`에서 기다립니다. 다이제스트는 기간 안의 회사 신호를 맨 앞 "거래처 신호"
-절로 넣고(HIGH 먼저), 신호가 있으면 문서가 0건이어도 보냅니다. 삭제는 보관(ARCHIVED)이며 그 감시는 제외됩니다.
+④ 첫 회사를 만들 때 **점검 소스**(`source.kind = CHECK`, 설정의 `check`가 점검 종류) 네 개가 생겨 모든 회사를 주기적으로 외부 API로 확인합니다.
+`nts_status`(하루 1회)는 사업자번호가 있는 회사의 국세청 사업자등록 상태를 확인해 폐업·휴업(HIGH)·미등록(MEDIUM)·과세유형 변경(LOW)을
+`company_signal`(BIZ_STATUS)로 남깁니다. `dart_corp_map`(주 1회)은 DART 고유번호 전체 목록(corpCode.xml)을 받아 corp_code가 빈 회사의 이름·별칭과
+공백·"(주)"·"주식회사"·"㈜"를 지우고 **정확히** 일치하는 항목이 하나(여럿이면 상장사 하나)일 때만 고유번호를 채웁니다(모호하면 로그만).
+`dart_disclosure`(6시간)는 고유번호가 있는 회사마다 최근 3일 공시를 받아 문서(`document_company` API)로 저장하고, 보고서명에 든 말로
+HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부적정·자본잠식·불성실공시·횡령·배임)·MEDIUM(소송·최대주주 변경·대표이사 변경·유상증자·합병·분할·
+영업양수도·거래정지)·LOW(그 밖의 주요사항보고서·정정공시) DISCLOSURE 신호를 남깁니다(일반 정기·수시 공시는 문서만). `g2b_debarment`(하루 1회)는
+조달청 나라장터 부정당업자(입찰참가자격 제한) 조회로 제재가 있으면 DEBARMENT HIGH 신호를 남깁니다. 같은 신호는 fingerprint(상태 코드+폐업일,
+공시 접수번호, 제재 시작일+기관)로 중복 기록하지 않습니다. 키가 없으면(공공데이터포털 `data_go_kr`: 국세청 사업자등록 상태조회·나라장터 사용자정보
+서비스 활용신청 필요, DART `dart`) 그 점검 소스는 다른 API 소스처럼 관리자 큐 `API_KEY`에서 기다립니다. 다이제스트는 기간 안의 회사 신호를 맨 앞
+"거래처 신호" 절로 넣고(HIGH 먼저), 신호가 있으면 문서가 0건이어도 보냅니다. 삭제는 보관(ARCHIVED)이며 그 감시는 제외됩니다.
 
 ### API 맛보기
 
@@ -195,7 +201,7 @@ curl -X POST localhost:8080/api/v1/digests/1/preview -H 'X-User: viewer'   # tex
 
 # 회사(거래처) 마스터 (REGISTRAR 이상. 회사 감시 + 점검 소스가 함께 생긴다) · 목록(신호 수·최근 신호·연결 문서 수)과 상세 · 회사 신호(심각도 → 시각 내림차순)
 curl -X POST localhost:8080/api/v1/companies -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"나부품","aliases":["NABU"],"bizNo":"123-45-67890","corpCode":"00123456","externalId":"CAI-001","tags":["1차 공급사"]}'
-curl localhost:8080/api/v1/companies -H 'X-User: viewer'            # GET /api/v1/companies/1 (최근 신호·문서 20건), PUT /api/v1/companies/1, DELETE 는 보관. POST /api/v1/companies/import 는 JSON 배열 또는 CSV(name,aliases(;구분),biz_no,...) upsert
+curl localhost:8080/api/v1/companies -H 'X-User: viewer'            # GET /api/v1/companies/1 (최근 신호·문서 20건, 종류별 최근 1건 latestByKind), PUT /api/v1/companies/1, DELETE 는 보관. POST /api/v1/companies/import 는 JSON 배열 또는 CSV(name,aliases(;구분),biz_no,...) upsert
 curl 'localhost:8080/api/v1/company-signals?since=2026-10-15&severity=HIGH' -H 'X-User: viewer'   # kind=BIZ_STATUS|NEWS|... · GET /api/v1/companies/1/signals?since=
 
 # 관리자: 소스 목록·상세·조치
@@ -309,7 +315,12 @@ M3에서 한 일:
   목록·상세·수정·보관)와 `/api/v1/company-signals`, 회사 감시(`회사:<이름>`, 360분)로 걸린 기사와 보강 태그 정확 일치로 연결, 사건·사고·인사·조직
   기사는 NEWS 신호, 점검 소스(`kind = CHECK`, 하루 1회)가 공공데이터포털(`data_go_kr`) 국세청 사업자등록 상태조회로 폐업·휴업·미등록·과세유형
   변경을 BIZ_STATUS 신호로 기록(fingerprint로 중복 없음), 다이제스트 맨 앞 "거래처 신호" 절과 `companyIds` 필터
-- [ ] 조달청 부정당업자 제재(DEBARMENT), DART 기업개황·재무(FINANCIAL)와 회사별 공시(corp_code), 회사별 다이제스트 구독 화면, 케이던시아 연동
+- [x] DART 고유번호 매핑·회사별 공시 신호·조달청 부정당업자 신호: 점검 소스에 점검 종류를 더해(`check`: `dart_corp_map` 주 1회 corpCode.xml ZIP으로
+  corp_code 자동 채움, `dart_disclosure` 6시간마다 회사별 list.json → 문서(`document_company` API) + 보고서명 규칙으로 DISCLOSURE HIGH/MEDIUM/LOW,
+  `g2b_debarment` 하루 1회 나라장터 사용자정보 서비스 `getUnptRsttCorpInfo02`로 사업자번호별 조회 → DEBARMENT HIGH) 처음 회사를 만들 때 네 점검
+  소스를 함께 만들고, 상세 API에 종류별 최근 신호(`latestByKind`). 조달청 API의 응답 항목명은 포털에 공개돼 있지 않아 커넥터 config `fields`로
+  바꿀 수 있다 (`worker/src/sensing_worker/apis/g2b_debarment.py` 참고)
+- [ ] DART 기업개황·재무(FINANCIAL), 회사별 다이제스트 구독 화면, 케이던시아 연동
 
 ## 원칙
 

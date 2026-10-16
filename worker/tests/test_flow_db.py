@@ -657,19 +657,30 @@ def register_company(store: Store, name: str, aliases: list[str], biz_no: str | 
     return company_id, watch_id
 
 
-def register_check_source(store: Store, user_id: int = 2) -> int:
-    """백엔드 CompanyService.ensureCheckSource와 같은 행: site api.odcloud.kr + source(kind CHECK, 1440분) + 설정 v1 + ONBOARD."""
+# 점검 종류 → (site 도메인, 제공자, 주기). 백엔드 CompanyService.CHECK_KINDS와 같다
+CHECK_KINDS = {
+    "nts_status": ("api.odcloud.kr", "data_go_kr", 1440),
+    "dart_corp_map": ("opendart.fss.or.kr", "dart", 10080),
+    "dart_disclosure": ("opendart.fss.or.kr", "dart", 360),
+    "g2b_debarment": ("apis.data.go.kr", "data_go_kr", 1440),
+}
+
+
+def register_check_source(store: Store, check: str = "nts_status", user_id: int = 2) -> int:
+    """백엔드 CompanyService.ensureCheckSources와 같은 행: site + source(kind CHECK, "check:<종류>", 종류별 주기) + 설정 v1 + ONBOARD."""
+    import json as _json
+    domain, provider, interval = CHECK_KINDS[check]
     c = store.conn
     site_id = c.execute("INSERT INTO site (domain, base_url, site_type, risk_flags) VALUES (%s, %s, 'PUBLIC', %s::jsonb) "
                         "ON CONFLICT (domain) DO UPDATE SET domain = EXCLUDED.domain RETURNING id",
-                        ("api.odcloud.kr", "https://api.odcloud.kr", '{"api_provider":"data_go_kr"}')).fetchone()["id"]
+                        (domain, "https://" + domain, _json.dumps({"api_provider": provider}))).fetchone()["id"]
     source_id = c.execute(
         "INSERT INTO source (site_id, name, kind, method, status, interval_minutes, requested_by) "
-        "VALUES (%s, 'check:nts_status', 'CHECK', 'API', 'PENDING', 1440, %s) RETURNING id", (site_id, user_id)).fetchone()["id"]
+        "VALUES (%s, %s, 'CHECK', 'API', 'PENDING', %s, %s) RETURNING id", (site_id, "check:" + check, interval, user_id)).fetchone()["id"]
     config_id = c.execute(
         "INSERT INTO source_config_version (source_id, version, config, status, change_note, created_by) "
         "VALUES (%s, 1, %s::jsonb, 'ACTIVE', '회사 점검 소스 생성', %s) RETURNING id",
-        (source_id, '{"method": "API", "provider": "data_go_kr", "check": "nts_status"}', user_id)).fetchone()["id"]
+        (source_id, _json.dumps({"method": "API", "provider": provider, "check": check}), user_id)).fetchone()["id"]
     c.execute("UPDATE source SET active_config_version_id = %s WHERE id = %s", (config_id, source_id))
     c.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'REGISTRATION')", (source_id,))
     return source_id
@@ -820,3 +831,127 @@ def test_check_source_records_biz_status_signals_once_and_waits_for_portal_key(e
     assert cred["status"] == "INVALID" and "revoked-key" not in cred["last_error"]
     err = q(store, "SELECT code, url FROM crawl_error ORDER BY id DESC LIMIT 1")
     assert err["code"] == "API_KEY_INVALID" and "serviceKey=***" in err["url"]
+
+
+# ---------------------------------------------------------------- 회사 점검 (M3-2): DART 고유번호 매핑 → 회사별 공시 신호, 조달청 부정당업자 신호
+
+def test_dart_checks_fill_corp_codes_and_record_disclosure_signals_once(env):
+    from datetime import datetime, timedelta, timezone
+    from fakedart import GOOD_KEY, dart_handler, disclosure
+    store, _, settings, _ = env
+    nabu, _ = register_company(store, "나부품", ["NABU"], "1234567890")       # corp_code 없음 → 매핑으로 채운다
+    ga, _ = register_company(store, "가전자", [], None)
+    store.conn.execute("UPDATE company SET corp_code = '00000002' WHERE id = %s", (ga,))   # 손으로 넣은 값은 그대로 둔다
+    dup, _ = register_company(store, "다중복", [], None)                      # DART에 같은 이름의 비상장사 둘 → 채우지 않는다
+    map_id = register_check_source(store, "dart_corp_map")
+    disc_id = register_check_source(store, "dart_disclosure")
+    rows = [disclosure("00000001", "나부품", "회생절차 개시신청", "20261016000001"),
+            disclosure("00000001", "나부품", "사업보고서 (2025.12)", "20261016000002", days_ago=1),
+            disclosure("00000002", "가전자", "주요사항보고서(유상증자결정)", "20261016000003", stock_code="001234"),
+            disclosure("00126380", "테스트전자", "회생절차 개시신청", "20261016000009")]      # 마스터에 없는 회사: 받지 않는다
+    handler = dart_handler(rows)
+    runner, s = api_runner(store, settings, handler)
+    put_credential(store, "dart", GOOD_KEY)
+    for _ in range(3):
+        assert process_one(store, runner, s) == "FAILED"     # 회사 감시 세 건은 네이버 키가 없어 REVIEW
+
+    # ① 고유번호 매핑 (주 1회): 나부품만 채워진다. 가전자는 이미 있고 다중복은 모호
+    assert process_one(store, runner, s) == "SUCCESS"
+    src = q(store, "SELECT s.status, s.interval_minutes, t.domain, v.config FROM source s JOIN site t ON t.id = s.site_id "
+                   "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", map_id)
+    assert src["status"] == "ACTIVE" and src["interval_minutes"] == 10080 and src["domain"] == "opendart.fss.or.kr"
+    assert src["config"] == {"method": "API", "provider": "dart", "check": "dart_corp_map"}
+    job = q(store, "SELECT status, found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", map_id)
+    assert (job["status"], job["found_count"], job["new_count"]) == ("SUCCESS", 2, 1)
+    codes = {r["name"]: r["corp_code"] for r in store.conn.execute("SELECT name, corp_code FROM company")}
+    assert codes == {"나부품": "00000001", "가전자": "00000002", "다중복": None}
+    assert sum("corpCode.xml" in u for u in handler.calls) == 1
+    reg = q(store, "SELECT status, result_message FROM registration_request WHERE source_id = %s", map_id)
+    assert reg["status"] == "COMPLETED" and "2곳 중 1곳" in reg["result_message"]
+    assert q(store, "SELECT status FROM api_credential WHERE provider = 'dart'")["status"] == "VALID"
+
+    # ② 회사별 공시 (6시간): corp_code가 있는 회사마다 받아 문서 3건(API 연결), 신호 2건 (회생 HIGH, 유상증자 MEDIUM). 사업보고서는 문서만
+    assert process_one(store, runner, s) == "SUCCESS"
+    src = q(store, "SELECT status, interval_minutes FROM source WHERE id = %s", disc_id)
+    assert src["status"] == "ACTIVE" and src["interval_minutes"] == 360
+    job = q(store, "SELECT found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", disc_id)
+    assert (job["found_count"], job["new_count"]) == (2, 2)
+    docs = store.conn.execute("SELECT d.title, d.source_id, d.url, dc.company_id, dc.matched_by FROM document d "
+                              "JOIN document_company dc ON dc.document_id = d.id ORDER BY d.id").fetchall()
+    assert [(d["title"], d["company_id"], d["matched_by"]) for d in docs] == [
+        ("회생절차 개시신청", nabu, "API"), ("사업보고서 (2025.12)", nabu, "API"), ("주요사항보고서(유상증자결정)", ga, "API")]
+    assert all(d["source_id"] == disc_id and d["url"].startswith("https://dart.fss.or.kr/dsaf001/main.do?rcpNo=") for d in docs)
+    assert q(store, "SELECT count(*) AS c FROM document")["c"] == 3 and "corp_code=00126380" not in " ".join(handler.calls)
+    rows_ = signals(store)
+    assert [(r["company_id"], r["kind"], r["severity"], r["fingerprint"]) for r in rows_] == [
+        (nabu, "DISCLOSURE", "HIGH", "20261016000001"), (ga, "DISCLOSURE", "MEDIUM", "20261016000003")]
+    assert rows_[0]["title"] == "회생절차 개시신청" and rows_[0]["source_id"] == disc_id
+    assert rows_[0]["document_id"] == q(store, "SELECT id FROM document WHERE url LIKE '%%20261016000001'")["id"]
+    assert rows_[0]["detail"]["matched"] == ["회생절차"] and rows_[0]["detail"]["rcept_no"] == "20261016000001"
+    today_kst = datetime.now(timezone(timedelta(hours=9))).date()
+    assert rows_[0]["observed_at"].astimezone(timezone(timedelta(hours=9))).date() == today_kst   # observed_at = 접수일(KST)
+
+    # ③ 다음 주기: 같은 공시는 문서도 신호도 늘지 않는다
+    assert crawl(store, runner, s, disc_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", disc_id)
+    assert (job["found_count"], job["new_count"]) == (2, 0) and len(signals(store)) == 2
+    assert q(store, "SELECT count(*) AS c FROM document")["c"] == 3 and q(store, "SELECT count(*) AS c FROM document_company")["c"] == 3
+    assert q(store, "SELECT max(version) AS v FROM document")["v"] == 1
+
+    # ④ 매핑을 다시 돌리면 대상은 다중복 하나, 채운 것 없음
+    assert crawl(store, runner, s, map_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", map_id)
+    assert (job["found_count"], job["new_count"]) == (1, 0)
+    assert q(store, "SELECT corp_code FROM company WHERE id = %s", dup)["corp_code"] is None
+    blob = " ".join((r["message"] or "") + (r["url"] or "") for r in store.conn.execute("SELECT message, url FROM crawl_error"))
+    assert GOOD_KEY not in blob
+
+
+def test_g2b_check_records_debarment_signal_once_and_skips_companies_without_biz_no(env):
+    from datetime import datetime, timedelta, timezone
+    from fakeg2b import GOOD_KEY, g2b_handler, sanction
+    store, _, settings, _ = env
+    nabu, _ = register_company(store, "나부품", [], "1234567890")
+    ga, _ = register_company(store, "가전자", [], None)
+    check_id = register_check_source(store, "g2b_debarment")
+    handler = g2b_handler({"1234567890": [sanction("1234567890", "나부품")]})
+    runner, s = api_runner(store, settings, handler)
+    put_credential(store, "data_go_kr", GOOD_KEY)
+    for _ in range(2):
+        assert process_one(store, runner, s) == "FAILED"     # 회사 감시 두 건: 네이버 키 없음
+
+    # ① 첫 점검: 시험 호출 + 번호 있는 회사만 조회 → 나부품 DEBARMENT HIGH 1건
+    assert process_one(store, runner, s) == "SUCCESS"
+    src = q(store, "SELECT s.status, s.interval_minutes, t.domain, t.risk_flags, v.config FROM source s JOIN site t ON t.id = s.site_id "
+                   "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", check_id)
+    assert src["status"] == "ACTIVE" and src["interval_minutes"] == 1440 and src["domain"] == "apis.data.go.kr"
+    assert src["risk_flags"] == {"api_provider": "data_go_kr"}
+    assert src["config"] == {"method": "API", "provider": "data_go_kr", "check": "g2b_debarment"}
+    assert handler.calls == [("1", "0000000000", "1"), ("1", "1234567890", "1")]
+    job = q(store, "SELECT status, found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", check_id)
+    assert (job["status"], job["found_count"], job["new_count"]) == ("SUCCESS", 2, 1)
+    rows = signals(store)
+    assert len(rows) == 1
+    assert (rows[0]["company_id"], rows[0]["kind"], rows[0]["severity"], rows[0]["fingerprint"]) == (nabu, "DEBARMENT", "HIGH", "20260101:조달청")
+    assert rows[0]["title"] == "입찰참가자격 제한 (2026-01-01~2026-06-30, 조달청)" and rows[0]["source_id"] == check_id
+    assert rows[0]["detail"]["raw"]["bizno"] == "1234567890" and rows[0]["detail"]["agency"] == "조달청"
+    assert rows[0]["observed_at"] == datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=9)))
+    assert q(store, "SELECT status FROM api_credential WHERE provider = 'data_go_kr'")["status"] == "VALID"
+    assert "2곳을 확인해 신호 1건" in q(store, "SELECT result_message FROM registration_request WHERE source_id = %s", check_id)["result_message"]
+
+    # ② 다음 날 같은 제재 → 신호가 늘지 않는다
+    assert crawl(store, runner, s, check_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job WHERE source_id = %s ORDER BY id DESC LIMIT 1", check_id)
+    assert (job["found_count"], job["new_count"]) == (2, 0) and len(signals(store)) == 1
+    blob = " ".join((r["message"] or "") + (r["url"] or "") for r in store.conn.execute("SELECT message, url FROM crawl_error"))
+    assert GOOD_KEY not in blob
+
+    # ③ 키가 폐기됐다 (게이트웨이 30) → REVIEW/API_KEY_INVALID, 자격 증명 INVALID, 키는 어디에도 없다
+    put_credential(store, "data_go_kr", "revoked-key")
+    assert crawl(store, runner, s, check_id) == "FAILED"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", check_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_INVALID"
+    cred = q(store, "SELECT status, last_error FROM api_credential WHERE provider = 'data_go_kr'")
+    assert cred["status"] == "INVALID" and "revoked-key" not in cred["last_error"]
+    err = q(store, "SELECT code, url FROM crawl_error ORDER BY id DESC LIMIT 1")
+    assert err["code"] == "API_KEY_INVALID" and "ServiceKey=***" in err["url"]

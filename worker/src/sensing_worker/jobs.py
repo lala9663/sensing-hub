@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-from .apis import ApiConnector, Provider, catalog as api_catalog, make_connector
+from .apis import ApiConnector, Provider, catalog as api_catalog, make_check_connector, make_connector
 from .apis import lookup as api_lookup
 from .codes import API_KEY_CODES, Code, CrawlFailure, MESSAGES
-from .company import biz_status_signal
+from .company import biz_status_signal, build_corp_index, debarment_signal, disclosure_signal, pick_corp_code
 from .config import Settings
 from .db import Job, Store, sha256
 from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, looks_like_sitemap,
@@ -24,7 +24,10 @@ from .policy import defaults_for, guess_site_type, passes_quality
 from .recipe import propose_recipe
 
 LLM_STEP_MESSAGE = "사이트 구조를 분석해 수집 방법을 만드는 중입니다."
-CHECK_INTERVAL_MINUTES = 1440   # 회사 단위 점검(국세청 사업자 상태)은 하루 1회
+CHECK_INTERVAL_MINUTES = 1440   # 회사 단위 점검의 기본 주기 (하루 1회)
+# 점검 종류별 주기 (백엔드가 소스에 정한 값이 있으면 그것을 쓴다): 사업자 상태 매일, 고유번호 매핑 주 1회, 회사별 공시 6시간, 부정당업자 매일
+CHECK_INTERVALS = {"nts_status": 1440, "dart_corp_map": 10080, "dart_disclosure": 360, "g2b_debarment": 1440}
+DISCLOSURE_DEFAULT_DAYS = 3
 
 log = logging.getLogger(__name__)
 
@@ -138,7 +141,9 @@ class JobRunner:
                                "관리자 또는 등록 담당자가 키워드 묶음을 만들어 주세요.", stage="PROBE")
         self.db.update_registration(job.source_id, step="API_KEY", message=f"{provider.name} API 키를 확인하는 중입니다.")
         secret = self._load_secret(provider.id, provider, stage="PROBE")
-        connector = make_connector(provider.id, self.f)
+        # 점검 소스는 제공자가 아니라 점검 종류(config.check)로 커넥터를 고른다 (data_go_kr 키 하나로 국세청·조달청)
+        connector = (make_check_connector(source["config"], self.f) if check and source.get("config")
+                     else make_connector(provider.id, self.f))
         try:
             connector.verify(secret)
         except CrawlFailure as e:
@@ -148,9 +153,10 @@ class JobRunner:
             raise
         self.db.mark_credential(provider.id, "VALID", None)
 
-        # 공시·공공 API는 6시간, 키워드 감시(보도 모니터링)는 60분, 회사 점검은 하루 1회(백엔드가 정한 주기 유지)
+        # 공시·공공 API는 6시간, 키워드 감시(보도 모니터링)는 60분, 회사 점검은 종류별 주기(백엔드가 정한 주기 우선)
         if check:
-            interval = source.get("interval_minutes") or CHECK_INTERVAL_MINUTES
+            interval = source.get("interval_minutes") or CHECK_INTERVALS.get(
+                str((source.get("config") or {}).get("check") or ""), CHECK_INTERVAL_MINUTES)
         elif watch:
             # 백엔드가 정한 주기를 지킨다 (일반 감시 60분, 회사 감시 360분)
             interval = source.get("interval_minutes") or 60
@@ -176,8 +182,12 @@ class JobRunner:
         status = "PARTIAL" if stats.errors else "SUCCESS"
         self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors, config_id)
         what = "감시 등록 완료" if watch else "점검 등록 완료" if check else "등록 완료"
-        done = (f"회사 {stats.found}곳을 확인해 신호 {stats.new}건을 남겼고" if check
-                else f"{provider.name} API로 {stats.new}건을 받았고")
+        if check and config.get("check") == "dart_corp_map":
+            done = f"고유번호가 없는 회사 {stats.found}곳 중 {stats.new}곳의 DART 고유번호를 채웠고"
+        elif check:
+            done = f"회사 {stats.found}곳을 확인해 신호 {stats.new}건을 남겼고"
+        else:
+            done = f"{provider.name} API로 {stats.new}건을 받았고"
         self.db.update_registration(
             job.source_id, status="COMPLETED", step="DONE", message=f"{what}. {done} {interval}분마다 업데이트합니다.")
         log.info("onboard ok source=%s provider=%s kind=%s method=API v%s new=%s", job.source_id, provider.id,
@@ -371,11 +381,11 @@ class JobRunner:
 
     # ------------------------------------------------------------------ CHECK (회사 단위 점검, M3)
     def _check_job(self, job: Job, source: dict) -> str:
-        """점검 소스의 주기 실행: 모든 ACTIVE 회사의 사업자 상태를 확인한다. 급감 감지는 적용하지 않는다."""
+        """점검 소스의 주기 실행: 모든 ACTIVE 회사를 점검 종류(config.check)대로 확인한다. 급감 감지는 적용하지 않는다."""
         config = source["config"]
         provider_id = config["provider"]
         secret = self._load_secret(provider_id, api_catalog.get(provider_id), stage="LIST")
-        connector = make_connector(provider_id, self.f)
+        connector = make_check_connector(config, self.f)
         stats = self._check(job, source, config, connector=connector, secret=secret)
         if source["status"] in ("BLOCKED", "BROKEN"):   # 관리자 재점검 통과
             self.db.set_source_status(job.source_id, "ACTIVE")
@@ -385,25 +395,42 @@ class JobRunner:
         return status
 
     def _check(self, job: Job, source: dict, config: dict, *, connector, secret: str) -> CrawlStats:
-        """국세청 사업자등록 상태 확인. found는 확인한 회사 수, new는 새로 남긴 신호 수.
+        """점검 종류(config.check)별 회사 단위 확인. found는 대상 회사 수, new는 새로 남긴 신호(또는 채운 고유번호) 수.
 
-        회사마다 마지막 상태를 company.last_biz_status에 두고, 계속사업자가 아니거나 이전 확인과 달라졌으면
-        company_signal(BIZ_STATUS)을 남긴다. fingerprint(b_stt_cd + end_dt)가 같으면 다시 기록하지 않는다.
+        - nts_status: 국세청 사업자등록 상태 → BIZ_STATUS 신호 (company.last_biz_status 갱신)
+        - dart_corp_map: corpCode.xml로 corp_code가 빈 회사의 DART 고유번호를 채운다 (신호 없음)
+        - dart_disclosure: corp_code가 있는 회사의 최근 공시를 문서(document_company API)로 저장하고 보고서명 규칙으로 DISCLOSURE 신호
+        - g2b_debarment: 조달청 부정당업자(입찰참가자격 제한)를 DEBARMENT HIGH 신호로
         """
+        kind = str(config.get("check") or "nts_status")
+        if kind == "nts_status":
+            return self._check_nts_status(job, config, connector, secret)
+        if kind == "dart_corp_map":
+            return self._check_dart_corp_map(job, config, connector, secret)
+        if kind == "dart_disclosure":
+            return self._check_dart_disclosure(job, config, connector, secret)
+        if kind == "g2b_debarment":
+            return self._check_g2b_debarment(job, config, connector, secret)
+        raise CrawlFailure(Code.UNEXPECTED, f"지원하지 않는 점검 종류: {kind}", stage="LIST")
+
+    def _call_api(self, provider_id: str, fn: Callable[[], object]):
+        """커넥터 호출. 키가 틀렸다는 응답이면 자격 증명을 INVALID로 표시하고 그대로 올린다."""
+        try:
+            return fn()
+        except CrawlFailure as e:
+            if e.code == Code.API_KEY_INVALID:
+                self.db.mark_credential(provider_id, "INVALID", str(e))
+            raise
+
+    def _check_nts_status(self, job: Job, config: dict, connector, secret: str) -> CrawlStats:
+        """국세청 사업자등록 상태 확인. 회사마다 마지막 상태를 company.last_biz_status에 두고, 계속사업자가 아니거나 이전 확인과
+        달라졌으면 company_signal(BIZ_STATUS)을 남긴다. fingerprint(b_stt_cd + end_dt)가 같으면 다시 기록하지 않는다."""
         stats = CrawlStats()
-        kind = config.get("check", "nts_status")
-        if kind != "nts_status":
-            raise CrawlFailure(Code.UNEXPECTED, f"지원하지 않는 점검 종류: {kind}", stage="LIST")
         companies = self.db.companies_with_biz_no()
         if not companies:
             log.info("check source=%s: no company with biz_no", job.source_id)
             return stats
-        try:
-            statuses = connector.check(secret, [c["biz_no"] for c in companies])
-        except CrawlFailure as e:
-            if e.code == Code.API_KEY_INVALID:
-                self.db.mark_credential(config["provider"], "INVALID", str(e))
-            raise
+        statuses = self._call_api(config["provider"], lambda: connector.check(secret, [c["biz_no"] for c in companies]))
         by_no = {s.biz_no: s for s in statuses}
         now = datetime.now(timezone.utc)
         for c in companies:
@@ -418,6 +445,99 @@ class JobRunner:
                     source_id=job.source_id):
                 stats.new += 1
                 log.info("company %s (%s) signal %s/%s: %s", c["id"], c["name"], signal.kind, signal.severity, signal.title)
+        return stats
+
+    def _check_dart_corp_map(self, job: Job, config: dict, connector, secret: str) -> CrawlStats:
+        """corp_code가 빈 ACTIVE 회사에 DART 고유번호를 채운다. found = 대상 회사 수, new = 새로 채운 수.
+        이름(별칭 포함)이 정확히 일치하는 항목이 하나(또는 상장사가 하나)일 때만 채우고, 모호하면 로그만 남긴다."""
+        stats = CrawlStats()
+        companies = self.db.companies_without_corp_code()
+        stats.found = len(companies)
+        if not companies:
+            log.info("check source=%s: every company already has a corp_code", job.source_id)
+            return stats
+        entries = self._call_api(config["provider"], lambda: connector.corp_codes(secret))
+        index = build_corp_index(entries)
+        for c in companies:
+            pick = pick_corp_code(c["name"], c.get("aliases") or [], index)
+            if pick.entry is not None:
+                if self.db.set_corp_code(c["id"], pick.entry.corp_code):
+                    stats.new += 1
+                    log.info("company %s (%s) corp_code=%s (%s, matched on %s)", c["id"], c["name"], pick.entry.corp_code,
+                             pick.entry.corp_name, pick.matched_on)
+            elif pick.ambiguous:
+                log.warning("company %s (%s): DART corp_code ambiguous on %s — %s", c["id"], c["name"], pick.matched_on,
+                            ", ".join(f"{e.corp_code}({e.corp_name}{'·상장' if e.listed else ''})" for e in pick.candidates[:5]))
+        log.info("dart corp map: companies=%s filled=%s entries=%s", stats.found, stats.new, len(entries))
+        return stats
+
+    def _check_dart_disclosure(self, job: Job, config: dict, connector, secret: str) -> CrawlStats:
+        """corp_code가 있는 회사마다 최근 days일 공시를 받아 문서로 저장(document_company API)하고 DISCLOSURE 신호를 남긴다.
+        found = 확인한 회사 수, new = 새 신호 수. 한 회사의 API 오류(키 오류 제외)는 기록하고 다음 회사로 넘어간다 (PARTIAL)."""
+        stats = CrawlStats()
+        companies = self.db.companies_with_corp_code()
+        if not companies:
+            log.info("check source=%s: no company with corp_code", job.source_id)
+            return stats
+        days = max(0, int(config.get("days", DISCLOSURE_DEFAULT_DAYS) or 0))
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(days=days)).date()
+        docs_new = 0
+        for c in companies:
+            corp_config = {**config, "corp_codes": [c["corp_code"]]}
+            try:
+                items = self._call_api(config["provider"],
+                                       lambda: connector.fetch(secret, corp_config, since, self.s.max_api_items_per_run))
+            except CrawlFailure as e:
+                if e.code in API_KEY_CODES:
+                    raise
+                self._record(job, e)
+                stats.errors += 1
+                log.warning("company %s (%s) disclosure fetch failed: %s %s", c["id"], c["name"], e.code.value, e)
+                continue
+            stats.found += 1
+            for item in items:
+                doc_id, result = self.db.upsert_document(
+                    source_id=job.source_id, job_id=job.id, url=item.url, title=item.title, author=item.author,
+                    section=item.section, published_at=item.published_at, body=item.body)
+                if result == "NEW":
+                    docs_new += 1
+                elif result == "UPDATED":
+                    stats.updated += 1
+                self.db.add_document_company(doc_id, c["id"], "API")
+                rcept_no = str(item.extra.get("rcept_no") or "") or sha256(item.url)
+                signal = disclosure_signal(rcept_no, item.title, corp_name=item.author, rcept_dt=item.extra.get("rcept_dt"),
+                                           url=item.url, flr_nm=item.section)
+                if signal is not None and self.db.add_company_signal(
+                        c["id"], signal.kind, signal.severity, signal.fingerprint, signal.title, signal.detail,
+                        item.published_at or now, document_id=doc_id, source_id=job.source_id):
+                    stats.new += 1
+                    log.info("company %s (%s) signal %s/%s: %s", c["id"], c["name"], signal.kind, signal.severity, signal.title)
+        log.info("dart disclosure: companies=%s new_documents=%s new_signals=%s errors=%s", stats.found, docs_new, stats.new,
+                 stats.errors)
+        return stats
+
+    def _check_g2b_debarment(self, job: Job, config: dict, connector, secret: str) -> CrawlStats:
+        """조달청 부정당업자 조회. 제재가 있는 회사마다 DEBARMENT HIGH 신호 (fingerprint 시작일+기관이라 같은 제재는 한 번만).
+        found = 대조한 회사 수, new = 새 신호 수. observed_at은 제재 시작일(없으면 지금)."""
+        stats = CrawlStats()
+        companies = self.db.companies_for_debarment()
+        stats.found = len(companies)
+        if not companies:
+            log.info("check source=%s: no active company", job.source_id)
+            return stats
+        result = self._call_api(config["provider"], lambda: connector.check(secret, companies, config))
+        now = datetime.now(timezone.utc)
+        names = {int(c["id"]): c["name"] for c in companies}
+        for company_id, items in result.items():
+            for d in items:
+                signal = debarment_signal(d)
+                observed = _kst_midnight(d.start_date) or now
+                if self.db.add_company_signal(company_id, signal.kind, signal.severity, signal.fingerprint, signal.title,
+                                              signal.detail, observed, source_id=job.source_id):
+                    stats.new += 1
+                    log.info("company %s (%s) signal %s/%s: %s", company_id, names.get(company_id), signal.kind,
+                             signal.severity, signal.title)
         return stats
 
     # ------------------------------------------------------------------ 실패 처리
@@ -447,6 +567,17 @@ class JobRunner:
             # 또는 감시의 키워드가 모두 지워졌다(REVIEW)
             self.db.set_source_status(job.source_id, "REVIEW", code.value)
         self.db.mark_crawl_result(job.source_id, False, source["interval_minutes"])
+
+
+def _kst_midnight(ymd: str | None) -> datetime | None:
+    """"20260101" → 한국 시간 그날 자정 (제재 시작일을 observed_at으로 쓸 때). 형식이 아니면 None."""
+    t = (ymd or "").strip()
+    if len(t) != 8 or not t.isdigit():
+        return None
+    try:
+        return datetime(int(t[:4]), int(t[4:6]), int(t[6:]), tzinfo=timezone(timedelta(hours=9)))
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------- 온보딩 판단 (DB 없이도 쓴다: evaluate.py)

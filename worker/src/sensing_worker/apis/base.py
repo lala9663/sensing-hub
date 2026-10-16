@@ -31,6 +31,8 @@ class ApiItem:
     body: str | None = None
     attachments: list[tuple[str, str]] = field(default_factory=list)   # (url, file_name)
     keyword: str | None = None   # 키워드 감시에서 이 항목을 찾아낸 검색어 (document_watch에 남긴다)
+    # 제공자별 원본 식별자 등 (DART: rcept_no·corp_code·rcept_dt). document에는 넣지 않고 신호 규칙이 쓴다
+    extra: dict = field(default_factory=dict)
 
 
 class ApiConnector(Protocol):

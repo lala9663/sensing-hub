@@ -1557,3 +1557,283 @@ def test_enrich_links_tags_to_companies_and_raises_news_signals_in_the_same_pass
     empty.companies, empty.links, empty.signals = [], {}, []
     enrich_pending(empty, BatchFakeLlm(make), Settings(), limit=10)
     assert empty.links == {} and empty.signals == []
+
+
+# ---------------------------------------------------------------------- 회사 점검 (M3-2): DART 고유번호 매핑·회사별 공시·조달청 부정당업자
+
+def test_dart_corp_codes_zip_is_parsed_and_key_errors_are_masked(monkeypatch):
+    import io
+    import zipfile
+    from fakedart import CORPS, GOOD_KEY, corp_zip, dart_handler
+    import sensing_worker.apis.dart as dart_mod
+    from sensing_worker.apis.dart import DartConnector, parse_corp_code_zip
+
+    entries = parse_corp_code_zip(corp_zip())
+    assert [(e.corp_code, e.corp_name, e.stock_code) for e in entries] == list(CORPS)   # stock_code의 공백은 지운다
+    assert entries[0].listed and not entries[1].listed and entries[0].modify_date == "20260101"
+    with pytest.raises(zipfile.BadZipFile):
+        parse_corp_code_zip(b"PK not really a zip")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("readme.txt", "no xml here")
+    with pytest.raises(ValueError):
+        parse_corp_code_zip(buf.getvalue())
+
+    handler = dart_handler()
+    c = DartConnector(_api_fetcher(handler))
+    assert len(c.corp_codes(GOOD_KEY)) == len(CORPS)
+    assert handler.calls[-1] == "https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key=" + GOOD_KEY   # 키는 요청에만
+
+    with pytest.raises(CrawlFailure) as e:                                   # 틀린 키: ZIP 대신 XML 010 → API_KEY_INVALID, 가림
+        c.corp_codes("wrong-secret-xyz")
+    assert e.value.code == Code.API_KEY_INVALID and not e.value.retryable and "010" in str(e.value)
+    assert "wrong-secret-xyz" not in str(e.value) + e.value.url and "crtfc_key=***" in e.value.url
+
+    with pytest.raises(CrawlFailure) as e:                                   # 서버 장애 → 재시도
+        DartConnector(_api_fetcher(dart_handler(server_status=503))).corp_codes(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and e.value.retryable and e.value.http_status == 503
+
+    monkeypatch.setattr(dart_mod, "CORP_ZIP_MAX_BYTES", 100)                 # 상한보다 큰 ZIP은 받지 않는다 (압축 폭탄 방어)
+    with pytest.raises(CrawlFailure) as e:
+        DartConnector(_api_fetcher(dart_handler())).corp_codes(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and not e.value.retryable and "상한" in str(e.value)
+
+
+def test_get_api_bytes_keeps_body_and_flags_oversize():
+    big = b"PK\x03\x04" + b"\0" * 100_000
+
+    def handler(request):
+        return httpx.Response(200, content=big, headers={"content-type": "application/zip"})
+    f = _api_fetcher(handler)
+    page = f.get_api_bytes("https://opendart.fss.or.kr/api/corpCode.xml")
+    assert page.body == big and page.text == "" and not page.truncated           # 큰 바이너리는 텍스트로 풀지 않는다
+    small = _api_fetcher(lambda r: httpx.Response(200, text="<result><status>010</status></result>"))
+    assert small.get_api_bytes("https://opendart.fss.or.kr/x").text.startswith("<result>")   # 작은 오류 응답은 텍스트도 둔다
+    page = f.get_api_bytes("https://opendart.fss.or.kr/api/corpCode.xml", max_bytes=1000)
+    assert page.truncated and len(page.body) <= 1000
+    assert f.get_api("https://opendart.fss.or.kr/api/list.json").body == b"" and not f.get_api("https://x.example.com/").truncated
+
+
+def test_corp_name_normalization_and_mapping_rules():
+    from fakedart import CORPS
+    from sensing_worker.apis.dart import CorpEntry
+    from sensing_worker.company import build_corp_index, normalize_corp_name, pick_corp_code
+    assert normalize_corp_name(" 주식회사 나부품 ") == normalize_corp_name("(주)나부품") == normalize_corp_name("㈜ 나부품") == "나부품"
+    assert normalize_corp_name("GA Electronics Co.") == "gaelectronicsco." and normalize_corp_name(None) == ""
+
+    index = build_corp_index(CorpEntry(c, n, s) for c, n, s in CORPS)
+    assert pick_corp_code("나부품 주식회사", [], index).entry.corp_code == "00000001"          # 유일 → 채움
+    ga = pick_corp_code("가전자", [], index)
+    assert ga.entry.corp_code == "00000002" and len(ga.candidates) == 2 and not ga.ambiguous   # 둘 중 상장사 하나 → 그것
+    dup = pick_corp_code("다중복", ["나부품"], index)
+    assert dup.entry is None and dup.ambiguous and dup.matched_on == "name"                   # 비상장 둘 → 모호, 별칭으로 넘어가지 않는다
+    alias = pick_corp_code("없는회사", ["NABU", "라물류"], index)
+    assert alias.entry.corp_code == "00000006" and alias.matched_on == "alias:라물류"           # "(주)라물류"와 정확 일치
+    none = pick_corp_code("없는회사", ["나부"], index)
+    assert none.entry is None and not none.ambiguous and none.candidates == []               # 부분 일치는 안 된다
+    assert pick_corp_code(None, [None, 3], index).entry is None and pick_corp_code("x", [], {}).matched_on is None
+
+
+def test_disclosure_severity_rules_and_signal_fingerprint():
+    from sensing_worker.company import disclosure_severity, disclosure_signal
+    assert disclosure_severity("회생절차 개시신청") == ("HIGH", ["회생절차"])
+    assert disclosure_severity("감사보고서 (감사의견: 의견거절)")[0] == "HIGH"
+    for word in ("파산신청", "영업정지", "상장폐지", "부적정", "자본잠식", "불성실공시법인지정", "횡령·배임혐의발생"):
+        assert disclosure_severity(word)[0] == "HIGH", word
+    assert disclosure_severity("[기재정정]주요사항보고서(유상증자결정)") == ("MEDIUM", ["유상증자"])    # HIGH→MEDIUM→LOW 순
+    for word in ("소송등의제기", "최대주주 변경", "대표이사 변경", "회사합병결정", "회사분할결정", "영업양수결정", "영업양도결정", "매매거래정지"):
+        assert disclosure_severity(word)[0] == "MEDIUM", word
+    assert disclosure_severity("주요사항보고서(자기주식취득결정)") == ("LOW", ["주요사항보고서"])
+    assert disclosure_severity("[기재정정]사업보고서 (2025.12)") == ("LOW", ["기재정정", "정정"])
+    assert disclosure_severity("사업보고서 (2025.12)") == (None, []) and disclosure_severity(None) == (None, [])
+    assert disclosure_severity("임원ㆍ주요주주특정증권등소유상황보고서") == (None, [])
+
+    s = disclosure_signal("20261015000001", " 회생절차개시신청 ", corp_name="나부품", rcept_dt="20261015", url="https://dart/x", flr_nm="나부품")
+    assert (s.kind, s.severity, s.fingerprint, s.title) == ("DISCLOSURE", "HIGH", "20261015000001", "회생절차개시신청")
+    assert s.detail["matched"] == ["회생절차"] and s.detail["corp_name"] == "나부품" and s.detail["url"] == "https://dart/x"
+    assert disclosure_signal("1", "사업보고서") is None
+
+
+def test_g2b_connector_checks_by_biz_no_and_switches_field_names_and_modes():
+    from fakeg2b import GOOD_KEY, g2b_handler, sanction
+    from sensing_worker.apis.g2b_debarment import DEFAULT_ENDPOINT, G2bDebarmentConnector
+    handler = g2b_handler({"1234567890": [sanction("1234567890", "나부품"),
+                                          sanction("1234567890", "나부품", start="20250101", end="20250301", agency="국방부")]})
+    c = G2bDebarmentConnector(_api_fetcher(handler))
+    c.verify(GOOD_KEY)
+    assert handler.calls == [("1", "0000000000", "1")]
+    assert c.default_config()["check"] == "g2b_debarment" and c.default_config()["endpoint"] == DEFAULT_ENDPOINT
+    assert c.fetch(GOOD_KEY, {}, datetime.now(timezone.utc).date(), 10) == []        # 문서를 만들지 않는다
+
+    companies = [{"id": 1, "name": "나부품", "aliases": [], "biz_no": "123-45-67890"},
+                 {"id": 2, "name": "가전자", "aliases": [], "biz_no": None},
+                 {"id": 3, "name": "다", "aliases": [], "biz_no": "1018112345"}]
+    result = c.check(GOOD_KEY, companies, c.default_config())
+    assert list(result) == [1] and len(result[1]) == 2
+    d = result[1][0]
+    assert (d.biz_no, d.company_name, d.start_date, d.end_date, d.agency) == ("1234567890", "나부품", "20260101", "20260630", "조달청")
+    assert d.reason == "계약의 이행을 하지 아니한 자" and d.period == "2026-01-01~2026-06-30" and d.raw["lmtBgnDt"] == "20260101"
+    assert handler.calls[1:] == [("1", "1234567890", "1"), ("1", "1018112345", "1")]   # 번호 없는 회사는 조회하지 않는다
+    assert all("ServiceKey=" in u and GOOD_KEY not in u for u in handler.urls)
+
+    # 응답 항목명이 후보에 없으면 config.fields로 바꾼다 (실제 스펙 확인 뒤 운영자가 넣는 값)
+    custom = g2b_handler({"1018112345": [{"bizno": "1018112345", "entNm": "다", "sanctStart": "2026-02-01",
+                                          "sanctEnd": "2026-04-30", "ordInst": "서울시"}]})
+    cfg = {**c.default_config(), "fields": {"company_name": "entNm", "start_date": "sanctStart", "end_date": "sanctEnd", "agency": "ordInst"}}
+    d2 = G2bDebarmentConnector(_api_fetcher(custom)).check(GOOD_KEY, companies, cfg)[3][0]
+    assert (d2.company_name, d2.start_date, d2.end_date, d2.agency, d2.reason) == ("다", "20260201", "20260430", "서울시", None)
+
+    # 기간 조회 모드: 조회구분 값이 없으면 설정 오류(재시도 없음), 있으면 전체를 페이징해 사업자번호 → 정규화한 이름으로 대조
+    with pytest.raises(CrawlFailure) as e:
+        c.check(GOOD_KEY, companies, {"mode": "period"})
+    assert e.value.code == Code.API_ERROR and not e.value.retryable and "period_inqry_div" in str(e.value)
+    period = g2b_handler({"1234567890": [sanction("1234567890", "나부품")], "9999999999": [sanction("9999999999", "(주)가전자")],
+                          "8888888888": [sanction("8888888888", "남")]}, per_page=2)
+    r3 = G2bDebarmentConnector(_api_fetcher(period)).check(GOOD_KEY, companies, {"mode": "period", "period_inqry_div": "2", "page_size": 2})
+    assert sorted(r3) == [1, 2] and r3[2][0].company_name == "(주)가전자"
+    assert period.calls == [("2", None, "1"), ("2", None, "2")]                       # 3건을 2건씩 두 페이지
+    assert "inqryBgnDt=" in period.urls[0] and "inqryEndDt=" in period.urls[0]
+
+
+def test_g2b_connector_classifies_key_and_limit_errors_and_masks_key():
+    from fakeg2b import GOOD_KEY, g2b_handler
+    from sensing_worker.apis.g2b_debarment import G2bDebarmentConnector
+    one = [{"id": 1, "name": "x", "aliases": [], "biz_no": "1234567890"}]
+
+    with pytest.raises(CrawlFailure) as e:                                   # 게이트웨이 30 (HTTP 200 + XML) → 키 오류, 본문·URL 가림
+        G2bDebarmentConnector(_api_fetcher(g2b_handler())).verify("wrong-service-key")
+    assert e.value.code == Code.API_KEY_INVALID and not e.value.retryable and "30" in str(e.value)
+    assert "wrong-service-key" not in str(e.value) + e.value.url and "ServiceKey=***" in e.value.url
+
+    for status in (401, 403):
+        with pytest.raises(CrawlFailure) as e:
+            G2bDebarmentConnector(_api_fetcher(g2b_handler(http_status=status))).verify(GOOD_KEY)
+        assert e.value.code == Code.API_KEY_INVALID and e.value.http_status == status
+
+    with pytest.raises(CrawlFailure) as e:                                   # 429 → 재시도
+        G2bDebarmentConnector(_api_fetcher(g2b_handler(http_status=429))).check(GOOD_KEY, one)
+    assert e.value.code == Code.API_ERROR and e.value.retryable and e.value.http_status == 429
+    assert GOOD_KEY not in (e.value.url + str(e.value) + (e.value.evidence or ""))
+
+    with pytest.raises(CrawlFailure) as e:                                   # 게이트웨이 22 (일 한도) → 재시도, 키 오류 아님
+        G2bDebarmentConnector(_api_fetcher(g2b_handler(gateway_code="22"))).verify(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and e.value.retryable and "22" in str(e.value)
+
+    with pytest.raises(CrawlFailure) as e:
+        G2bDebarmentConnector(_api_fetcher(g2b_handler(http_status=503))).check(GOOD_KEY, one)
+    assert e.value.code == Code.API_ERROR and e.value.retryable
+
+    def down(request):
+        raise httpx.ConnectError("boom", request=request)
+    with pytest.raises(CrawlFailure) as e:
+        G2bDebarmentConnector(_api_fetcher(down)).verify(GOOD_KEY)
+    assert e.value.code == Code.TIMEOUT and "ServiceKey=***" in e.value.url
+
+    assert G2bDebarmentConnector(_api_fetcher(g2b_handler())).check(GOOD_KEY, [{"id": 1, "name": "x", "biz_no": None}]) == {}
+
+
+def test_debarment_signal_is_high_with_start_date_and_agency_fingerprint():
+    from fakeg2b import sanction
+    from sensing_worker.apis.g2b_debarment import Debarment, _to_debarment
+    from sensing_worker.company import debarment_signal
+    d = _to_debarment(sanction("1234567890", "나부품"), None)
+    s = debarment_signal(d)
+    assert (s.kind, s.severity, s.fingerprint) == ("DEBARMENT", "HIGH", "20260101:조달청")
+    assert s.title == "입찰참가자격 제한 (2026-01-01~2026-06-30, 조달청)" and s.detail["raw"] == d.raw
+    assert s.detail["reason"] == "계약의 이행을 하지 아니한 자" and s.detail["biz_no"] == "1234567890"
+    bare = debarment_signal(Debarment("1234567890", "나부품", None, None, None, None, {"x": 1}))
+    assert bare.fingerprint.startswith("raw:") and bare.title == "입찰참가자격 제한 (기간 미상, 기관 미상)"
+    assert _to_debarment({"foo": "bar"}, None) is None                                # 번호도 이름도 없으면 버린다
+    assert _to_debarment({"bizno": "1234567890", "unptRsttBgnDt": "202603011200"}, None).start_date == "20260301"   # 시각이 붙어도 날짜 8자리
+
+
+def test_check_connector_is_chosen_by_check_kind():
+    from sensing_worker.apis import DartConnector, G2bDebarmentConnector, NtsStatusConnector, make_check_connector
+    f = _api_fetcher(lambda r: httpx.Response(404))
+    assert isinstance(make_check_connector({"provider": "data_go_kr", "check": "nts_status"}, f), NtsStatusConnector)
+    assert isinstance(make_check_connector({"provider": "data_go_kr", "check": "g2b_debarment"}, f), G2bDebarmentConnector)
+    assert isinstance(make_check_connector({"provider": "dart", "check": "dart_corp_map"}, f), DartConnector)
+    assert isinstance(make_check_connector({"provider": "dart", "check": "dart_disclosure"}, f), DartConnector)
+    assert isinstance(make_check_connector({"provider": "data_go_kr"}, f), NtsStatusConnector)   # 종류가 없으면 제공자 기본
+
+
+def test_dart_check_kinds_fill_corp_codes_and_record_disclosures(tmp_path):
+    from fakedart import GOOD_KEY, dart_handler, disclosure
+    from sensing_worker.db import Job
+    handler = dart_handler([disclosure("00000001", "나부품", "회생절차개시신청", "20261016000001"),
+                            disclosure("00000001", "나부품", "사업보고서 (2025.12)", "20261016000002"),
+                            disclosure("00000002", "가전자", "주요사항보고서(유상증자결정)", "20261016000003", stock_code="001234")])
+    runner, store, _ = _api_runner(tmp_path, handler, credential=GOOD_KEY)
+    store.load_source.return_value.update({"kind": "CHECK", "status": "ACTIVE", "interval_minutes": 10080, "active_config_version_id": 11,
+                                           "config": {"method": "API", "provider": "dart", "check": "dart_corp_map"}})
+    store.companies_without_corp_code.return_value = [{"id": 1, "name": "나부품 주식회사", "aliases": []}, {"id": 2, "name": "다중복", "aliases": []}]
+    store.set_corp_code.return_value = True
+    job = Job(id=9, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=11, attempt=1)
+
+    # 고유번호 매핑: 유일 일치만 채운다 (다중복은 모호 → 로그만). found 2, new 1
+    assert runner.run(job) == "SUCCESS"
+    store.set_corp_code.assert_called_once_with(1, "00000001")
+    assert store.finish_job.call_args.args[:4] == (9, "SUCCESS", 2, 1)
+    assert sum("corpCode.xml" in u for u in handler.calls) == 1 and not any("list.json" in u for u in handler.calls)
+    store.add_company_signal.assert_not_called()
+
+    # 회사별 공시: 회사마다 corp_code로 부르고, 문서 저장 + API 연결 + 신호 (회생 HIGH, 유상증자 MEDIUM, 사업보고서는 문서만)
+    store.reset_mock()
+    store.load_source.return_value["config"] = {"method": "API", "provider": "dart", "check": "dart_disclosure", "days": 3}
+    store.companies_with_corp_code.return_value = [{"id": 1, "name": "나부품", "corp_code": "00000001"},
+                                                   {"id": 2, "name": "가전자", "corp_code": "00000002"}]
+    store.upsert_document.return_value = (41, "NEW")
+    store.add_company_signal.return_value = True
+    assert runner.run(job) == "SUCCESS"
+    assert store.upsert_document.call_count == 3 and store.add_document_company.call_count == 3
+    assert store.add_document_company.call_args_list[0].args == (41, 1, "API")
+    assert store.upsert_document.call_args_list[0].kwargs["url"] == "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20261016000001"
+    sigs = [c.args[:4] for c in store.add_company_signal.call_args_list]
+    assert sigs == [(1, "DISCLOSURE", "HIGH", "20261016000001"), (2, "DISCLOSURE", "MEDIUM", "20261016000003")]
+    assert store.add_company_signal.call_args_list[0].kwargs["document_id"] == 41
+    assert store.finish_job.call_args.args[:4] == (9, "SUCCESS", 2, 2)
+    assert [u for u in handler.calls if "corp_code=00000001" in u] and [u for u in handler.calls if "corp_code=00000002" in u]
+
+    # 한 회사의 API 오류는 기록하고 다음 회사로 (PARTIAL); 키 오류는 전체 실패 + 자격 증명 INVALID
+    store.reset_mock()
+    store.load_source.return_value["config"] = {"method": "API", "provider": "dart", "check": "dart_disclosure", "days": 3}
+    store.upsert_document.return_value = (41, "SAME")
+    store.add_company_signal.return_value = False
+    broken = dart_handler(api_status="100")
+    runner2, store2, _ = _api_runner(tmp_path, broken, credential=GOOD_KEY)
+    store2.load_source.return_value.update(store.load_source.return_value)
+    store2.companies_with_corp_code.return_value = store.companies_with_corp_code.return_value
+    assert runner2.run(job) == "PARTIAL"
+    assert store2.record_error.call_count == 2 and store2.finish_job.call_args.args[:5] == (9, "PARTIAL", 0, 0, 2)
+    runner3, store3, _ = _api_runner(tmp_path, dart_handler(), credential="stale-key")
+    store3.load_source.return_value.update(store.load_source.return_value)
+    store3.companies_with_corp_code.return_value = store.companies_with_corp_code.return_value
+    assert runner3.run(job) == "FAILED"
+    assert store3.mark_credential.call_args.args[:2] == ("dart", "INVALID") and "stale-key" not in store3.mark_credential.call_args.args[2]
+    store3.set_source_status.assert_called_once_with(3, "REVIEW", "API_KEY_INVALID")
+
+    # 지원하지 않는 종류
+    store.load_source.return_value["config"] = {"method": "API", "provider": "dart", "check": "dart_financial"}
+    assert runner.run(job) == "FAILED"
+    assert store.record_error.call_args.args[1].code == Code.UNEXPECTED
+
+
+def test_g2b_check_kind_records_debarment_signals_with_mock_store(tmp_path):
+    from fakeg2b import GOOD_KEY, g2b_handler, sanction
+    from sensing_worker.db import Job
+    handler = g2b_handler({"1234567890": [sanction("1234567890", "나부품")]})
+    runner, store, _ = _api_runner(tmp_path, handler, credential=GOOD_KEY)
+    store.load_source.return_value.update({"kind": "CHECK", "status": "ACTIVE", "interval_minutes": 1440, "active_config_version_id": 11,
+                                           "domain": "apis.data.go.kr",
+                                           "config": {"method": "API", "provider": "data_go_kr", "check": "g2b_debarment", "days": 7}})
+    store.companies_for_debarment.return_value = [{"id": 1, "name": "나부품", "aliases": [], "biz_no": "1234567890"},
+                                                  {"id": 2, "name": "가전자", "aliases": [], "biz_no": None}]
+    store.add_company_signal.return_value = True
+    job = Job(id=10, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=11, attempt=1)
+    assert runner.run(job) == "SUCCESS"
+    assert handler.calls == [("1", "1234567890", "1")]                              # 주기 실행은 시험 호출 없이, 번호 있는 회사만
+    args, kwargs = store.add_company_signal.call_args.args, store.add_company_signal.call_args.kwargs
+    assert args[:4] == (1, "DEBARMENT", "HIGH", "20260101:조달청") and args[4] == "입찰참가자격 제한 (2026-01-01~2026-06-30, 조달청)"
+    assert args[6].isoformat() == "2026-01-01T00:00:00+09:00" and kwargs["source_id"] == 3    # observed_at = 제재 시작일 (KST)
+    assert store.finish_job.call_args.args[:4] == (10, "SUCCESS", 2, 1)
+    store.load_credential.assert_called_once_with("data_go_kr", "unit-secret")

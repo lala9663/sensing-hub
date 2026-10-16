@@ -319,6 +319,36 @@ class Store:
         self.conn.execute("UPDATE company SET last_biz_status = %s::jsonb, updated_at = now() WHERE id = %s",
                           (json.dumps(detail, ensure_ascii=False), company_id))
 
+    def companies_without_corp_code(self) -> list[dict]:
+        """DART 고유번호 매핑 대상: ACTIVE이고 corp_code가 비어 있는 회사 (id, name, aliases)."""
+        return self.conn.execute(
+            """
+            SELECT id, name, aliases FROM company
+            WHERE status = 'ACTIVE' AND (corp_code IS NULL OR corp_code = '') ORDER BY id
+            """).fetchall()
+
+    def set_corp_code(self, company_id: int, corp_code: str) -> bool:
+        """비어 있을 때만 채운다 (사람이 손으로 넣은 값은 덮지 않는다). 채웠으면 True."""
+        row = self.conn.execute(
+            """
+            UPDATE company SET corp_code = %s, updated_at = now()
+            WHERE id = %s AND (corp_code IS NULL OR corp_code = '') RETURNING id
+            """, (corp_code[:8], company_id)).fetchone()
+        return row is not None
+
+    def companies_with_corp_code(self) -> list[dict]:
+        """DART 회사별 공시 대상: ACTIVE이고 corp_code가 있는 회사 (id, name, corp_code)."""
+        return self.conn.execute(
+            """
+            SELECT id, name, corp_code FROM company
+            WHERE status = 'ACTIVE' AND corp_code IS NOT NULL AND corp_code <> '' ORDER BY id
+            """).fetchall()
+
+    def companies_for_debarment(self) -> list[dict]:
+        """조달청 부정당업자 대조 대상: 모든 ACTIVE 회사 (id, name, aliases, biz_no)."""
+        return self.conn.execute(
+            "SELECT id, name, aliases, biz_no FROM company WHERE status = 'ACTIVE' ORDER BY id").fetchall()
+
     def add_attachment(self, document_id: int, url: str, file_name: str) -> None:
         self.conn.execute(
             """
