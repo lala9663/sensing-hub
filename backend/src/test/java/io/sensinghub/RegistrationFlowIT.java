@@ -508,10 +508,17 @@ class RegistrationFlowIT {
         assertThat(http.exchange("/api/v1/documents/999999", HttpMethod.GET, new HttpEntity<>(viewer), String.class)
                 .getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
 
-        // 토픽별 건수 (많은 순, 같으면 이름순). since는 수집 시각 기준
-        assertThat(get("viewer", "/api/v1/documents/topics").toString())
-                .isEqualTo("{\"산업동향\":1,\"자사\":1,\"정책·규제\":1,\"지원사업\":1}");
-        assertThat(get("viewer", "/api/v1/documents/topics?since=2026-10-16").toString())
-                .isEqualTo("{\"산업동향\":1,\"자사\":1}");
+        // 토픽별 건수. since는 수집 시각 기준. 건수가 같을 때의 이름순은 DB 콜레이션(한글 정렬)에 따라 달라지므로
+        // 순서가 아니라 내용만 본다
+        assertThat(topicCounts("/api/v1/documents/topics"))
+                .containsExactlyInAnyOrderEntriesOf(java.util.Map.of("산업동향", 1, "자사", 1, "정책·규제", 1, "지원사업", 1));
+        assertThat(topicCounts("/api/v1/documents/topics?since=2026-10-16"))
+                .containsExactlyInAnyOrderEntriesOf(java.util.Map.of("산업동향", 1, "자사", 1));
+    }
+
+    private java.util.Map<String, Integer> topicCounts(String path) {
+        java.util.Map<String, Integer> counts = new java.util.LinkedHashMap<>();
+        get("viewer", path).fields().forEachRemaining(e -> counts.put(e.getKey(), e.getValue().asInt()));
+        return counts;
     }
 }
