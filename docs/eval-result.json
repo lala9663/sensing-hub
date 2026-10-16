@@ -10,7 +10,10 @@
     "pattern": "/briefing/pressReleaseView.do?newsId={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 19,
-    "seconds": 37.1
+    "seconds": 36.5,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.msit.go.kr",
@@ -23,7 +26,10 @@
     "pattern": "/bbs/view.do?bbsSeqNo={n}&mId={n}&mPid={n}&nttSeqNo={n}&sCode=*",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 21,
-    "seconds": 40.4
+    "seconds": 40.5,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.motie.go.kr",
@@ -36,7 +42,10 @@
     "pattern": "/kor/article/{id}/{n}/view?mno=*",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 40,
-    "seconds": 72.2
+    "seconds": 72.2,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.yna.co.kr",
@@ -49,7 +58,10 @@
     "pattern": "/view/{id}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 15,
-    "seconds": 28.1
+    "seconds": 28.2,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.hankyung.com",
@@ -59,10 +71,13 @@
     "site_type": "NEWS",
     "method": "RSS",
     "hubs": 5,
-    "pattern": "/article/{n}",
-    "quality": "샘플 5건 중 5건 통과",
+    "pattern": "/article/{id}",
+    "quality": "샘플 5건 중 4건 통과",
     "requests": 13,
-    "seconds": 24.2
+    "seconds": 24.3,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.etnews.com",
@@ -75,7 +90,10 @@
     "pattern": "/{n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 21,
-    "seconds": 36.2
+    "seconds": 36.3,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://zdnet.co.kr",
@@ -88,7 +106,10 @@
     "pattern": "/view/?no={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 13,
-    "seconds": 25.3
+    "seconds": 24.1,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.ddaily.co.kr",
@@ -101,7 +122,10 @@
     "pattern": "/page/view/{n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 12,
-    "seconds": 22.3
+    "seconds": 22.3,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://daily.hankooki.com",
@@ -114,7 +138,10 @@
     "pattern": null,
     "quality": null,
     "requests": 7,
-    "seconds": 12.1
+    "seconds": 12.1,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   },
   {
     "url": "https://www.bloter.net",
@@ -127,6 +154,9 @@
     "pattern": "/news/articleView.html?idxno={n}",
     "quality": "샘플 5건 중 5건 통과",
     "requests": 10,
-    "seconds": 14.1
+    "seconds": 14.3,
+    "recipe_source": "heuristic",
+    "sample_url": null,
+    "sample_match": null
   }
 ]
