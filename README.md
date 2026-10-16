@@ -97,6 +97,18 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 스키마를 검증하고, 실패하면 오류 메시지를 붙여 한 번만 다시 요청합니다. OpenAI 호환 서버가 `response_format`을 400으로 거부하면
 `json_object` → 없음 순으로 낮춰 다시 보냅니다. 측정 도구(`sensing-discovery-eval`)도 같은 변수를 읽고 결과 표에 레시피 출처를 표시합니다.
 
+### 공개 API 소스와 자격 증명 (M2)
+
+언론 보도·공시처럼 공개 API가 있는 제공처는 크롤링하지 않습니다. 워커의 API 카탈로그(`apis/catalog.py`, 첫 항목 DART)에 있는
+도메인을 등록하면 사전 점검 없이 **"API 키 발급 필요"** 로 관리자 큐(`kind=API_KEY`)에 들어가고, 관리자가 키를 넣으면 시험 호출로
+검증한 뒤 `method: API` 설정으로 첫 수집과 주기 수집(6시간)을 자동으로 시작합니다. 키 발급은 사람이 합니다 (자동 가입·약관 동의 대행 없음).
+키는 pgcrypto로 암호화해 `api_credential`에만 두고 응답·로그·오류 메시지·증거 파일 어디에도 남기지 않습니다.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_SECRET_KEY` | (없음) | 백엔드·워커 공통. API 키를 암호화·복호화하는 대칭키(`pgp_sym_encrypt`). 비우면 백엔드 자격 증명 API는 503, 워커는 API 소스를 관리자 큐로 보낸다 |
+| `SENSING_MAX_API_ITEMS` | `500` | 워커. API 소스 실행 1회당 받을 항목 수 상한 |
+
 ### API 맛보기
 
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
@@ -115,10 +127,14 @@ curl localhost:8080/api/v1/sources/1 -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/sources/1/actions/recheck -H 'X-User: admin'   # pause|resume|run|recheck|rediscover|exclude
 curl -X POST localhost:8080/api/v1/sources/1/configs/2/activate -H 'X-User: admin'  # 설정 버전 롤백
 
-# 관리자: 처리 대기 큐 (승인 대기 → REVIEW → BROKEN → BLOCKED, 오래 기다린 순). kind로 거를 수 있다
+# 관리자: 처리 대기 큐 (승인 대기 → API_KEY → REVIEW → BROKEN → BLOCKED, 오래 기다린 순). kind로 거를 수 있다
 curl localhost:8080/api/v1/review-queue -H 'X-User: admin'
 curl localhost:8080/api/v1/review-queue/counts -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'      -H 'Content-Type: application/json' -d '{"reason":"업무와 관련 없는 사이트"}'
+
+# 관리자: 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
+curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"dart","secret":"<발급받은 키>","label":"공시 API"}'
+curl localhost:8080/api/v1/api-credentials -H 'X-User: admin'   # DELETE /api/v1/api-credentials/dart
 ```
 
 ## 폴더
@@ -133,7 +149,8 @@ worker/    Python 수집 워커
     llm.py        LLM 클라이언트 (Claude · OpenAI 호환 · 없음), JSON 꺼내기·스키마 검증·재요청
     extract.py    기사 추출: og/article/JSON-LD 메타 + 본문 + 첨부 링크 (설정 selectors 우선)
     policy.py     사이트 유형 판정, 기본값, 품질 검사
-    jobs.py       ONBOARD / CRAWL 작업
+    apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록 커넥터
+    jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로)
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
 docs/      설계 메모
@@ -157,7 +174,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 | --- | --- | --- |
 | M0 골격·환경 | 스키마, 등록 API, 스케줄러, 작업 큐, 워커 골격 | 완료 |
 | M1 하네스·탐색 | 자동 탐색 고도화, 도메인 단위 간격(워커 간 공유), 이상 감지, 관리자 처리 대기 API, LLM 레시피 생성 | 완료 (허브 한 곳 실패 내성만 남음) |
-| M2 외부 API·키워드 감시 | API 카탈로그·자격 증명 저장소·API 수집기(뉴스 검색·DART·공공데이터포털), 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트 알림, 최소 화면(등록·내 요청·관리자 큐) | 다음 |
+| M2 외부 API·키워드 감시 | API 카탈로그·자격 증명 저장소·API 수집기(뉴스 검색·DART·공공데이터포털), 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트 알림, 최소 화면(등록·내 요청·관리자 큐) | 진행 중 |
 | M3 동적·첨부 | Playwright 동적 수집, 첨부 다운로드·HWP/PDF 텍스트 추출, 원문 삭제(GONE) 감지, (합의 시) 회사 계정 로그인 세션 | |
 | M4 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 모달·tool calling(`register_source`·`get_source_status`·`submit_api_key`), 대화 저장 | |
 | M5 관리자·운영 | 레시피 수정·미리보기, 설정 백필, 감사 로그 화면, 운영 지표 | |
@@ -180,6 +197,13 @@ M1에서 한 일:
     후보를 유력한 순서로 품질 검사해 첫 합격 채택, 목록 행의 날짜를 상세에 넘기기, 게시판 제목·등록일·스크립트 첨부 추출,
     자기 하위 페이지로 링크하는 목록 페이지는 기사로 보지 않기, 공공기관은 본문 대신 첨부가 있어도 통과
 - [x] 등록 시 LLM 레시피 생성 (`SENSING_LLM_PROVIDER`: Claude 또는 OpenAI 호환 API, 스키마·샘플 품질 검사를 통과한 것만 설정으로 저장, 실패·장애 시 휴리스틱)
+
+M2에서 한 일:
+
+- [x] API 소스 기반·DART: API 카탈로그(`worker/src/sensing_worker/apis/`), 자격 증명 저장소(`api_credential`, pgcrypto 암호화,
+  `/api/v1/api-credentials`), 관리자 큐 `API_KEY` 종류, DART 공시 목록 커넥터. dart.fss.or.kr을 등록하면 크롤링 없이
+  "공시 API 키 발급 필요"로 큐에 가고, 관리자가 키를 넣으면 검증 → `method: API` 설정 → 첫 수집 → 6시간 주기 수집이 자동으로 이어진다
+- [ ] 네이버 뉴스 검색·공공데이터포털 커넥터, 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트, 최소 화면
 
 ## 원칙
 
