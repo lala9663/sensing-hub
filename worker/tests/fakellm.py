@@ -27,6 +27,27 @@ class FakeLlm:
         return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
 
 
+class BatchFakeLlm(FakeLlm):
+    """보강(enrich) 묶음 프롬프트에 맞춰 답하는 가짜 LLM: 프롬프트의 [문서 N]마다 항목 하나를 만든다.
+
+    make(idx, prompt) -> dict 로 항목을 바꿀 수 있다. 기본은 요약 "요약 N", 토픽 ["정책·규제", "엉뚱한분류"], 태그 7개.
+    """
+
+    def __init__(self, make=None, error: Exception | None = None):
+        super().__init__(error=error)
+        self.make = make or (lambda idx, prompt: {
+            "idx": idx, "summary": f"요약 {idx}", "topics": ["정책·규제", "엉뚱한분류"],
+            "tags": [f"태그{idx}-{k}" for k in range(1, 8)]})
+
+    def complete(self, system: str, user: str, schema: dict) -> str:
+        self.calls.append((system, user, schema))
+        if self.error is not None:
+            raise self.error
+        import re
+        idxs = [int(m) for m in re.findall(r"^\[문서 (\d+)\]", user, re.M)]
+        return json.dumps({"items": [self.make(i, user) for i in idxs]}, ensure_ascii=False)
+
+
 def portal_recipe(base: str, **overrides) -> str:
     """fakesite.portal_cms_routes 사이트에 맞는 레시피 JSON."""
     recipe = {

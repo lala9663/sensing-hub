@@ -264,3 +264,55 @@ class Store:
             INSERT INTO attachment (document_id, url, file_name) VALUES (%s, %s, %s)
             ON CONFLICT (document_id, url) DO NOTHING
             """, (document_id, url, file_name))
+
+    # ------------------------------------------------------------------ 보강 (요약·분류)
+    def lock_pending_enrichment(self, limit: int, failed_retry_hours: int = 24) -> list[dict]:
+        """보강이 필요한 문서를 최신 수집순으로 limit건 잠그고 돌려준다. 반드시 self.conn.transaction() 안에서 부른다.
+
+        대상: 보강 행이 없거나, 본문이 바뀌어 document_version이 뒤처졌거나, FAILED가 failed_retry_hours 전 것.
+        FOR UPDATE SKIP LOCKED라 워커 여러 대가 같은 문서를 잡지 않는다. 잠금은 트랜잭션이 끝날 때 풀리므로
+        그 사이 같은 문서를 다시 저장하려는 수집(upsert_document)은 잠깐 기다린다.
+        """
+        return self.conn.execute(
+            """
+            SELECT d.id, d.version, d.url, d.title, d.body_text, d.section, t.domain, t.site_type
+            FROM document d
+            JOIN source s ON s.id = d.source_id
+            JOIN site t ON t.id = s.site_id
+            LEFT JOIN document_enrichment e ON e.document_id = d.id
+            WHERE e.document_id IS NULL
+               OR e.document_version < d.version
+               OR (e.status = 'FAILED' AND e.created_at < now() - make_interval(hours => %s))
+            ORDER BY d.collected_at DESC, d.id DESC
+            LIMIT %s
+            FOR UPDATE OF d SKIP LOCKED
+            """, (failed_retry_hours, limit)).fetchall()
+
+    def load_watch_hits(self, document_ids: list[int]) -> dict[int, list[tuple[str | None, str | None]]]:
+        """문서별 (감시 이름, 걸린 검색어) 목록."""
+        if not document_ids:
+            return {}
+        rows = self.conn.execute(
+            """
+            SELECT w.document_id, s.watch_name, w.keyword
+            FROM document_watch w JOIN source s ON s.id = w.source_id
+            WHERE w.document_id = ANY(%s) ORDER BY w.matched_at, w.source_id
+            """, (document_ids,)).fetchall()
+        out: dict[int, list[tuple[str | None, str | None]]] = {}
+        for r in rows:
+            out.setdefault(r["document_id"], []).append((r["watch_name"], r["keyword"]))
+        return out
+
+    def save_enrichment(self, document_id: int, document_version: int, *, summary: str | None, topics: list[str],
+                        tags: list[str], model: str | None, status: str = "DONE", error: str | None = None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO document_enrichment (document_id, document_version, summary, topics, tags, model, status, error)
+            VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s)
+            ON CONFLICT (document_id) DO UPDATE SET
+                document_version = EXCLUDED.document_version, summary = EXCLUDED.summary,
+                topics = EXCLUDED.topics, tags = EXCLUDED.tags, model = EXCLUDED.model,
+                status = EXCLUDED.status, error = EXCLUDED.error, created_at = now()
+            """, (document_id, document_version, (summary or None) and summary[:600],
+                  json.dumps(topics, ensure_ascii=False), json.dumps(tags, ensure_ascii=False),
+                  (model or "")[:100] or None, status, (error or "")[:500] or None))

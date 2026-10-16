@@ -527,3 +527,118 @@ def test_naver_domain_registered_as_site_asks_for_keyword_watch(env):
     reg = q(store, "SELECT status, result_message FROM registration_request")
     assert reg["status"] == "REVIEW" and reg["result_message"] == "네이버 뉴스는 키워드 감시로 등록합니다. 관리자 또는 등록 담당자가 키워드 묶음을 만들어 주세요."
     assert q(store, "SELECT count(*) AS c FROM source_config_version")["c"] == 0
+
+
+# ---------------------------------------------------------------- 보강 (M2, 요약·분류)
+
+def enrichments(store: Store) -> list[dict]:
+    return store.conn.execute("SELECT e.*, d.url FROM document_enrichment e JOIN document d ON d.id = e.document_id "
+                              "ORDER BY e.document_id").fetchall()
+
+
+def gov_site(sites: list[Site]) -> Site:
+    site = Site({}); sites.append(site)
+    site.routes.update({k: (s, t, b.replace("{base}", site.base)) for k, (s, t, b) in gov_site_routes().items()})
+    return site
+
+
+def test_enrich_pending_classifies_collected_documents_in_batches(env):
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    store, runner, settings, sites = env
+    news = Site(news_site_routes()); sites.append(news)                       # 6건, 본문 없음 (언론사)
+    gov = gov_site(sites)                                                    # 5건, 본문 있음
+    register(store, news.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    register(store, gov.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    assert q(store, "SELECT count(*) AS c FROM document")["c"] == 11
+
+    llm = BatchFakeLlm()
+    first = enrich_pending(store, llm, settings, limit=10)
+    assert (first.fetched, first.done, first.failed, first.skipped) == (10, 10, 0, 0) and len(llm.calls) == 1
+    second = enrich_pending(store, llm, settings, limit=10)                    # 남은 1건
+    assert second.fetched == 1 and second.done == 1
+    third = enrich_pending(store, llm, settings, limit=10)                     # 더 가져올 것이 없다
+    assert third.fetched == 0 and len(llm.calls) == 2
+
+    rows = enrichments(store)
+    assert len(rows) == 11 and all(r["status"] == "DONE" and r["document_version"] == 1 for r in rows)
+    assert all(r["model"] == "fake fake-1" and r["topics"] == ["정책·규제"] and len(r["tags"]) == 5 for r in rows)
+    press = [r for r in rows if "articleView" in r["url"]]
+    public = [r for r in rows if "/board/view.do" in r["url"]]
+    assert len(press) == 6 and all(r["summary"] is None for r in press)         # 언론 기사: 요약을 저장하지 않는다
+    assert len(public) == 5 and all(r["summary"].startswith("요약 ") for r in public)
+    assert "본문: (없음 — 언론 기사, 제목만 저장)" in llm.calls[0][1] + llm.calls[1][1]
+
+
+def test_enrich_runs_again_when_document_body_changes(env):
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    store, runner, settings, sites = env
+    gov = gov_site(sites)
+    source_id = register(store, gov.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    llm = BatchFakeLlm()
+    assert enrich_pending(store, llm, settings, limit=10).done == 5
+    assert enrich_pending(store, llm, settings, limit=10).fetched == 0
+
+    doc = q(store, "SELECT id, url, title, version FROM document ORDER BY id LIMIT 1")
+    job_id = q(store, "SELECT id FROM crawl_job ORDER BY id LIMIT 1")["id"]
+    doc_id, result = store.upsert_document(source_id=source_id, job_id=job_id, url=doc["url"], title=doc["title"],
+                                           author=None, section=None, published_at=None, body="수정된 본문 " * 30)
+    assert result == "UPDATED" and doc_id == doc["id"]
+    assert q(store, "SELECT version FROM document WHERE id = %s", doc_id)["version"] == 2
+
+    outcome = enrich_pending(store, llm, settings, limit=10)                  # 바뀐 문서만 다시
+    assert outcome.fetched == 1 and outcome.done == 1
+    row = q(store, "SELECT document_version, summary FROM document_enrichment WHERE document_id = %s", doc_id)
+    assert row["document_version"] == 2 and row["summary"] == "요약 1"
+    assert enrich_pending(store, llm, settings, limit=10).fetched == 0
+
+
+def test_enrich_failed_rows_are_retried_after_a_day_and_llm_outage_writes_nothing(env):
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    from sensing_worker.llm import LlmUnavailable
+    store, runner, settings, sites = env
+    news = Site(news_site_routes(range(101, 103))); sites.append(news)
+    register(store, news.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    outage = enrich_pending(store, FakeLlm(error=LlmUnavailable("down")), settings, limit=10)
+    assert outage.fetched == 2 and outage.llm_unavailable and enrichments(store) == []     # 아무것도 쓰지 않는다
+
+    bad = FakeLlm(['{"items": []}'])                                                        # 검증 실패 2회 → FAILED
+    failed = enrich_pending(store, bad, settings, limit=10)
+    assert failed.failed == 2 and len(bad.calls) == 2
+    rows = enrichments(store)
+    assert all(r["status"] == "FAILED" and "검증 실패" in r["error"] and r["topics"] == [] for r in rows)
+    assert enrich_pending(store, BatchFakeLlm(), settings, limit=10).fetched == 0          # 바로는 다시 안 잡는다
+
+    store.conn.execute("UPDATE document_enrichment SET created_at = now() - interval '25 hours'")
+    retried = enrich_pending(store, BatchFakeLlm(), settings, limit=10)                     # 24시간 뒤에는 다시
+    assert retried.done == 2
+    assert all(r["status"] == "DONE" and r["error"] is None for r in enrichments(store))
+
+
+def test_two_workers_do_not_enrich_the_same_documents(env):
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    store, runner, settings, sites = env
+    news = Site(news_site_routes(range(101, 104))); sites.append(news)
+    register(store, news.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    other = Store(DSN)
+    try:
+        with store.conn.transaction():                                   # 워커 1이 2건을 잠근 채 LLM을 기다리는 중
+            locked = store.lock_pending_enrichment(2)
+            assert len(locked) == 2
+            outcome = enrich_pending(other, BatchFakeLlm(), settings, limit=10)      # 워커 2는 남은 1건만
+            assert outcome.fetched == 1 and outcome.done == 1
+            assert {r["document_id"] for r in enrichments(other)}.isdisjoint({r["id"] for r in locked})
+        assert enrich_pending(other, BatchFakeLlm(), settings, limit=10).fetched == 2   # 잠금이 풀리면 나머지
+        assert len(enrichments(store)) == 3
+    finally:
+        other.close()

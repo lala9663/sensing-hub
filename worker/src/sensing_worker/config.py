@@ -67,3 +67,9 @@ class Settings:
     llm_max_sample_pages: int = field(default_factory=lambda: int(os.getenv("SENSING_LLM_MAX_SAMPLE_PAGES", "5")))
     llm_page_chars: int = field(default_factory=lambda: int(os.getenv("SENSING_LLM_PAGE_CHARS", "30000")))
     llm_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_LLM_TIMEOUT", "120")))
+    # 수집 시점 요약·분류(보강). 큐에 작업이 없을 때 LLM이 설정돼 있으면 한 묶음씩 돌린다
+    enrich_enabled: bool = field(default_factory=lambda: _bool("SENSING_ENRICH_ENABLED", True))
+    # 한 번의 LLM 호출에 묶는 문서 수
+    enrich_batch: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_BATCH", "10")))
+    # 문서당 LLM에 보여 줄 본문 글자 수 상한
+    enrich_body_chars: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_BODY_CHARS", "4000")))

@@ -1217,3 +1217,150 @@ def test_periodic_api_crawl_uses_connector_and_sends_lost_key_to_review(tmp_path
     store.load_credential.return_value = None                                    # 키가 지워졌다
     assert runner.run(job) == "FAILED"
     store.set_source_status.assert_called_once_with(3, "REVIEW", "API_KEY_REQUIRED")
+
+
+# ---------------------------------------------------------------------- 보강 (요약·분류)
+
+def _doc(i: int, **kw):
+    from sensing_worker.enrich import PendingDoc
+    base = dict(id=i, version=1, url=f"https://a.go.kr/view/{i}", title=f"제목 {i}", body="본문 " * 50,
+                domain="a.go.kr", section="보도자료", site_type="PUBLIC")
+    base.update(kw)
+    return PendingDoc(**base)
+
+
+def test_enrich_prompt_numbers_documents_and_hides_press_bodies():
+    from sensing_worker.enrich import SYSTEM_PROMPT, TOPICS, build_batch_prompt
+    docs = [_doc(1, body="가나다 " * 3000),                                                    # 본문 4,000자 넘김
+            _doc(2, site_type="NEWS", body="언론사 본문이 있어도 보여 주지 않는다", domain="news.example.com",
+                 watches=[("자사 보도", "메타넷"), (None, None)]),
+            _doc(3, body=None, section=None)]                                                   # 본문 없음 → 제목만
+    prompt = build_batch_prompt(docs, body_chars=4000)
+    assert "문서 3건" in prompt
+    assert "[문서 1]\n출처: 도메인 a.go.kr / 섹션 보도자료\n제목: 제목 1\n본문: 가나다" in prompt
+    assert "...(잘림)" in prompt and prompt.count("가나다") < 1500
+    assert "[문서 2]\n출처: 도메인 news.example.com / 섹션 보도자료 / 언론사 / 감시 '자사 보도' 검색어 '메타넷' / 감시\n" in prompt
+    assert "언론사 본문이 있어도" not in prompt and prompt.count("본문: (없음 — 언론 기사, 제목만 저장)") == 2
+    assert "[문서 3]\n출처: 도메인 a.go.kr\n제목: 제목 3\n" in prompt
+    assert all(t in SYSTEM_PROMPT for t in TOPICS)
+
+
+def test_enrich_parse_matches_idx_drops_unknown_topics_and_caps_tags():
+    from sensing_worker.enrich import ENRICH_SCHEMA, check_items, parse_items
+    from sensing_worker.llm import validate_schema
+    docs = [_doc(1), _doc(2, site_type="NEWS", body=None), _doc(3)]
+    data = {"items": [
+        {"idx": 2, "summary": "언론 기사인데 요약을 보냈다", "topics": ["자사", "없는분류", " 경쟁사 "], "tags": ["메타넷"]},
+        {"idx": 1, "summary": "  첫  문장.\n둘째 문장.  ", "topics": ["정책·규제", "정책·규제"],
+         "tags": ["a", "b", " ", "c", "a", "d", "e", "f", "g"]},
+        {"idx": 1, "summary": "중복 번호는 무시", "topics": ["기타"], "tags": []},
+        {"idx": 9, "summary": "없는 번호", "topics": ["기타"], "tags": []},
+        {"idx": 3, "summary": "", "topics": ["완전히 다른 값"], "tags": [" ", "국토교통부"]},
+    ]}
+    assert validate_schema(data, ENRICH_SCHEMA) == []
+    out = parse_items(data, docs)
+    assert set(out) == {1, 2, 3}
+    assert out[1].summary == "첫 문장. 둘째 문장." and out[1].topics == ["정책·규제"]
+    assert out[1].tags == ["a", "b", "c", "d", "e"]                       # 빈 값·중복 제거 후 5개
+    assert out[2].summary is None and out[2].topics == ["자사", "경쟁사"]  # 언론 기사는 summary 강제 null, 체계 밖 제거
+    assert out[3].summary is None and out[3].topics == ["기타"] and out[3].tags == ["국토교통부"]
+    assert all(s.status == "DONE" for s in out.values())
+
+    errors = check_items(data, 3)
+    assert any("idx 9" in e for e in errors) and any("두 번" in e for e in errors)
+    assert check_items({"items": [{"idx": 1}, {"idx": 3}]}, 3) == ["items: 번호 [2]의 항목이 없습니다. 모든 문서에 대해 하나씩 내세요"]
+    assert check_items({"items": [{"idx": i} for i in (1, 2, 3)]}, 3) == []
+
+
+def test_enrich_batch_retries_once_then_marks_batch_failed():
+    from sensing_worker.enrich import enrich_batch
+    docs = [_doc(1), _doc(2)]
+    settings = Settings(enrich_body_chars=100)
+    llm = FakeLlm(['{"items": [{"idx": 1, "summary": "a", "topics": ["기타"], "tags": []}]}',          # 2번 누락 → 재요청
+                   '{"items": [{"idx": 1, "summary": "a", "topics": ["기타"], "tags": []},'
+                   '{"idx": 2, "summary": null, "topics": ["지원사업"], "tags": ["중소벤처기업부"]}]}'])
+    results, gen = enrich_batch(llm, docs, settings)
+    assert gen.attempts == 2 and "번호 [2]" in llm.calls[1][1]
+    assert results[1].summary == "a" and results[2].summary is None and results[2].topics == ["지원사업"]
+
+    llm = FakeLlm(['{"items": []}'])                                       # 두 번 다 빈 응답 → 묶음 전체 FAILED
+    results, gen = enrich_batch(llm, docs, settings)
+    assert gen.data is None and len(llm.calls) == 2
+    assert {r.status for r in results.values()} == {"FAILED"} and "검증 실패 (2회)" in results[1].error
+
+
+class _FakeEnrichStore:
+    """DB 없이 enrich_pending을 돌리기 위한 최소 저장소."""
+
+    def __init__(self, rows):
+        import contextlib
+        self.rows = rows
+        self.saved = []
+        self.conn = SimpleNamespace(transaction=contextlib.nullcontext)
+
+    def lock_pending_enrichment(self, limit, failed_retry_hours=24):
+        return self.rows[:limit]
+
+    def load_watch_hits(self, ids):
+        return {ids[0]: [("자사 보도", "메타넷")]} if ids else {}
+
+    def save_enrichment(self, document_id, document_version, **fields):
+        self.saved.append((document_id, document_version, fields))
+
+
+def _rows(n, **kw):
+    rows = []
+    for i in range(1, n + 1):
+        row = dict(id=i, version=1, url=f"https://n.example.com/{i}", title=f"기사 {i}", body_text=None,
+                   section=None, domain="n.example.com", site_type="NEWS")
+        row.update(kw)
+        rows.append(row)
+    return rows
+
+
+def test_enrich_pending_writes_nothing_when_llm_is_unavailable():
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    store = _FakeEnrichStore(_rows(3))
+    outcome = enrich_pending(store, BatchFakeLlm(error=LlmUnavailable("down")), Settings(), limit=10)
+    assert outcome.llm_unavailable and outcome.fetched == 3 and outcome.done == 0
+    assert store.saved == []
+
+    outcome = enrich_pending(_FakeEnrichStore([]), BatchFakeLlm(error=LlmUnavailable("down")), Settings(), limit=10)
+    assert outcome.fetched == 0 and not outcome.llm_unavailable
+
+
+def test_enrich_pending_saves_results_and_skips_empty_documents():
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import enrich_pending
+    rows = _rows(2) + _rows(1, id=3, title=None, body_text="  ")                        # 3번은 제목·본문 없음
+    rows += _rows(1, id=4, site_type="PUBLIC", body_text="공고 본문 " * 20, title="2026년 지원사업 공고")
+    store = _FakeEnrichStore(rows)
+    llm = BatchFakeLlm()
+    outcome = enrich_pending(store, llm, Settings(), limit=10)
+    assert (outcome.fetched, outcome.done, outcome.skipped, outcome.failed) == (4, 3, 1, 0)
+    assert outcome.usage == {"input_tokens": 1000, "output_tokens": 50}
+    assert len(llm.calls) == 1 and "[문서 3]" in llm.calls[0][1] and "[문서 4]" not in llm.calls[0][1]   # 빈 문서는 안 보냄
+    assert "감시 '자사 보도' 검색어 '메타넷'" in llm.calls[0][1]
+    saved = {doc_id: fields for doc_id, _, fields in store.saved}
+    assert saved[1]["summary"] is None and saved[1]["topics"] == ["정책·규제"] and len(saved[1]["tags"]) == 5   # 언론: 요약 없음
+    assert saved[1]["status"] == "DONE" and saved[1]["model"] == "fake fake-1"
+    assert saved[3]["status"] == "SKIPPED" and saved[3]["topics"] == []
+    assert saved[4]["summary"] == "요약 3" and saved[4]["status"] == "DONE"                 # 본문 있는 문서는 요약 저장
+
+
+def test_main_loop_runs_enrich_only_when_idle_and_llm_is_configured(monkeypatch):
+    from sensing_worker import main as m
+    calls = []
+    monkeypatch.setattr(m, "enrich_pending", lambda store, llm, settings, limit: calls.append(limit))
+    m.enrich_idle(None, NoLlm(), Settings())
+    assert calls == []
+    m.enrich_idle(None, FakeLlm(["{}"]), Settings(enrich_enabled=False))
+    assert calls == []
+    m.enrich_idle(None, FakeLlm(["{}"]), Settings(enrich_batch=7))
+    assert calls == [7]
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(m, "enrich_pending", boom)
+    m.enrich_idle(None, FakeLlm(["{}"]), Settings())     # 보강 오류는 루프를 죽이지 않는다

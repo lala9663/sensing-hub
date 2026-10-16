@@ -14,9 +14,10 @@ import time
 from .codes import Code, CrawlFailure
 from .config import Settings
 from .db import Store
+from .enrich import enrich_pending
 from .fetcher import PoliteFetcher
 from .jobs import JobRunner
-from .llm import describe, make_llm
+from .llm import NoLlm, describe, make_llm
 from .throttle import DbThrottle
 
 log = logging.getLogger("sensing_worker")
@@ -54,6 +55,16 @@ def process_one(store: Store, runner: JobRunner, settings: Settings) -> str | No
     return status
 
 
+def enrich_idle(store: Store, llm, settings: Settings) -> None:
+    """큐가 비었을 때 한 묶음 보강한다. 보강의 어떤 오류도 수집 루프를 멈추지 않는다."""
+    if not settings.enrich_enabled or isinstance(llm, NoLlm):
+        return
+    try:
+        enrich_pending(store, llm, settings, settings.enrich_batch)
+    except Exception:   # DB 오류 등. 다음 루프에 다시 시도한다
+        log.exception("enrich failed")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="sensing-hub 수집 워커")
     parser.add_argument("--once", action="store_true", help="대기 작업 하나만 처리하고 종료")
@@ -74,6 +85,7 @@ def main(argv: list[str] | None = None) -> None:
             if args.once:
                 break
             if status is None:
+                enrich_idle(store, llm, settings)   # 작업이 없을 때만 요약·분류를 한 묶음 돌린다
                 time.sleep(settings.poll_seconds)
     finally:
         fetcher.close()
