@@ -683,3 +683,183 @@ def test_crawl_stops_at_blocking_hub(tmp_path):
     assert e.value.code == Code.BOT_CHALLENGE and e.value.blocking
     assert store.record_error.call_count == 1                              # 앞서 건너뛴 허브의 404는 남긴다
     assert store.record_error.call_args.args[1].code == Code.HTTP_4XX
+
+
+# ---------------------------------------------------------------------- 공개 API 소스 (M2)
+
+def _api_fetcher(handler) -> PoliteFetcher:
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True)
+    return PoliteFetcher(s, transport=httpx.MockTransport(handler))
+
+
+def test_api_catalog_lookup():
+    from sensing_worker.apis import catalog
+    assert catalog.lookup("dart.fss.or.kr").id == "dart"
+    assert catalog.lookup("WWW.dart.fss.or.kr").id == "dart"
+    assert catalog.lookup("opendart.fss.or.kr").id == "dart"
+    assert catalog.lookup("m.dart.fss.or.kr").id == "dart"
+    assert catalog.lookup("fss.or.kr") is None                      # 금감원 홈은 공시 API 대상이 아니다
+    assert catalog.lookup("news.example.com") is None and catalog.lookup("") is None
+    assert catalog.get("dart").needs_key and "opendart.fss.or.kr" in catalog.get("dart").signup_url
+    assert "API 키" in catalog.get("dart").key_required_message
+
+
+def test_mask_secret_hides_value_and_key_params():
+    from sensing_worker.apis import mask_secret
+    assert mask_secret("https://x/api?crtfc_key=abc123&bgn_de=1", "abc123") == "https://x/api?crtfc_key=***&bgn_de=1"
+    assert mask_secret("key abc123 leaked", "abc123") == "key *** leaked"
+    assert mask_secret("serviceKey=zzz&x=1") == "serviceKey=***&x=1"      # 값을 몰라도 패턴으로 가린다
+    assert mask_secret(None, "abc") is None and mask_secret("", "abc") == ""
+
+
+def test_dart_connector_lists_disclosures_without_leaking_key():
+    from fakedart import GOOD_KEY, dart_handler, disclosures
+    from sensing_worker.apis.dart import KST, DartConnector
+    handler = dart_handler(disclosures(5), per_page=2)                 # 3페이지로 나뉜다
+    c = DartConnector(_api_fetcher(handler))
+    c.verify(GOOD_KEY)
+    assert c.default_config() == {"method": "API", "provider": "dart", "days": 1, "corp_codes": []}
+
+    items = c.fetch(GOOD_KEY, c.default_config(), since=datetime.now(KST).date() - timedelta(days=1), limit=10)
+    assert [i.url for i in items] == [f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo=2026101500000{i}" for i in range(1, 6)]
+    assert items[0].title == "주요사항보고서(유상증자결정) 1" and items[0].author == "테스트전자"
+    assert items[0].section == "테스트전자" and items[0].body is None and items[0].attachments == []
+    assert items[0].published_at.tzinfo == KST and items[0].published_at.hour == 0
+    assert len(handler.calls) == 1 + 3                                 # verify 1회 + 목록 3페이지
+    assert all("crtfc_key=" + GOOD_KEY in u for u in handler.calls)    # 키는 요청에만 실린다
+
+    assert c.fetch(GOOD_KEY, c.default_config(), since=datetime.now(KST).date(), limit=2) == items[:2]   # limit
+    assert c.fetch(GOOD_KEY, {"days": 1, "corp_codes": ["00126380"]}, since=datetime.now(KST).date(), limit=9)[0] == items[0]
+    assert "corp_code=00126380" in handler.calls[-1]
+
+
+def test_dart_connector_classifies_key_errors_and_outages():
+    from fakedart import GOOD_KEY, dart_handler
+    from sensing_worker.apis.dart import DartConnector
+    since = datetime.now(timezone.utc).date()
+
+    with pytest.raises(CrawlFailure) as e:                             # 잘못된 키 → API_KEY_INVALID, 키 노출 없음
+        DartConnector(_api_fetcher(dart_handler())).verify("wrong-secret-xyz")
+    assert e.value.code == Code.API_KEY_INVALID and not e.value.retryable
+    assert "010" in str(e.value) and "wrong-secret-xyz" not in str(e.value)
+    assert "crtfc_key=***" in e.value.url and "wrong-secret-xyz" not in e.value.url
+
+    with pytest.raises(CrawlFailure) as e:                             # 서버 장애 → API_ERROR(재시도), 증거에도 키 없음
+        DartConnector(_api_fetcher(dart_handler(server_status=503))).fetch(GOOD_KEY, {}, since, 10)
+    assert e.value.code == Code.API_ERROR and e.value.retryable and e.value.http_status == 503
+    assert GOOD_KEY not in (e.value.url + str(e.value) + (e.value.evidence or ""))
+
+    with pytest.raises(CrawlFailure) as e:                             # 요청 한도 초과(020)는 키 오류가 아니다
+        DartConnector(_api_fetcher(dart_handler(api_status="020"))).verify(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and e.value.retryable
+
+    assert DartConnector(_api_fetcher(dart_handler(items=[]))).fetch(GOOD_KEY, {}, since, 10) == []   # 013 = 0건
+
+    def down(request):                                                 # 연결 실패도 URL을 가린 채 전달된다
+        raise httpx.ConnectError("boom", request=request)
+    with pytest.raises(CrawlFailure) as e:
+        DartConnector(_api_fetcher(down)).verify(GOOD_KEY)
+    assert e.value.code == Code.TIMEOUT and GOOD_KEY not in e.value.url and "crtfc_key=***" in e.value.url
+
+
+def test_api_fetch_keeps_private_host_guard_but_skips_robots():
+    from sensing_worker.apis.dart import DartConnector
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "000", "list": [], "total_page": 1})
+    DartConnector(_api_fetcher(handler)).verify("k")
+    assert calls == ["/api/list.json"]                                 # robots.txt를 읽지 않는다
+
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=False)
+    with pytest.raises(CrawlFailure) as e:
+        PoliteFetcher(s, transport=httpx.MockTransport(handler)).get_api("http://127.0.0.1/api")
+    assert e.value.code == Code.INTERNAL_ADDRESS
+
+
+def test_discovery_eval_marks_api_domains_without_network():
+    from sensing_worker.evaluate import evaluate_site, summarize
+    settings = Settings(min_interval_seconds=0, max_retries=1)
+    r = evaluate_site("https://dart.fss.or.kr/dsaf001/main.do?rcpNo=1", settings)
+    assert r.outcome == "API" and r.method == "API" and r.requests == 0 and r.code == "API_KEY_REQUIRED"
+    assert "opendart.fss.or.kr" in r.message
+    assert "API 1" in summarize([r])
+
+
+def _api_runner(tmp_path, handler, *, secret_key="unit-secret", credential="good-key-0123456789abcdef"):
+    """MagicMock 저장소로 ONBOARD/CRAWL 흐름만 돌린다 (DB 흐름은 test_flow_db.py)."""
+    from sensing_worker.db import Job
+    from sensing_worker.jobs import JobRunner
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True, evidence_dir=str(tmp_path),
+                 secret_key=secret_key)
+    store = MagicMock()
+    store.load_source.return_value = {"id": 3, "site_id": 5, "domain": "dart.fss.or.kr",
+                                      "base_url": "https://dart.fss.or.kr", "config": None, "config_version": None,
+                                      "status": "PENDING", "interval_minutes": 60, "active_config_version_id": None}
+    store.load_credential.return_value = credential
+    store.found_baseline.return_value = None
+    store.activate_new_config.return_value = (11, 1)
+    store.upsert_document.return_value = (1, "NEW")
+    runner = JobRunner(store, PoliteFetcher(s, transport=httpx.MockTransport(handler)), s, llm=NoLlm())
+    job = Job(id=7, source_id=3, job_type="ONBOARD", trigger="REGISTRATION", config_version_id=None, attempt=1)
+    return runner, store, job
+
+
+def test_onboard_api_source_waits_for_key_without_crawling(tmp_path):
+    from fakedart import dart_handler
+    handler = dart_handler()
+    runner, store, job = _api_runner(tmp_path, handler, credential=None)
+    assert runner.run(job) == "FAILED"
+    assert handler.calls == []                                                     # 네트워크 호출 없음
+    store.update_site.assert_called_once_with(5, site_type="PUBLIC", risk_flags={"api_provider": "dart"})
+    store.set_source_status.assert_called_once_with(3, "REVIEW", "API_KEY_REQUIRED")
+    reg = store.update_registration.call_args.kwargs
+    assert reg["status"] == "REVIEW" and "DART 공시는 크롤링 대신" in reg["message"] and "opendart" in reg["message"]
+    store.load_credential.assert_called_once_with("dart", "unit-secret")
+    store.activate_new_config.assert_not_called()
+
+    runner, store, job = _api_runner(tmp_path, handler, secret_key="")           # 대칭키 미설정도 같은 경로
+    assert runner.run(job) == "FAILED"
+    store.load_credential.assert_not_called()
+    assert "SENSING_SECRET_KEY" in store.update_registration.call_args.kwargs["message"]
+    assert store.record_error.call_args.args[1].code == Code.API_KEY_REQUIRED
+
+
+def test_onboard_api_source_with_key_verifies_and_collects(tmp_path):
+    from fakedart import dart_handler
+    handler = dart_handler()
+    runner, store, job = _api_runner(tmp_path, handler)
+    assert runner.run(job) == "SUCCESS"
+    store.mark_credential.assert_called_once_with("dart", "VALID", None)
+    config, interval = store.activate_new_config.call_args.args[1], store.activate_new_config.call_args.args[3]
+    assert config["method"] == "API" and config["provider"] == "dart" and interval == 360
+    assert store.upsert_document.call_count == 3
+    assert store.upsert_document.call_args.kwargs["url"].startswith("https://dart.fss.or.kr/dsaf001/main.do?rcpNo=")
+    assert store.finish_job.call_args.args[:4] == (7, "SUCCESS", 3, 3)
+    assert store.update_registration.call_args.kwargs["status"] == "COMPLETED"
+    assert "3건" in store.update_registration.call_args.kwargs["message"]
+
+    runner, store, job = _api_runner(tmp_path, handler, credential="stale-key")   # 틀린 키
+    assert runner.run(job) == "FAILED"
+    assert store.mark_credential.call_args.args[:2] == ("dart", "INVALID")
+    assert "stale-key" not in store.mark_credential.call_args.args[2]
+    store.set_source_status.assert_called_once_with(3, "REVIEW", "API_KEY_INVALID")
+
+
+def test_periodic_api_crawl_uses_connector_and_sends_lost_key_to_review(tmp_path):
+    from fakedart import dart_handler
+    from sensing_worker.db import Job
+    handler = dart_handler()
+    runner, store, _ = _api_runner(tmp_path, handler)
+    store.load_source.return_value.update({"status": "ACTIVE", "interval_minutes": 360, "active_config_version_id": 11,
+                                           "config": {"method": "API", "provider": "dart", "days": 1, "corp_codes": []}})
+    store.mark_anomaly.return_value = 0
+    job = Job(id=8, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=11, attempt=1)
+    assert runner.run(job) == "SUCCESS"
+    assert store.upsert_document.call_count == 3 and store.finish_job.call_args.args[2] == 3   # found_count
+    store.set_source_status.assert_not_called()
+
+    store.load_credential.return_value = None                                    # 키가 지워졌다
+    assert runner.run(job) == "FAILED"
+    store.set_source_status.assert_called_once_with(3, "REVIEW", "API_KEY_REQUIRED")

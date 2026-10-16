@@ -120,6 +120,11 @@ class PoliteFetcher:
     def get(self, url: str) -> Page:
         return self._request(url, check_robots=True, classify=True)
 
+    def get_api(self, url: str) -> Page:
+        """공개 API 호출. 도메인 간격·내부망 차단·연결 재시도는 같지만 robots 검사와 차단 화면 분류는 하지 않는다
+        (API 주소는 robots 대상이 아니고, 오류는 응답 JSON의 상태 코드로 커넥터가 분류한다). 4xx·5xx도 그대로 돌려준다."""
+        return self._request(url, check_robots=False, classify=False)
+
     def _request(self, url: str, *, check_robots: bool, classify: bool, redirects: int = 0) -> Page:
         if check_robots and not self.allowed(url):
             raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=url)

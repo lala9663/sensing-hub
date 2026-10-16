@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -11,6 +12,8 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .codes import CrawlFailure
+
+log = logging.getLogger(__name__)
 
 
 def sha256(text: str) -> str:
@@ -128,6 +131,31 @@ class Store:
                        updated_at = now()
                 WHERE id = %s
                 """, (interval_minutes, source_id))
+
+    # ------------------------------------------------------------------ 공개 API 자격 증명
+    def load_credential(self, provider: str, key: str) -> str | None:
+        """api_credential의 비밀을 대칭키로 풀어 돌려준다. 없으면 None.
+
+        백엔드가 pgp_sym_encrypt로 넣은 것을 같은 키로 pgp_sym_decrypt한다. 키가 다르면 복호화가 실패하는데,
+        이는 '키가 없는 것'과 같이 다룬다 (관리자가 키를 다시 넣으면 백엔드 쪽 키로 다시 암호화된다).
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT pgp_sym_decrypt(secret_enc, %s) AS secret FROM api_credential WHERE provider = %s",
+                (key, provider)).fetchone()
+        except psycopg.Error as e:
+            log.warning("credential decrypt failed provider=%s: %s (SENSING_SECRET_KEY가 백엔드와 다른지 확인)",
+                        provider, type(e).__name__)
+            return None
+        return row["secret"] if row else None
+
+    def mark_credential(self, provider: str, status: str, error: str | None) -> None:
+        """시험 호출 결과를 남긴다. 비밀은 건드리지 않는다. error에는 키가 들어 있으면 안 된다 (커넥터가 가린다)."""
+        self.conn.execute(
+            """
+            UPDATE api_credential SET status = %s, last_error = %s, last_verified_at = now(), updated_at = now()
+            WHERE provider = %s
+            """, (status, (error or "")[:500] or None, provider))
 
     # ------------------------------------------------------------------ 등록 요청
     def update_registration(self, source_id: int, *, status: str | None = None, step: str | None = None,

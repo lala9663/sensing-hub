@@ -310,3 +310,114 @@ def test_broken_section_keeps_crawl_partial_and_source_active(env):
     assert errs[0]["code"] == "HTTP_4XX" and errs[0]["stage"] == "LIST" and errs[0]["http_status"] == 404
     assert errs[0]["url"] == gone
     assert any("sc_section_code=S1N2" in h for h in site.hits)  # 다음 허브는 계속 방문했다
+
+
+# ---------------------------------------------------------------------- 공개 API 소스 (M2, DART)
+
+SECRET_KEY = "flow-test-secret"
+
+
+def api_runner(store: Store, settings: Settings, handler, secret_key: str = SECRET_KEY) -> tuple[JobRunner, Settings]:
+    """가짜 DART(MockTransport)를 쓰는 러너. 실제 opendart에는 요청하지 않는다."""
+    import httpx
+    s = Settings(**{**settings.__dict__, "secret_key": secret_key})
+    runner = JobRunner(store, PoliteFetcher(s, transport=httpx.MockTransport(handler)), s)
+    return runner, s
+
+
+def put_credential(store: Store, provider: str, secret: str, key: str = SECRET_KEY) -> None:
+    """백엔드 ApiCredentialService.save와 같은 행 (pgp_sym_encrypt)."""
+    store.conn.execute(
+        "INSERT INTO api_credential (provider, label, secret_enc, status) VALUES (%s, %s, pgp_sym_encrypt(%s, %s), 'UNVERIFIED') "
+        "ON CONFLICT (provider) DO UPDATE SET secret_enc = EXCLUDED.secret_enc, status = 'UNVERIFIED', last_error = NULL",
+        (provider, "테스트 키", secret, key))
+
+
+def test_dart_registration_waits_for_api_key_then_collects(env):
+    from fakedart import GOOD_KEY, dart_handler
+    store, _, settings, _ = env
+    handler = dart_handler()
+    runner, s = api_runner(store, settings, handler)
+    source_id = register(store, "https://dart.fss.or.kr")
+
+    # ① 키가 없다 → 크롤링 없이 관리자 큐(REVIEW/API_KEY_REQUIRED)로
+    assert process_one(store, runner, s) == "FAILED"
+    assert handler.calls == []
+    src = q(store, "SELECT s.status, s.status_reason, t.risk_flags, t.site_type FROM source s JOIN site t ON t.id = s.site_id "
+                   "WHERE s.id = %s", source_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_REQUIRED"
+    assert src["risk_flags"] == {"api_provider": "dart"} and src["site_type"] == "PUBLIC"
+    reg = q(store, "SELECT status, step, result_message FROM registration_request")
+    assert reg["status"] == "REVIEW" and "공시 API로 받습니다" in reg["result_message"] and "opendart" in reg["result_message"]
+    err = q(store, "SELECT code, stage, evidence_path FROM crawl_error")
+    assert err["code"] == "API_KEY_REQUIRED" and err["stage"] == "PROBE" and err["evidence_path"] is None
+
+    # ② 관리자가 키를 넣고(백엔드가 암호화 저장 + ONBOARD 재등록) → 검증 → API 설정 → 첫 수집
+    put_credential(store, "dart", GOOD_KEY)
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'MANUAL')", (source_id,))
+    assert process_one(store, runner, s) == "SUCCESS"
+    src = q(store, "SELECT s.status, s.status_reason, s.method, s.interval_minutes, v.config, v.version, v.change_note "
+                   "FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", source_id)
+    assert src["status"] == "ACTIVE" and src["status_reason"] is None and src["method"] == "API"
+    assert src["interval_minutes"] == 360 and src["version"] == 1
+    assert src["config"] == {"method": "API", "provider": "dart", "days": 1, "corp_codes": []}
+    assert "키 검증 통과" in src["change_note"]
+    docs = store.conn.execute("SELECT url, title, author, section, published_at, body_text FROM document ORDER BY url").fetchall()
+    assert len(docs) == 3 and all(d["body_text"] is None for d in docs)
+    assert docs[0]["url"] == "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20261015000001"
+    assert docs[0]["author"] == "테스트전자" and docs[0]["published_at"] is not None
+    cred = q(store, "SELECT status, last_error, last_verified_at FROM api_credential WHERE provider = 'dart'")
+    assert cred["status"] == "VALID" and cred["last_error"] is None and cred["last_verified_at"] is not None
+    reg = q(store, "SELECT status, result_message FROM registration_request")
+    assert reg["status"] == "COMPLETED" and "3건" in reg["result_message"] and "360분" in reg["result_message"]
+    assert all(GOOD_KEY not in (r["message"] or "") + (r["url"] or "")
+               for r in store.conn.execute("SELECT message, url FROM crawl_error").fetchall())
+
+    # 주기 수집: 같은 공시는 다시 저장하지 않는다
+    assert crawl(store, runner, s, source_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job ORDER BY id DESC LIMIT 1")
+    assert job["found_count"] == 3 and job["new_count"] == 0
+    assert q(store, "SELECT count(*) AS c FROM document")["c"] == 3
+
+    # ③ 키가 폐기됐다 → 주기 수집이 REVIEW/API_KEY_INVALID로 보내고 자격 증명은 INVALID
+    put_credential(store, "dart", "revoked-key")
+    assert crawl(store, runner, s, source_id) == "FAILED"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_INVALID"
+    cred = q(store, "SELECT status, last_error FROM api_credential WHERE provider = 'dart'")
+    assert cred["status"] == "INVALID" and "010" in cred["last_error"] and "revoked-key" not in cred["last_error"]
+    err = q(store, "SELECT code, url, message FROM crawl_error ORDER BY id DESC LIMIT 1")
+    assert err["code"] == "API_KEY_INVALID" and "crtfc_key=***" in err["url"] and "revoked-key" not in err["message"]
+
+
+def test_dart_onboard_with_wrong_key_marks_credential_invalid(env):
+    from fakedart import dart_handler
+    store, _, settings, _ = env
+    runner, s = api_runner(store, settings, dart_handler())
+    put_credential(store, "dart", "typo-key")
+    source_id = register(store, "https://opendart.fss.or.kr")
+    assert process_one(store, runner, s) == "FAILED"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_INVALID"
+    assert q(store, "SELECT status FROM api_credential")["status"] == "INVALID"
+    reg = q(store, "SELECT status, result_message FROM registration_request")
+    assert reg["status"] == "REVIEW" and "유효하지 않습니다" in reg["result_message"] and "typo-key" not in reg["result_message"]
+    assert q(store, "SELECT count(*) AS c FROM source_config_version")["c"] == 0
+
+
+def test_dart_without_secret_key_or_with_mismatched_key_goes_to_review(env):
+    from fakedart import GOOD_KEY, dart_handler
+    store, _, settings, _ = env
+    put_credential(store, "dart", GOOD_KEY, key="backend-uses-another-key")
+    source_id = register(store, "https://dart.fss.or.kr")
+
+    runner, s = api_runner(store, settings, dart_handler(), secret_key="")        # 워커에 대칭키가 없다
+    assert process_one(store, runner, s) == "FAILED"
+    assert q(store, "SELECT status_reason FROM source WHERE id = %s", source_id)["status_reason"] == "API_KEY_REQUIRED"
+    assert "SENSING_SECRET_KEY" in q(store, "SELECT result_message FROM registration_request")["result_message"]
+
+    runner, s = api_runner(store, settings, dart_handler())                       # 대칭키가 백엔드와 다르다 → 복호화 실패
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'MANUAL')", (source_id,))
+    assert process_one(store, runner, s) == "FAILED"
+    assert q(store, "SELECT status_reason FROM source WHERE id = %s", source_id)["status_reason"] == "API_KEY_REQUIRED"
+    assert q(store, "SELECT count(*) AS c FROM document")["c"] == 0

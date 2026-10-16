@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-from .codes import Code, CrawlFailure, MESSAGES
+from .apis import ApiConnector, Provider, catalog as api_catalog, make_connector
+from .apis import lookup as api_lookup
+from .codes import API_KEY_CODES, Code, CrawlFailure, MESSAGES
 from .config import Settings
 from .db import Job, Store, sha256
 from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, looks_like_sitemap,
@@ -67,6 +70,11 @@ class JobRunner:
         """사전 점검 → 자동 탐색 → 품질 검사 → 기본값 적용(설정 새 버전) → 첫 수집."""
         base_url, domain = source["base_url"], source["domain"]
 
+        # 0) 공개 API가 있는 제공처(DART 등)는 크롤링하지 않고 API 소스로 등록한다
+        provider = api_lookup(domain)
+        if provider is not None:
+            return self._onboard_api(job, source, provider)
+
         # 1) 사전 점검
         self.db.update_registration(job.source_id, step="PROBE", message="사전 점검 중입니다.")
         probe = probe_site(self.f, domain, base_url)
@@ -108,11 +116,63 @@ class JobRunner:
                  result.method, result.recipe_source, version, stats.new)
         return status
 
+    # ------------------------------------------------------------------ ONBOARD (공개 API)
+    def _onboard_api(self, job: Job, source: dict, provider: Provider) -> str:
+        """카탈로그에 있는 제공처: 키 확인 → 시험 호출 → 설정(method API) 활성화 → 첫 수집.
+
+        키가 없으면 REVIEW/API_KEY_REQUIRED로 멈춘다 (관리자가 키를 넣으면 백엔드가 ONBOARD를 다시 넣는다).
+        키가 틀리면 자격 증명을 INVALID로 표시하고 REVIEW/API_KEY_INVALID로 멈춘다.
+        """
+        self.db.update_site(source["site_id"], site_type="PUBLIC", risk_flags={"api_provider": provider.id})
+        self.db.update_registration(job.source_id, step="API_KEY", message=f"{provider.name} API 키를 확인하는 중입니다.")
+        secret = self._load_secret(provider.id, provider, stage="PROBE")
+        connector = make_connector(provider.id, self.f)
+        try:
+            connector.verify(secret)
+        except CrawlFailure as e:
+            e.stage = "PROBE"
+            if e.code == Code.API_KEY_INVALID:
+                self.db.mark_credential(provider.id, "INVALID", str(e))
+            raise
+        self.db.mark_credential(provider.id, "VALID", None)
+
+        defaults = defaults_for("PUBLIC")   # 공시·공공 API: 6시간 주기
+        config = connector.default_config()
+        first = source["config_version"] is None
+        config_id, version = self.db.activate_new_config(
+            job.source_id, config, f"{provider.name} API로 {'생성' if first else '다시 생성'} (키 검증 통과)",
+            defaults["interval_minutes"])
+
+        self.db.update_registration(job.source_id, step="FIRST_CRAWL", message="첫 수집 중입니다.")
+        stats = self._crawl_api(job, source, config, connector=connector, secret=secret)
+        self.db.mark_crawl_result(job.source_id, True, defaults["interval_minutes"])
+        status = "PARTIAL" if stats.errors else "SUCCESS"
+        self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors, config_id)
+        self.db.update_registration(
+            job.source_id, status="COMPLETED", step="DONE",
+            message=f"등록 완료. {provider.name} API로 {stats.new}건을 받았고 {defaults['interval_minutes']}분마다 업데이트합니다.")
+        log.info("onboard ok source=%s provider=%s method=API v%s new=%s", job.source_id, provider.id, version, stats.new)
+        return status
+
+    def _load_secret(self, provider_id: str, provider: Provider | None, stage: str) -> str:
+        """복호화한 키. 대칭키나 자격 증명이 없으면 API_KEY_REQUIRED (사용자 메시지는 제공자의 발급 안내)."""
+        hint = provider.key_required_message if provider else MESSAGES[Code.API_KEY_REQUIRED]
+        if not self.s.secret_key:
+            raise CrawlFailure(Code.API_KEY_REQUIRED, f"{hint} (워커에 SENSING_SECRET_KEY가 설정되지 않았습니다.)",
+                               stage=stage)
+        secret = self.db.load_credential(provider_id, self.s.secret_key)
+        if not secret:
+            raise CrawlFailure(Code.API_KEY_REQUIRED, hint, stage=stage)
+        return secret
+
     # ------------------------------------------------------------------ CRAWL
     def _crawl_job(self, job: Job, source: dict) -> str:
         if not source.get("config"):
             raise CrawlFailure(Code.DISCOVERY_FAILED, "활성 설정이 없습니다.", stage="LIST")
-        stats = self._crawl(job, source, source["config"])
+        if source["config"].get("method") == "API":
+            stats = self._crawl_api(job, source, source["config"])
+        else:
+            stats = self._crawl(job, source, source["config"])
         streak = self.db.mark_anomaly(job.source_id, stats.anomalies > 0)
         if streak >= self.s.anomaly_broken_after:
             # 조용한 실패가 이어진다: 사이트 개편으로 일부만 잡히는 것으로 보고 관리자에게 넘긴다
@@ -231,6 +291,45 @@ class JobRunner:
             stats.anomalies += 1
         return stats
 
+    def _crawl_api(self, job: Job, source: dict, config: dict, *, connector: ApiConnector | None = None,
+                   secret: str | None = None) -> CrawlStats:
+        """공개 API 수집: 허브 루프 대신 커넥터 fetch. 급감 감지는 크롤링과 같이 found_count 기준이다.
+
+        0건은 실패가 아니다 (주말·휴일 공시처럼 정상적으로 비는 날이 있다) — PARSE_EMPTY를 내지 않는다.
+        """
+        stats = CrawlStats()
+        provider_id = config["provider"]
+        if secret is None:
+            secret = self._load_secret(provider_id, api_catalog.get(provider_id), stage="LIST")
+        connector = connector or make_connector(provider_id, self.f)
+        since = (datetime.now(timezone.utc) - timedelta(days=max(0, int(config.get("days", 1))))).date()
+        try:
+            items = connector.fetch(secret, config, since, self.s.max_api_items_per_run)
+        except CrawlFailure as e:
+            if e.code == Code.API_KEY_INVALID:
+                self.db.mark_credential(provider_id, "INVALID", str(e))
+            raise
+        stats.found = len(items)
+
+        baseline = self.db.found_baseline(job.source_id, source.get("active_config_version_id"))
+        if baseline and stats.found < baseline * self.s.anomaly_drop_ratio:
+            self._record(job, CrawlFailure(
+                Code.ANOMALY_DROP, f"API 항목이 {stats.found}건으로 평소({baseline:.1f}건)보다 크게 줄었습니다.", stage="LIST"))
+            stats.errors += 1
+            stats.anomalies += 1
+
+        for item in items:
+            doc_id, result = self.db.upsert_document(
+                source_id=job.source_id, job_id=job.id, url=item.url, title=item.title, author=item.author,
+                section=item.section, published_at=item.published_at, body=item.body)
+            if result == "NEW":
+                stats.new += 1
+            elif result == "UPDATED":
+                stats.updated += 1
+            for att_url, name in item.attachments:
+                self.db.add_attachment(doc_id, att_url, name)
+        return stats
+
     # ------------------------------------------------------------------ 실패 처리
     def _apply_failure(self, job: Job, source: dict, failure: CrawlFailure) -> None:
         code = failure.code
@@ -253,6 +352,9 @@ class JobRunner:
             self.db.set_source_status(job.source_id, "BLOCKED", code.value)
         elif code in (Code.PARSE_EMPTY, Code.DISCOVERY_FAILED):
             self.db.set_source_status(job.source_id, "BROKEN", code.value)
+        elif code in API_KEY_CODES:
+            # 키가 사라졌거나 만료됐다: 관리자 큐(API_KEY)로 보내고, 키를 다시 넣으면 백엔드가 ONBOARD를 넣는다
+            self.db.set_source_status(job.source_id, "REVIEW", code.value)
         self.db.mark_crawl_result(job.source_id, False, source["interval_minutes"])
 
 
@@ -355,3 +457,4 @@ def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_t
 
 def host_of(url: str) -> str:
     return urlsplit(url).hostname or ""
+

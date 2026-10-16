@@ -20,13 +20,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .apis import lookup as api_lookup
 from .codes import CrawlFailure
 from .config import Settings
 from .fetcher import PoliteFetcher
 from .jobs import discover, probe_site
 from .llm import LlmClient, make_llm
 
-# 온보딩 결과와 같은 분류: OK(자동 등록) | REVIEW(관리자 큐) | BLOCKED(등록 불가) | ERROR(그 밖의 실패)
+# 온보딩 결과와 같은 분류: OK(자동 등록) | API(공개 API 소스, 키 필요) | REVIEW(관리자 큐) | BLOCKED(등록 불가) | ERROR(그 밖의 실패)
 REVIEW_CODES = {"DISCOVERY_FAILED", "QUALITY_FAILED"}
 
 
@@ -51,6 +52,11 @@ def evaluate_site(url: str, settings: Settings, llm: LlmClient | None = None) ->
     parts = urlsplit(url)
     base_url = f"{parts.scheme}://{parts.netloc}"
     domain = (parts.hostname or "").lower().removeprefix("www.")
+    provider = api_lookup(domain)
+    if provider is not None:
+        # 온보딩과 같이 크롤링하지 않는다. 키 발급은 사람의 일이므로 측정 도구는 네트워크를 쓰지 않는다
+        return SiteResult(url=base_url, outcome="API", code="API_KEY_REQUIRED", method="API",
+                          message=f"{provider.name}: API 키 발급 필요 ({provider.signup_url})")
     fetcher = PoliteFetcher(settings)
     llm = llm if llm is not None else make_llm(settings)
     started = time.monotonic()
@@ -102,7 +108,7 @@ def summarize(results: list[SiteResult], target: int | None = None) -> str:
     ok = sum(r.outcome == "OK" for r in results)
     goal = f" (목표 {target}곳: {'달성' if ok >= target else '미달'})" if target else ""
     lines.append(f"\n자동 등록 성공 {ok}/{len(results)}곳{goal}")
-    counts = {k: sum(r.outcome == k for r in results) for k in ("REVIEW", "BLOCKED", "ERROR")}
+    counts = {k: sum(r.outcome == k for r in results) for k in ("API", "REVIEW", "BLOCKED", "ERROR")}
     lines.append("나머지: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
     return "\n".join(lines)
 
