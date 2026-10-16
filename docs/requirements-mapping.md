@@ -62,9 +62,9 @@
 | 소스 | 신호 | 키 | 비고 |
 | --- | --- | --- | --- |
 | 국세청 사업자등록 상태 조회 (공공데이터포털) | 휴업·폐업·과세유형 변경 | 공공데이터포털 서비스키 | **구현됨** (M3-1, 2026-10-16): 회사 마스터(`company`)의 사업자번호로 점검 소스(`kind CHECK`, 하루 1회)가 조회해 `company_signal` BIZ_STATUS(폐업·휴업 HIGH, 미등록 MEDIUM, 과세유형 변경 LOW)로 기록. 가장 확실한 "거래 가능 여부" 신호 |
-| 조달청 부정당업자 제재 정보 (공공데이터포털) | 입찰 참가 제한·제재 기간 | 공공데이터포털 서비스키 | 회사명·사업자번호로 대조 |
-| DART 기업개황·정기보고서 재무 | 감사의견, 자본잠식, 매출 급감, 최대주주 변경 | DART 키 (이미 등록) | corp_code 매핑은 기업개황(company.json)과 corpCode.xml로 |
-| DART 공시 목록 (이미 구현) | 소송, 영업정지, 회생·파산 신청, 임원 변동 | DART 키 | 회사별(corp_code) 조회로 전환 |
+| 조달청 부정당업자 제재 정보 (공공데이터포털) | 입찰 참가 제한·제재 기간 | 공공데이터포털 서비스키 | **구현됨** (M3-2, 2026-10-16): 점검 소스 `g2b_debarment`(하루 1회)가 사업자번호별로 조회해 `company_signal` DEBARMENT(HIGH, fingerprint 제재 시작일+기관, 제목 "입찰참가자격 제한 (기간, 기관)"). **확인한 스펙**: 포털에 "부정당업자제재정보서비스"라는 오픈API는 없고(오픈API 검색 0건, 파일데이터 "나라장터 부정당제재 내역"만), "조달청_나라장터 사용자정보 서비스"(data/15129466)의 `getUnptRsttCorpInfo02`가 그것이다 — 엔드포인트 `https://apis.data.go.kr/1230000/ao/UsrInfoService02/getUnptRsttCorpInfo02`, 요청 `ServiceKey`·`numOfRows`·`pageNo`·`type=json`·`inqryDiv`(1=사업자번호)·`bizno`·`inqryBgnDt`/`inqryEndDt`(YYYYMMDDHHMM). **응답 items 항목명은 포털 화면에 없어 확인 필요**: 커넥터는 후보 이름을 차례로 보고 config `fields`로 바꿀 수 있다. 기간 조회의 `inqryDiv` 값도 미확인이라 기본은 사업자번호별 조회(`mode: bizno`), 확인되면 `mode: period`로 전체를 받아 사업자번호→회사명 순으로 대조. 나라장터 사용자정보 서비스 활용신청 필요 |
+| DART 기업개황·정기보고서 재무 | 감사의견, 자본잠식, 매출 급감, 최대주주 변경 | DART 키 (이미 등록) | corp_code 매핑은 **구현됨** (M3-2): 점검 소스 `dart_corp_map`(주 1회)이 `corpCode.xml`(ZIP 30MB 상한, 안의 XML 300MB 상한, 약 10만 건)을 받아 이름·별칭 정규화(공백·"(주)"·"주식회사"·"㈜" 제거, 소문자) 정확 일치가 하나(여럿이면 상장사 하나)일 때만 `company.corp_code`를 채운다. 재무(FINANCIAL)는 후속 |
+| DART 공시 목록 (이미 구현) | 소송, 영업정지, 회생·파산 신청, 임원 변동 | DART 키 | **회사별 조회 구현됨** (M3-2): 점검 소스 `dart_disclosure`(6시간)가 corp_code가 있는 회사마다 `list.json?corp_code=`로 최근 3일(config `days`)을 받아 문서(`document_company` API)로 저장하고 보고서명 규칙으로 `company_signal` DISCLOSURE — HIGH 회생절차·파산·영업정지·상장폐지·감사의견 거절·부적정·자본잠식·불성실공시·횡령·배임, MEDIUM 소송·최대주주 변경·대표이사 변경·유상증자·합병·분할·영업양수도·거래정지, LOW 그 밖의 주요사항보고서·정정공시, 일반 공시는 문서만. fingerprint `rcept_no` |
 | 네이버 뉴스 검색 (이미 구현) | 사고·리콜·수사·파업 보도 | 네이버 키 | 회사 별칭을 검색어로. 제목만 저장. **회사 연결 구현됨** (M3-1): 회사마다 감시 `회사:<이름>`이 생기고 걸린 기사는 `document_company`(WATCH), 보강 태그 정확 일치는 TAG, 사건·사고·인사·조직 토픽이면 `company_signal` NEWS(MEDIUM) |
 | 공정거래위원회 의결·제재 | 과징금·시정명령 | 사이트 크롤링 또는 공공데이터포털 | API 유무 확인 필요 |
 | 법원 공고 (회생·파산) | 회생·파산 개시 | 키 없음 | 크롤링 가능 여부 확인 필요 |
