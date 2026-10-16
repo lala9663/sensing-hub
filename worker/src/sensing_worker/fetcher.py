@@ -6,6 +6,7 @@
 - 5xx·타임아웃 재시도와 백오프, Retry-After 준수
 - 차단 신호(403·429·봇 확인 화면·로그인)는 재시도하지 않고 즉시 실패로 분류
 - 내부망 주소로 풀리는 호스트 접속 차단
+- 구식 TLS 설정을 요구하는 서버(공공기관에 흔함)는 인증서 검증을 유지한 호환 컨텍스트로 한 번 더 시도
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ JS_REDIRECT_RE = re.compile(r"""(?:location|window\.location|document\.location)
                             r"""|location\.replace\(\s*["']([^"']+)["']\s*\)""", re.I)
 # 실패 증거로 남길 응답 본문 길이 (문자)
 EVIDENCE_CHARS = 20000
+# OpenSSL SSL_OP_LEGACY_SERVER_CONNECT. Python 3.12부터 ssl 모듈에 상수가 있다
+_OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
 
 @dataclass
@@ -50,23 +53,54 @@ class Page:
     headers: dict[str, str]
 
 
+def compat_ssl_context() -> ssl.SSLContext:
+    """구식 TLS 서버용 호환 컨텍스트. 인증서 검증(체인·호스트명)은 기본 컨텍스트 그대로 유지한다.
+
+    공공기관 사이트 중에는 RSA 키 교환 암호만 지원하거나(ECDHE 없음 → Python 기본 암호 목록에서 제외),
+    1024비트 DH·SHA-1 서명처럼 OpenSSL SECLEVEL 2가 거부하는 설정이거나, legacy renegotiation을
+    요구하는 곳이 있다. 세 가지를 모두 허용하되 TLS 1.2 미만은 쓰지 않는다.
+    """
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    ctx.options |= _OP_LEGACY_SERVER_CONNECT
+    return ctx
+
+
 class PoliteFetcher:
     def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None,
-                 throttle: LocalThrottle | DbThrottle | None = None):
+                 throttle: LocalThrottle | DbThrottle | None = None,
+                 compat_transport: httpx.BaseTransport | None = None):
         self.s = settings
-        self._client = httpx.Client(
-            headers={"User-Agent": settings.user_agent, "Accept-Language": "ko,en;q=0.8"},
-            timeout=httpx.Timeout(settings.read_timeout, connect=settings.connect_timeout),
-            follow_redirects=False,
-            transport=transport,
-        )
+        self._client = self._make_client(transport)
+        # 호환 TLS 클라이언트는 처음 필요할 때 만든다. 테스트는 compat_transport로 두 클라이언트를 구분한다
+        self._compat_transport = compat_transport or transport
+        self._compat_client: httpx.Client | None = None
+        # 호환 컨텍스트로만 접속되는 호스트. 한 번 알아내면 fetcher 수명(워커 프로세스) 동안 바로 호환 클라이언트로 보낸다
+        self.compat_hosts: set[str] = set()
         # 워커 여러 대가 돌 때는 DbThrottle을 넘겨 도메인 간격을 공유한다
         self.throttle = throttle or LocalThrottle(settings.min_interval_seconds)
         self._robots: dict[str, tuple[float, urllib.robotparser.RobotFileParser | None, str]] = {}
         self.request_count = 0
 
+    def _make_client(self, transport: httpx.BaseTransport | None, verify: ssl.SSLContext | bool = True) -> httpx.Client:
+        return httpx.Client(
+            headers={"User-Agent": self.s.user_agent, "Accept-Language": "ko,en;q=0.8"},
+            timeout=httpx.Timeout(self.s.read_timeout, connect=self.s.connect_timeout),
+            follow_redirects=False,
+            transport=transport,
+            verify=verify,
+        )
+
+    def _compat(self) -> httpx.Client:
+        if self._compat_client is None:
+            self._compat_client = self._make_client(self._compat_transport, verify=compat_ssl_context())
+        return self._compat_client
+
     def close(self) -> None:
         self._client.close()
+        if self._compat_client is not None:
+            self._compat_client.close()
         self.throttle.close()
 
     # ------------------------------------------------------------------ robots
@@ -130,13 +164,18 @@ class PoliteFetcher:
             raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=url)
         self._guard_host(url)
 
+        host = urlsplit(url).hostname or ""
+        use_compat = host in self.compat_hosts
         attempt = 0
         while True:
             attempt += 1
             self._throttle(url)
+            client = self._compat() if use_compat else self._client
             try:
-                with self._client.stream("GET", url) as resp:
+                with client.stream("GET", url) as resp:
                     self.request_count += 1
+                    if use_compat:
+                        self.compat_hosts.add(host)
                     body = self._read_limited(resp)
                     page = Page(url=str(resp.url), status=resp.status_code,
                                 content_type=resp.headers.get("content-type", ""),
@@ -145,7 +184,17 @@ class PoliteFetcher:
                 if _is_dns_error(e):
                     raise CrawlFailure(Code.DNS_FAIL, url=url) from e
                 if _is_tls_error(e):
-                    raise CrawlFailure(Code.TLS_ERROR, url=url) from e
+                    if _is_cert_error(e):
+                        # 서버 인증서 자체가 문제(만료·체인·호스트명 불일치). 호환 설정으로 넘어가지 않는다
+                        raise CrawlFailure(Code.TLS_ERROR, f"인증서 검증 실패: {_ssl_detail(e)}", url=url) from e
+                    if self.s.tls_compat and not use_compat:
+                        # 구식 TLS 설정을 요구하는 서버일 수 있다: 호환 컨텍스트로 한 번만 다시 시도 (재시도 횟수에 안 셈)
+                        use_compat = True
+                        attempt -= 1
+                        continue
+                    detail = (f"구식 TLS 호환 설정(SECLEVEL=1, TLS 1.2+)으로도 실패: {_ssl_detail(e)}" if use_compat
+                              else f"TLS 핸드셰이크 실패 (호환 재시도 꺼짐): {_ssl_detail(e)}")
+                    raise CrawlFailure(Code.TLS_ERROR, f"보안 연결(TLS)에 실패했습니다. {detail}", url=url) from e
                 if attempt < self.s.max_retries:
                     self._backoff(attempt)
                     continue
@@ -289,5 +338,25 @@ def _is_dns_error(e: Exception) -> bool:
 
 
 def _is_tls_error(e: Exception) -> bool:
-    cause = e.__cause__ or e.__context__
-    return isinstance(cause, ssl.SSLError) or "ssl" in repr(e).lower() or "certificate" in repr(e).lower()
+    return any(isinstance(c, ssl.SSLError) for c in _causes(e)) or "ssl" in repr(e).lower() or "certificate" in repr(e).lower()
+
+
+def _is_cert_error(e: Exception) -> bool:
+    """인증서 검증 실패(만료·체인·호스트명 불일치)인지. httpx는 OpenSSL 메시지를 문자열로만 넘기기도 해서 본문도 본다."""
+    if any(isinstance(c, ssl.SSLCertVerificationError) for c in _causes(e)):
+        return True
+    text = repr(e).lower()
+    return "certificate_verify_failed" in text or "certificate verify failed" in text
+
+
+def _causes(e: BaseException) -> list[BaseException]:
+    out: list[BaseException] = []
+    cur: BaseException | None = e
+    while cur is not None and cur not in out and len(out) < 8:
+        out.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
+def _ssl_detail(e: Exception) -> str:
+    return str(e).strip()[:300] or type(e).__name__
