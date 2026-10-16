@@ -52,11 +52,18 @@ class DiscoveryResult:
     notes: list[str] = field(default_factory=list)
     domain: str = ""                               # 실제 수집 대상 호스트 (홈이 다른 호스트로 넘긴 경우 그곳)
     sample_dates: dict[str, str] = field(default_factory=dict)  # 샘플 URL → 목록·피드에 보인 날짜 (상세에 없을 때 씀)
+    # 추출 셀렉터 {title, date, body, attachment}. 비어 있으면 메타·휴리스틱으로 뽑는다. LLM 레시피가 채운다
+    selectors: dict = field(default_factory=dict)
+    date_format: str | None = None                 # 상세 페이지 날짜 텍스트의 strptime 형식 (LLM 레시피)
+    recipe_source: str = "heuristic"               # heuristic | llm
+    recipe_notes: str = ""                         # LLM이 남긴 설명
+    llm_model: str | None = None                   # "제공자 모델" (recipe_source=llm일 때)
 
     def to_config(self) -> dict:
         return {"method": self.method, "hubs": self.hubs, "article_pattern": self.article_pattern,
                 "sections": self.sections, "excluded_sections": self.excluded_sections,
-                "site_domain": self.domain}
+                "site_domain": self.domain, "selectors": self.selectors, "date_format": self.date_format,
+                "recipe_source": self.recipe_source, "recipe_notes": self.recipe_notes, "llm_model": self.llm_model}
 
 
 # ---------------------------------------------------------------------- URL 서명
@@ -205,6 +212,9 @@ class Discoverer:
         self.pages = 0
         self.notes: list[str] = []
         self.hints: dict[str, str] = {}  # 후보 URL → 목록·피드에서 본 날짜
+        self.home = None                  # 홈 페이지(Page). LLM 레시피 생성이 다시 받지 않고 쓴다
+        self.sections: list[dict] = []
+        self.excluded: list[str] = []
 
     def _get(self, url: str):
         if self.pages >= self.max_pages:
@@ -243,6 +253,7 @@ class Discoverer:
         home_links = [u for u, _ in home_entries]
         sections = self._sections(home.text, home.url)
         excluded = self._excluded(sections)
+        self.home, self.sections, self.excluded = home, sections, excluded
 
         # 1. RSS
         feeds = self._find_feeds(home.text, home.url)

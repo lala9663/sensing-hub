@@ -38,6 +38,13 @@ services:
     environment:
       SENSING_DB_DSN: postgresql://sensing:sensing@db:5432/sensing
       SENSING_MIN_INTERVAL: "2"
+      # 등록 시 LLM 레시피 생성 (비우면 휴리스틱 탐색만). none | anthropic | openai — README 워커 환경 변수 참고
+      SENSING_LLM_PROVIDER: ${SENSING_LLM_PROVIDER:-}
+      SENSING_LLM_MODEL: ${SENSING_LLM_MODEL:-}
+      SENSING_LLM_BASE_URL: ${SENSING_LLM_BASE_URL:-}
+      SENSING_LLM_API_KEY: ${SENSING_LLM_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       # 사내 프록시가 있으면 지정한다
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       HTTP_PROXY: ${HTTP_PROXY:-}

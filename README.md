@@ -61,11 +61,41 @@ createdb sensing   # 사용자/비밀번호 sensing/sensing 기준 (application.
 cd backend && ./gradlew bootRun
 
 # worker
-cd worker && pip install -e ".[dev,extract]"
+cd worker && pip install -e ".[dev,extract,llm-anthropic]"
 SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worker
 ```
 
 사내망처럼 프록시로만 외부에 나가는 환경이면 워커에 `HTTPS_PROXY`를 지정합니다.
+
+### 워커 환경 변수 (LLM 레시피)
+
+사이트를 등록하면 워커가 홈과 샘플 기사 페이지를 LLM에 보여 주고, LLM이 허브·기사 URL 서명·추출 셀렉터를 JSON 레시피로 써냅니다.
+레시피는 스키마 검증 → 셀렉터 문법·서명 형식 검사 → 허브에서 서명에 맞는 링크 3개 이상 → 기존 샘플 5건 품질 검사를 모두
+통과해야 설정 버전(`recipe_source: "llm"`, `selectors`)으로 저장되고, 아니면 휴리스틱 탐색 결과를 씁니다.
+LLM 장애는 경고만 남기고 휴리스틱으로 진행하므로 LLM이 멈춰도 등록은 실패하지 않습니다. 기본값은 LLM을 쓰지 않는 것입니다.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_LLM_PROVIDER` | `none` | `none`(휴리스틱만) \| `anthropic`(Claude API, 선택 의존성 `llm-anthropic`) \| `openai`(OpenAI 호환 `chat/completions`: vLLM·Ollama 등 사내 반입 모델) |
+| `SENSING_LLM_MODEL` | `claude-opus-5-5` | 모델 이름. `openai`면 서버에 올린 모델 이름을 반드시 지정 |
+| `SENSING_LLM_BASE_URL` | (없음) | `openai` 제공자의 주소. `{base_url}/chat/completions`로 POST한다 |
+| `SENSING_LLM_API_KEY` | (없음) | `openai` 제공자의 키 (`Authorization: Bearer`). 비우면 헤더를 보내지 않는다 (로컬 vLLM·Ollama) |
+| `ANTHROPIC_API_KEY` | (없음) | `anthropic` 제공자의 키. 게이트웨이를 거치면 `ANTHROPIC_BASE_URL`도 지정 |
+| `SENSING_LLM_FALLBACKS` | `true` | `anthropic`: 안전 분류기가 거절하면 서버가 다른 모델로 대신 답하게 한다 (`false`면 끈다) |
+| `SENSING_LLM_MAX_SAMPLE_PAGES` / `SENSING_LLM_PAGE_CHARS` / `SENSING_LLM_TIMEOUT` | `5` / `30000` / `120` | LLM에 보여 줄 샘플 페이지 수, 페이지당 글자 수 상한(script·style·svg 제거 후), 요청 제한 시간(초) |
+
+```bash
+# Claude
+SENSING_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... sensing-worker
+# Ollama (로컬, 키 없음)
+SENSING_LLM_PROVIDER=openai SENSING_LLM_BASE_URL=http://localhost:11434/v1 SENSING_LLM_MODEL=qwen2.5:14b sensing-worker
+# vLLM (사내 서버)
+SENSING_LLM_PROVIDER=openai SENSING_LLM_BASE_URL=http://vllm:8000/v1 SENSING_LLM_MODEL=Qwen/Qwen2.5-32B-Instruct SENSING_LLM_API_KEY=... sensing-worker
+```
+
+JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`json_schema`)를 지원하면 힌트로 쓰되, 응답은 항상 우리 쪽에서 JSON을 꺼내
+스키마를 검증하고, 실패하면 오류 메시지를 붙여 한 번만 다시 요청합니다. OpenAI 호환 서버가 `response_format`을 400으로 거부하면
+`json_object` → 없음 순으로 낮춰 다시 보냅니다. 측정 도구(`sensing-discovery-eval`)도 같은 변수를 읽고 결과 표에 레시피 출처를 표시합니다.
 
 ### API 맛보기
 
@@ -99,7 +129,9 @@ worker/    Python 수집 워커
   src/sensing_worker/
     fetcher.py    수집 하네스 HTTP 계층: 간격·robots·재시도·차단 분류·내부망 차단
     discovery.py  자동 탐색: RSS → 사이트맵 → 링크 패턴 (CMS 패턴 라이브러리)
-    extract.py    기사 추출: og/article/JSON-LD 메타 + 본문 + 첨부 링크
+    recipe.py     LLM 레시피: 홈·샘플 페이지 → 허브·서명·셀렉터 JSON → 검증 → 품질 검사
+    llm.py        LLM 클라이언트 (Claude · OpenAI 호환 · 없음), JSON 꺼내기·스키마 검증·재요청
+    extract.py    기사 추출: og/article/JSON-LD 메타 + 본문 + 첨부 링크 (설정 selectors 우선)
     policy.py     사이트 유형 판정, 기본값, 품질 검사
     jobs.py       ONBOARD / CRAWL 작업
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전
@@ -142,6 +174,7 @@ M1에서 바로 할 일:
     영숫자 식별자(`ATCL6fd477428`) 패턴화, 사이트맵 `lastmod` 최신순, 메뉴 이름(보도자료·공지)으로 게시판 찾기,
     후보를 유력한 순서로 품질 검사해 첫 합격 채택, 목록 행의 날짜를 상세에 넘기기, 게시판 제목·등록일·스크립트 첨부 추출,
     자기 하위 페이지로 링크하는 목록 페이지는 기사로 보지 않기, 공공기관은 본문 대신 첨부가 있어도 통과
+- [x] 등록 시 LLM 레시피 생성 (`SENSING_LLM_PROVIDER`: Claude 또는 OpenAI 호환 API, 스키마·샘플 품질 검사를 통과한 것만 설정으로 저장, 실패·장애 시 휴리스틱)
 
 ## 원칙
 

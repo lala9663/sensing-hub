@@ -45,3 +45,16 @@ class Settings:
     # 실패 증거(응답 HTML 일부) 저장 위치와 보관 기간
     evidence_dir: str = field(default_factory=lambda: os.getenv("SENSING_EVIDENCE_DIR", "./data/evidence"))
     evidence_retention_days: int = field(default_factory=lambda: int(os.getenv("SENSING_EVIDENCE_DAYS", "30")))
+    # 등록 시 LLM이 수집 레시피(허브·기사 패턴·셀렉터)를 만들게 할지. none(기본) | anthropic | openai(OpenAI 호환 API)
+    llm_provider: str = field(default_factory=lambda: os.getenv("SENSING_LLM_PROVIDER", "none"))
+    llm_model: str = field(default_factory=lambda: os.getenv("SENSING_LLM_MODEL", "claude-opus-5-5"))
+    # openai 제공자의 주소 (예: http://localhost:11434/v1, http://vllm:8000/v1). anthropic은 ANTHROPIC_BASE_URL을 쓴다
+    llm_base_url: str = field(default_factory=lambda: os.getenv("SENSING_LLM_BASE_URL", ""))
+    # openai 제공자의 키. 비어 있으면 Authorization 헤더를 보내지 않는다 (로컬 vLLM·Ollama). anthropic은 ANTHROPIC_API_KEY
+    llm_api_key: str = field(default_factory=lambda: os.getenv("SENSING_LLM_API_KEY", ""))
+    # anthropic: 안전 분류기가 거절하면 서버가 다른 모델로 대신 답하게 한다
+    llm_fallbacks: bool = field(default_factory=lambda: _bool("SENSING_LLM_FALLBACKS", True))
+    # LLM에 보여 줄 샘플 기사 페이지 수와 페이지당 글자 수 상한, 요청 제한 시간
+    llm_max_sample_pages: int = field(default_factory=lambda: int(os.getenv("SENSING_LLM_MAX_SAMPLE_PAGES", "5")))
+    llm_page_chars: int = field(default_factory=lambda: int(os.getenv("SENSING_LLM_PAGE_CHARS", "30000")))
+    llm_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_LLM_TIMEOUT", "120")))

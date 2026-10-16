@@ -1,8 +1,12 @@
+import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
+from fakellm import FakeLlm, portal_recipe
 from sensing_worker.codes import Code, CrawlFailure
 from sensing_worker.config import Settings
 from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, parse_sitemap, pattern_from_signature,
@@ -11,7 +15,10 @@ from sensing_worker.evidence import EvidenceStore
 from sensing_worker.extract import Article, extract_article, links_with_dates
 from sensing_worker.jobs import discover
 from sensing_worker.fetcher import Page, PoliteFetcher, client_redirect_target
+from sensing_worker.llm import (FALLBACK_BETA, AnthropicLlm, LlmUnavailable, NoLlm, OpenAiCompatLlm, extract_json,
+                                generate_recipe, make_llm, validate_schema)
 from sensing_worker.policy import defaults_for, guess_site_type, passes_quality
+from sensing_worker.recipe import RECIPE_SCHEMA, clean_html, quick_check
 from sensing_worker.throttle import LocalThrottle, throttle_key
 
 
@@ -175,6 +182,7 @@ def test_discovery_eval_classifies_sites_like_onboarding():
     try:
         ok = evaluate_site(news.base + "/news/articleView.html?idxno=101", settings)
         assert ok.outcome == "OK" and ok.method == "STATIC" and ok.site_type == "NEWS" and ok.requests > 0
+        assert ok.recipe_source == "heuristic"                      # LLM 설정이 없으면 휴리스틱
         assert ok.url == news.base                                   # 기사 주소를 넣어도 사이트 단위로 본다
         bad = evaluate_site(blocked.base, settings)
         assert bad.outcome == "BLOCKED" and bad.code == "BOT_CHALLENGE"
@@ -356,3 +364,254 @@ def test_board_page_linking_to_its_posts_is_hub_like():
     assert not passes_quality([art] * 5, attachments_ok=True)[0]
     post = f'<html><head><title>글 1</title></head><body><a href="/kor/article/ATCL1">목록</a><p>{"본문 " * 100}</p></body></html>'
     assert not extract_article(post, "https://m.go.kr/kor/article/ATCL1/1001/view?mno=", date_hint="2026-10-15").is_hub_like
+
+
+# ---------------------------------------------------------------------- LLM 레시피
+
+def test_extract_json_from_fenced_or_chatty_response():
+    fenced = '물론입니다. 레시피는 다음과 같습니다.\n```json\n{"a": 1, "b": [1, 2]}\n```\n도움이 되길 바랍니다.'
+    assert extract_json(fenced) == {"a": 1, "b": [1, 2]}
+    chatty = 'Here you go: {"hubs": ["https://x"], "n": {"k": "v}"}} trailing } text'
+    assert extract_json(chatty) == {"hubs": ["https://x"], "n": {"k": "v}"}}
+    with pytest.raises(ValueError):
+        extract_json("JSON을 만들 수 없습니다.")
+    with pytest.raises(ValueError):
+        extract_json("[1, 2, 3]")
+
+
+def test_schema_validation_without_jsonschema():
+    good = json.loads(portal_recipe("https://p.go.kr"))
+    assert validate_schema(good, RECIPE_SCHEMA) == []
+    bad = {**good, "extra": 1, "selectors": {"title": 3, "date": None}, "hubs": "https://p.go.kr/"}
+    del bad["notes"]
+    errors = validate_schema(bad, RECIPE_SCHEMA)
+    assert any("$.notes" in e for e in errors) and any("$.extra" in e for e in errors)
+    assert any("$.hubs" in e and "array" in e for e in errors)
+    assert any("$.selectors.title" in e for e in errors) and any("$.selectors.body" in e for e in errors)
+
+
+def test_quick_check_rejects_bad_selector_signature_and_foreign_hub():
+    data = json.loads(portal_recipe("https://p.go.kr", article_signature="/portal/bbs/view.do",
+                                    selectors={"title": "div[[", "date": None, "body": None, "attachment": None},
+                                    hubs=["https://other.com/list", "/relative"]))
+    errors = quick_check(data, "p.go.kr")
+    assert any("selectors.title" in e for e in errors)
+    assert any("article_signature" in e and "{n}" in e for e in errors)
+    assert any("같은 사이트" in e for e in errors) and any("절대 URL" in e for e in errors)
+    assert quick_check(json.loads(portal_recipe("https://p.go.kr")), "p.go.kr") == []
+
+
+def test_generate_recipe_retries_once_with_validation_errors():
+    schema = {"type": "object", "additionalProperties": False, "required": ["x"], "properties": {"x": {"type": "string"}}}
+    llm = FakeLlm(['{"x": 1}', '{"x": "ok"}'])
+    gen = generate_recipe(llm, "sys", "user", schema)
+    assert gen.data == {"x": "ok"} and gen.attempts == 2
+    assert "[이전 응답의 문제]" in llm.calls[1][1] and "$.x" in llm.calls[1][1]
+    assert gen.usage == {"input_tokens": 2000, "output_tokens": 100}
+
+    llm = FakeLlm(['{"x": "a"}', '{"x": "b"}', '{"x": "c"}'])
+    gen = generate_recipe(llm, "sys", "user", schema, check=lambda d: [] if d["x"] == "c" else ["x는 c여야 합니다"])
+    assert gen.data is None and gen.attempts == 2 and gen.errors == ["x는 c여야 합니다"]   # 한 번만 재요청
+
+    with pytest.raises(LlmUnavailable):
+        generate_recipe(FakeLlm(error=LlmUnavailable("down")), "sys", "user", schema)
+
+
+def test_clean_html_strips_scripts_and_truncates():
+    html = "<html><head><script>var a=1</script><style>p{}</style></head><body><svg><path/></svg><!-- c --><p>본문   글</p></body></html>"
+    text = clean_html(html, 1000)
+    assert "var a" not in text and "svg" not in text and "<!--" not in text and "<p>본문 글</p>" in text
+    assert clean_html("<p>" + "x" * 100 + "</p>", 20).endswith("...(잘림)")
+
+
+def _portal_site():
+    from fakesite import Site, portal_cms_routes
+    return Site(portal_cms_routes())
+
+
+def test_llm_recipe_rescues_site_that_heuristics_reject():
+    site = _portal_site()
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    settings = Settings(min_interval_seconds=0, allow_private_hosts=True)
+    try:
+        with pytest.raises(CrawlFailure) as e:
+            discover(f, "127.0.0.1", site.base, "ETC")               # 라벨 없는 날짜: 휴리스틱으로는 발행일을 못 찾는다
+        assert e.value.code == Code.QUALITY_FAILED
+
+        llm = FakeLlm([portal_recipe(site.base)])
+        steps: list[str] = []
+        result, detail = discover(f, "127.0.0.1", site.base, "ETC", llm=llm, settings=settings, progress=steps.append)
+        assert result.recipe_source == "llm" and result.method == "STATIC" and result.llm_model == "fake fake-1"
+        assert result.hubs == [f"{site.base}/portal/bbs/list.do?bbsId=B01"]
+        assert result.article_pattern["signature"] == "/portal/bbs/view.do?bbsId=*&nttId={n}"
+        assert result.selectors == {"title": ".headline-area strong", "date": ".reg", "body": ".cont-area"}
+        assert result.date_format == "%Y.%m.%d" and len(result.sample_urls) >= 5
+        assert "5건 통과" in detail and "fake fake-1" in detail and "토큰 입력 1,000" in detail
+        assert steps == ["사이트 구조를 분석해 수집 방법을 만드는 중입니다."]
+        config = result.to_config()
+        assert config["recipe_source"] == "llm" and config["selectors"]["title"] == ".headline-area strong"
+        # LLM에 보여 준 입력: 홈 HTML, 샘플 페이지, 휴리스틱 후보와 서명 통계
+        system, user, schema = llm.calls[0]
+        assert schema is RECIPE_SCHEMA and "JSON 객체만" in system
+        assert "[홈 페이지 HTML" in user and "[샘플 페이지 1" in user and "/portal/bbs/view.do?bbsId=*&nttId={n}" in user
+        assert "<script" not in user
+    finally:
+        f.close()
+        site.close()
+
+
+def test_llm_recipe_with_too_few_matching_links_is_rejected():
+    site = _portal_site()
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    settings = Settings(min_interval_seconds=0, allow_private_hosts=True)
+    try:
+        llm = FakeLlm([portal_recipe(site.base, article_signature="/portal/notice/{n}")])
+        with pytest.raises(CrawlFailure) as e:
+            discover(f, "127.0.0.1", site.base, "ETC", llm=llm, settings=settings)   # 레시피 거부 → 휴리스틱 불합격 그대로
+        assert e.value.code == Code.QUALITY_FAILED and len(llm.calls) == 1
+    finally:
+        f.close()
+        site.close()
+
+
+def test_llm_recipe_is_requested_again_after_invalid_selector():
+    site = _portal_site()
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    settings = Settings(min_interval_seconds=0, allow_private_hosts=True)
+    try:
+        bad = portal_recipe(site.base, selectors={"title": "div[[", "date": ".reg", "body": None, "attachment": None})
+        llm = FakeLlm(["```json\n" + bad + "\n```", portal_recipe(site.base)])
+        result, _ = discover(f, "127.0.0.1", site.base, "ETC", llm=llm, settings=settings)
+        assert result.recipe_source == "llm" and len(llm.calls) == 2
+        assert "selectors.title" in llm.calls[1][1]
+    finally:
+        f.close()
+        site.close()
+
+
+def test_llm_outage_falls_back_to_heuristics():
+    from fakesite import Site, news_site_routes
+    site = Site(news_site_routes())
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    settings = Settings(min_interval_seconds=0, allow_private_hosts=True)
+    try:
+        llm = FakeLlm(error=LlmUnavailable("connection refused"))
+        result, detail = discover(f, "127.0.0.1", site.base, "NEWS", llm=llm, settings=settings)
+        assert result.recipe_source == "heuristic" and result.method == "STATIC" and result.selectors == {}
+        assert result.to_config()["recipe_source"] == "heuristic" and "LLM" not in detail
+        assert len(llm.calls) == 1
+        # NoLlm은 호출조차 하지 않는다
+        result, _ = discover(f, "127.0.0.1", site.base, "NEWS", llm=NoLlm(), settings=settings)
+        assert result.recipe_source == "heuristic"
+    finally:
+        f.close()
+        site.close()
+
+
+def test_make_llm_from_settings():
+    assert isinstance(make_llm(Settings()), NoLlm)
+    assert isinstance(make_llm(Settings(llm_provider="none")), NoLlm)
+    with pytest.raises(RuntimeError):
+        make_llm(Settings(llm_provider="openai", llm_base_url=""))        # 주소 없음
+    with pytest.raises(RuntimeError):
+        make_llm(Settings(llm_provider="bard"))
+    llm = make_llm(Settings(llm_provider="openai", llm_base_url="http://localhost:11434/v1/", llm_model="llama3"))
+    assert isinstance(llm, OpenAiCompatLlm) and llm.base_url == "http://localhost:11434/v1"
+
+
+def _anthropic_response(text: str, stop_reason: str = "end_turn"):
+    return SimpleNamespace(stop_reason=stop_reason, stop_details=SimpleNamespace(category="cyber"),
+                           content=[SimpleNamespace(type="text", text=text)],
+                           usage=SimpleNamespace(input_tokens=30, output_tokens=7))
+
+
+def test_anthropic_llm_uses_json_schema_output_and_fallbacks():
+    client = MagicMock()
+    client.beta.messages.create.return_value = _anthropic_response('{"ok": true}')
+    llm = AnthropicLlm(client=client)
+    assert llm.model == "claude-opus-5-5"
+    assert llm.complete("sys", "user", RECIPE_SCHEMA) == '{"ok": true}'
+    kw = client.beta.messages.create.call_args.kwargs
+    assert kw["model"] == "claude-opus-5-5" and kw["system"] == "sys" and kw["max_tokens"] == 16000
+    assert kw["messages"] == [{"role": "user", "content": "user"}]
+    assert kw["output_config"]["format"]["type"] == "json_schema" and kw["output_config"]["format"]["schema"] is RECIPE_SCHEMA
+    assert kw["fallbacks"] == "default" and kw["betas"] == [FALLBACK_BETA]
+    assert llm.last_usage == {"input_tokens": 30, "output_tokens": 7}
+    client.messages.create.assert_not_called()
+
+    # SENSING_LLM_FALLBACKS=false: 일반 Messages API, fallbacks·betas 없음
+    plain = MagicMock()
+    plain.messages.create.return_value = _anthropic_response("{}")
+    AnthropicLlm("claude-sonnet-5-5", fallbacks=False, client=plain).complete("s", "u", {"type": "object"})
+    kw = plain.messages.create.call_args.kwargs
+    assert kw["model"] == "claude-sonnet-5-5" and "fallbacks" not in kw and "betas" not in kw
+    assert kw["output_config"]["format"]["type"] == "json_schema"
+    plain.beta.messages.create.assert_not_called()
+
+    refusing = MagicMock()
+    refusing.beta.messages.create.return_value = _anthropic_response("", stop_reason="refusal")
+    with pytest.raises(LlmUnavailable):
+        AnthropicLlm(client=refusing).complete("s", "u", {"type": "object"})
+
+
+def test_openai_compat_llm_downgrades_response_format_on_400():
+    bodies: list[dict] = []
+    headers: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://vllm:8000/v1/chat/completions"
+        body = json.loads(request.content)
+        bodies.append(body)
+        headers.append(dict(request.headers))
+        fmt = body.get("response_format", {}).get("type")
+        if fmt in ("json_schema", "json_object"):
+            return httpx.Response(400, json={"error": {"message": f"response_format {fmt} is not supported"}})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": '{"x": 1}'}}],
+                                         "usage": {"prompt_tokens": 12, "completion_tokens": 3}})
+
+    llm = OpenAiCompatLlm("http://vllm:8000/v1/", "qwen", "secret-key", transport=httpx.MockTransport(handler))
+    assert llm.complete("sys", "user", RECIPE_SCHEMA) == '{"x": 1}'
+    assert [b.get("response_format", {}).get("type") for b in bodies] == ["json_schema", "json_object", None]
+    first = bodies[0]
+    assert first["model"] == "qwen" and first["temperature"] == 0
+    assert first["messages"] == [{"role": "system", "content": "sys"}, {"role": "user", "content": "user"}]
+    assert first["response_format"]["json_schema"] == {"name": "recipe", "schema": RECIPE_SCHEMA, "strict": True}
+    assert headers[0]["authorization"] == "Bearer secret-key"
+    assert llm.last_usage == {"input_tokens": 12, "output_tokens": 3}
+    # 한 번 내려간 단계를 기억해 다음 요청은 바로 통한다
+    bodies.clear()
+    llm.complete("sys", "user2", RECIPE_SCHEMA)
+    assert len(bodies) == 1 and "response_format" not in bodies[0]
+
+    # 키가 없으면 Authorization 헤더를 보내지 않는다 (로컬 Ollama·vLLM)
+    seen: list[httpx.Request] = []
+
+    def ok(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+    OpenAiCompatLlm("http://localhost:11434/v1", "llama3", "", transport=httpx.MockTransport(ok)).complete("s", "u", {})
+    assert "authorization" not in seen[0].headers and json.loads(seen[0].content)["response_format"]["type"] == "json_schema"
+
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+    with pytest.raises(LlmUnavailable):
+        OpenAiCompatLlm("http://localhost:11434/v1", "llama3", transport=httpx.MockTransport(down)).complete("s", "u", {})
+
+    def server_error(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+    with pytest.raises(LlmUnavailable):
+        OpenAiCompatLlm("http://localhost:11434/v1", "llama3", transport=httpx.MockTransport(server_error)).complete("s", "u", {})
+
+
+def test_extract_uses_recipe_selectors_and_date_format():
+    html = ('<html><head><title>테스트포털</title><meta property="og:title" content="테스트포털"></head><body>'
+            '<p class="headline-area"><strong>중소기업 지원 계획 발표</strong></p><p class="reg">2026.10.14</p>'
+            '<div class="cont-area"><p>' + "본문 " * 100 + "</p></div></body></html>")
+    plain = extract_article(html, "https://p.go.kr/portal/bbs/view.do?bbsId=B01&nttId=1")
+    assert plain.title == "테스트포털" and plain.published_at is None            # 셀렉터 없이는 사이트 이름·날짜 없음
+    art = extract_article(html, "https://p.go.kr/portal/bbs/view.do?bbsId=B01&nttId=1",
+                          {"title": ".headline-area strong", "date": ".reg", "body": ".cont-area"}, date_format="%Y.%m.%d")
+    assert art.title == "중소기업 지원 계획 발표"
+    assert art.published_at == datetime(2026, 10, 13, 15, 0, tzinfo=timezone.utc) and art.body_length >= 200
+    # 형식이 맞지 않으면 공통 해석으로 넘어간다
+    assert extract_article(html, "https://p.go.kr/x", {"date": ".reg"}, date_format="%d/%m/%Y").published_at is not None

@@ -55,7 +55,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install ".[dev,extract]"
+      - run: pip install ".[dev,extract,llm-anthropic]"
       - name: Test (unit + DB flow)
         env:
           SENSING_TEST_DSN: postgresql://sensing:sensing@localhost:5432/sensing_test

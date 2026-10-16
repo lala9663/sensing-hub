@@ -16,6 +16,7 @@ from .config import Settings
 from .db import Store
 from .fetcher import PoliteFetcher
 from .jobs import JobRunner
+from .llm import describe, make_llm
 from .throttle import DbThrottle
 
 log = logging.getLogger("sensing_worker")
@@ -63,9 +64,10 @@ def main(argv: list[str] | None = None) -> None:
     store = Store(settings.db_url)
     throttle = DbThrottle(settings.db_url, settings.min_interval_seconds) if settings.shared_throttle else None
     fetcher = PoliteFetcher(settings, throttle=throttle)
-    runner = JobRunner(store, fetcher, settings)
+    llm = make_llm(settings)   # 제공자 설정이 잘못됐으면(패키지 없음·주소 없음) 여기서 바로 멈춘다
+    runner = JobRunner(store, fetcher, settings, llm=llm)
     pruned = runner.evidence.prune()
-    log.info("worker %s started (evidence dirs pruned: %s)", settings.worker_id, pruned)
+    log.info("worker %s started (llm: %s, evidence dirs pruned: %s)", settings.worker_id, describe(llm), pruned)
     try:
         while True:
             status = process_one(store, runner, settings)

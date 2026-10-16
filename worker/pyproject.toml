@@ -16,6 +16,8 @@ dependencies = [
 extract = ["trafilatura>=1.12"]
 # 동적 수집 (M2)
 dynamic = ["playwright>=1.47"]
+# 등록 시 LLM 레시피 생성에 Claude를 쓸 때 (SENSING_LLM_PROVIDER=anthropic). OpenAI 호환 API는 추가 의존성이 없다
+llm-anthropic = ["anthropic>=1"]
 dev = ["pytest>=8.3"]
 
 [project.scripts]

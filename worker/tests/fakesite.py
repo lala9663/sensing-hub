@@ -172,3 +172,28 @@ def gov_board_js_routes() -> dict:
         <span><a class="down" href="javascript:void(0);" onclick="fn_download('{n}', '1', 'hwpx');">다운로드</a></span></li></ul></div>
         </div></body></html>""")
     return routes
+
+
+def portal_cms_routes(post_ids=range(1, 7)) -> dict:
+    """공공기관 포털(자체 CMS): 메타 태그와 <title>이 모두 사이트 이름이고, 글 제목은 .headline-area strong,
+    등록일은 라벨 없이 .reg에 "2026.10.14"로만 있다. 목록 행에도 날짜가 없어 휴리스틱으로는 발행일을 못 찾는다.
+    셀렉터를 아는 레시피(LLM)가 있어야 통과하는 사이트다."""
+    items = "".join(f'<li><a href="/portal/bbs/view.do?bbsId=B01&amp;nttId={i}">포털 보도자료 {i}번 안내</a></li>'
+                    for i in post_ids)
+    head = ('<head><title>테스트포털</title><meta property="og:title" content="테스트포털">'
+            '<meta property="og:site_name" content="테스트포털"></head>')
+    routes = {
+        "/": (200, "text/html; charset=utf-8",
+              f'<html>{head}<body><nav><a href="/portal/bbs/list.do?bbsId=B01">보도자료</a>'
+              f'<a href="/portal/intro.do">기관 소개</a></nav><ul>{items}</ul></body></html>'),
+        "/robots.txt": (404, "text/plain", ""),
+        "/portal/bbs/list.do": (200, "text/html; charset=utf-8", f"<html>{head}<body><ul>{items}</ul></body></html>"),
+        "/portal/intro.do": (200, "text/html; charset=utf-8", f"<html>{head}<body><p>소개</p></body></html>"),
+    }
+    for i in post_ids:
+        # 정규 주소는 쿼리 키를 정렬하므로 경로 키도 그 순서로 둔다
+        routes[f"/portal/bbs/view.do?bbsId=B01&nttId={i}"] = (200, "text/html; charset=utf-8", f"""<html>{head}<body>
+        <div class="post"><p class="headline-area"><strong>포털 보도자료 {i}번 안내</strong></p>
+        <p class="reg">{(datetime.now(timezone(timedelta(hours=9))) - timedelta(days=i)).strftime("%Y.%m.%d")}</p>
+        <div class="cont-area"><p>{BODY}</p></div></div></body></html>""")
+    return routes

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -14,7 +15,11 @@ from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, look
 from .evidence import EvidenceStore
 from .extract import extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, PoliteFetcher
+from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
 from .policy import defaults_for, guess_site_type, passes_quality
+from .recipe import propose_recipe
+
+LLM_STEP_MESSAGE = "사이트 구조를 분석해 수집 방법을 만드는 중입니다."
 
 log = logging.getLogger(__name__)
 
@@ -31,11 +36,13 @@ class CrawlStats:
 
 class JobRunner:
     def __init__(self, store: Store, fetcher: PoliteFetcher, settings: Settings,
-                 evidence: EvidenceStore | None = None):
+                 evidence: EvidenceStore | None = None, llm: LlmClient | None = None):
         self.db = store
         self.f = fetcher
         self.s = settings
         self.evidence = evidence or EvidenceStore(settings.evidence_dir, settings.evidence_retention_days)
+        # 등록 시 수집 레시피를 쓰는 LLM. 설정이 없으면 NoLlm → 휴리스틱 탐색만 한다
+        self.llm = llm if llm is not None else make_llm(settings)
 
     def _record(self, job: Job, failure: CrawlFailure) -> None:
         """실패를 기록한다. 응답 본문이 붙어 있으면 증거 파일로 남기고 경로를 함께 적는다."""
@@ -67,17 +74,24 @@ class JobRunner:
         self.db.update_site(source["site_id"], robots_status=probe.robots, site_type=site_type,
                             ai_restricted=probe.ai_blocked, risk_flags={"ai_bots_blocked": probe.ai_blocked})
 
-        # 2) 자동 탐색 + 3) 품질 검사: 후보를 유력한 순서로 샘플 검사해 첫 합격을 쓴다
+        # 2) 자동 탐색 + 3) 품질 검사: 후보를 유력한 순서로 샘플 검사해 첫 합격을 쓴다.
+        #    LLM이 설정돼 있으면 홈·샘플 페이지로 레시피를 쓰게 하고, 같은 품질 검사를 통과하면 그것을 쓴다
         self.db.update_registration(job.source_id, step="DISCOVERY",
                                     message="기사 입구와 주소 패턴을 찾고 샘플 기사로 품질을 검사하는 중입니다.")
-        result, detail = discover(self.f, domain, base_url, site_type)
+        result, detail = discover(
+            self.f, domain, base_url, site_type, llm=self.llm, settings=self.s,
+            progress=lambda msg: self.db.update_registration(job.source_id, step="DISCOVERY", message=msg))
 
-        # 4) 기본값 적용 → 설정 새 버전 → ACTIVE
+        # 4) 기본값 적용 → 설정 새 버전 → ACTIVE (레시피의 selectors·recipe_source도 설정에 들어간다)
         defaults = defaults_for(site_type)
         config = {**result.to_config(), "store_scope": defaults["store_scope"],
-                  "collect_attachments": defaults["collect_attachments"], "selectors": {}}
-        note = "자동 탐색으로 생성" if source["config_version"] is None else "자동 탐색 다시 실행"
-        config_id, version = self.db.activate_new_config(job.source_id, config, f"{note} ({detail})",
+                  "collect_attachments": defaults["collect_attachments"]}
+        first = source["config_version"] is None
+        if result.recipe_source == "llm":
+            note = "LLM 레시피로 생성" if first else "LLM 레시피 다시 생성"
+        else:
+            note = "자동 탐색으로 생성" if first else "자동 탐색 다시 실행"
+        config_id, version = self.db.activate_new_config(job.source_id, config, f"{note} ({detail})"[:500],
                                                          defaults["interval_minutes"])
 
         # 5) 첫 수집: 허브(피드·목록 첫 페이지)에 보이는 최신 기사만 가져온다
@@ -90,8 +104,8 @@ class JobRunner:
             job.source_id, status="COMPLETED", step="DONE",
             message=f"등록 완료. 기사 {stats.new}건을 수집했고 {defaults['interval_minutes']}분마다 업데이트합니다."
                     + (" 언론사로 분류되어 제목·링크·발행일만 저장합니다." if defaults["store_scope"] == "TITLE_LINK" else ""))
-        log.info("onboard ok source=%s domain=%s method=%s v%s new=%s", job.source_id, domain, result.method,
-                 version, stats.new)
+        log.info("onboard ok source=%s domain=%s method=%s recipe=%s v%s new=%s", job.source_id, domain,
+                 result.method, result.recipe_source, version, stats.new)
         return status
 
     # ------------------------------------------------------------------ CRAWL
@@ -169,7 +183,8 @@ class JobRunner:
                 self._record(job, e)
                 stats.errors += 1
                 continue
-            art = extract_article(page.text, page.url, config.get("selectors"), date_hint=hints.get(url))
+            art = extract_article(page.text, page.url, config.get("selectors"), date_hint=hints.get(url),
+                                  date_format=config.get("date_format"))
             if not art.title or not art.published_at:
                 stats.field_missing += 1
                 missing_sample = missing_sample or (page.url, page.text[:EVIDENCE_CHARS])
@@ -242,12 +257,14 @@ def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site
     """샘플 5건으로 품질 검사. 통과하면 설명을 돌려주고, 아니면 QUALITY_FAILED.
 
     언론사가 아니면 본문 대신 첨부(보도자료 HWP·PDF)가 있어도 샘플로 인정한다.
+    후보에 셀렉터(LLM 레시피)가 있으면 수집 때와 똑같이 그 셀렉터로 뽑아 검사한다.
     """
     samples = []
     for url in result.sample_urls[:5]:
         try:
             page = f.get(url)
-            samples.append(extract_article(page.text, page.url, date_hint=result.sample_dates.get(url)))
+            samples.append(extract_article(page.text, page.url, result.selectors, date_hint=result.sample_dates.get(url),
+                                           date_format=result.date_format))
         except CrawlFailure as e:
             if e.blocking:
                 raise
@@ -258,21 +275,30 @@ def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site
     return detail
 
 
-def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str,
-             max_tries: int = 6) -> tuple[DiscoveryResult, str]:
+def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_tries: int = 6,
+             llm: LlmClient | None = None, settings: Settings | None = None,
+             progress: Callable[[str], None] | None = None) -> tuple[DiscoveryResult, str]:
     """자동 탐색 후보를 유력한 순서로 품질 검사해 첫 합격 (결과, 검사 설명)을 돌려준다.
 
-    후보가 하나도 없으면 DISCOVERY_FAILED, 있었지만 모두 불합격이면 첫 후보의 QUALITY_FAILED를 낸다.
+    LLM이 설정돼 있으면(NoLlm이 아니면) 휴리스틱 결과와 관계없이 레시피 생성을 한 번 시도하고, 그 레시피가 같은
+    품질 검사를 통과하면 그것을 쓴다. 아니면 휴리스틱 합격 후보로 돌아간다. LLM 장애(LlmUnavailable)는 경고만
+    남기고 휴리스틱으로 진행한다 — LLM이 멈췄다고 등록이 실패해서는 안 된다.
+    둘 다 없으면: 후보가 하나도 없었으면 DISCOVERY_FAILED, 있었지만 모두 불합격이면 첫 후보의 QUALITY_FAILED.
     """
     tried: set[str] = set()
     first_failure: CrawlFailure | None = None
-    for result in Discoverer(f, domain, base_url).candidates():
+    seen: list[DiscoveryResult] = []
+    passed: tuple[DiscoveryResult, str] | None = None
+    disc = Discoverer(f, domain, base_url)
+    for result in disc.candidates():
         sig = result.article_pattern.get("signature") or result.article_pattern["path"]
         if sig in tried:
             continue
         tried.add(sig)
+        seen.append(result)
         try:
-            return result, check_quality(f, result, base_url, site_type)
+            passed = (result, check_quality(f, result, base_url, site_type))
+            break
         except CrawlFailure as e:
             if e.code != Code.QUALITY_FAILED:
                 raise
@@ -280,6 +306,25 @@ def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str,
             first_failure = first_failure or e
         if len(tried) >= max_tries:
             break
+
+    if llm is not None and not isinstance(llm, NoLlm):
+        if progress:
+            progress(LLM_STEP_MESSAGE)
+        try:
+            outcome = propose_recipe(f, llm, settings or Settings(), disc, seen, site_type,
+                                     quality=lambda r: check_quality(f, r, base_url, site_type))
+        except LlmUnavailable as e:
+            log.warning("LLM unavailable, continuing with heuristics domain=%s: %s", domain, e)
+        else:
+            if outcome.result is not None:
+                log.info("llm recipe accepted domain=%s pattern=%s hubs=%s selectors=%s", domain,
+                         outcome.result.article_pattern.get("signature"), len(outcome.result.hubs),
+                         sorted(outcome.result.selectors))
+                return outcome.result, outcome.detail
+            log.info("llm recipe rejected domain=%s: %s", domain, outcome.detail)
+
+    if passed:
+        return passed
     if first_failure:
         raise CrawlFailure(Code.QUALITY_FAILED, f"{first_failure} [후보 {len(tried)}개 검사]",
                            url=base_url, stage="DISCOVERY")

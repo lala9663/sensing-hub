@@ -12,7 +12,9 @@ import pathlib
 import psycopg
 import pytest
 
-from fakesite import Site, blocked_site_routes, gov_site_routes, news_site_routes, robots_blocked_routes
+from fakellm import FakeLlm, portal_recipe
+from fakesite import (Site, blocked_site_routes, gov_site_routes, news_site_routes, portal_cms_routes,
+                      robots_blocked_routes)
 from sensing_worker.config import Settings
 from sensing_worker.db import Store
 from sensing_worker.fetcher import PoliteFetcher
@@ -243,3 +245,41 @@ def test_no_anomaly_without_enough_history(env):
     process_one(store, runner, settings)
     shrink_hubs(site, range(101, 102))
     assert crawl(store, runner, settings, source_id) == "SUCCESS"    # 기준 이력 1회뿐 → 판단 보류
+
+
+def test_llm_recipe_is_saved_as_config_and_used_by_first_crawl(env):
+    store, runner, settings, sites = env
+    site = Site(portal_cms_routes()); sites.append(site)
+    llm = FakeLlm([portal_recipe(site.base)])
+    runner = JobRunner(store, runner.f, settings, evidence=runner.evidence, llm=llm)   # 생성자 주입
+    source_id = register(store, site.base)
+
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    src = q(store, "SELECT s.status, s.method, v.config, v.change_note FROM source s "
+                   "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", source_id)
+    assert src["status"] == "ACTIVE" and src["method"] == "STATIC"
+    cfg = src["config"]
+    assert cfg["recipe_source"] == "llm" and cfg["llm_model"] == "fake fake-1"
+    assert cfg["selectors"] == {"title": ".headline-area strong", "date": ".reg", "body": ".cont-area"}
+    assert cfg["date_format"] == "%Y.%m.%d" and cfg["recipe_notes"].startswith("보도자료 목록이 허브")
+    assert cfg["hubs"] == [f"{site.base}/portal/bbs/list.do?bbsId=B01"]
+    assert src["change_note"].startswith("LLM 레시피로 생성") and "fake fake-1" in src["change_note"]
+    assert "토큰 입력 1,000" in src["change_note"]
+
+    docs = store.conn.execute("SELECT title, published_at, body_text FROM document ORDER BY url").fetchall()
+    assert len(docs) == 6
+    assert all(d["title"].startswith("포털 보도자료") and d["published_at"] is not None for d in docs)   # 셀렉터로 뽑은 제목·날짜
+    assert all(len(d["body_text"]) > 200 for d in docs)
+    reg = q(store, "SELECT status, result_message FROM registration_request")
+    assert reg["status"] == "COMPLETED" and "6건" in reg["result_message"]
+    assert len(llm.calls) == 1
+
+
+def test_same_site_goes_to_review_without_llm(env):
+    store, runner, settings, sites = env
+    site = Site(portal_cms_routes()); sites.append(site)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "FAILED"                    # NoLlm: 날짜를 못 찾아 품질 불합격
+    assert q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)["status_reason"] == "QUALITY_FAILED"
+    assert q(store, "SELECT status FROM registration_request")["status"] == "REVIEW"

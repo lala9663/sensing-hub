@@ -24,6 +24,7 @@ from .codes import CrawlFailure
 from .config import Settings
 from .fetcher import PoliteFetcher
 from .jobs import discover, probe_site
+from .llm import LlmClient, make_llm
 
 # 온보딩 결과와 같은 분류: OK(자동 등록) | REVIEW(관리자 큐) | BLOCKED(등록 불가) | ERROR(그 밖의 실패)
 REVIEW_CODES = {"DISCOVERY_FAILED", "QUALITY_FAILED"}
@@ -42,22 +43,25 @@ class SiteResult:
     quality: str | None = None
     requests: int = 0
     seconds: float = 0.0
+    recipe_source: str = "heuristic"      # heuristic | llm (LLM 설정이 없으면 항상 heuristic)
 
 
-def evaluate_site(url: str, settings: Settings) -> SiteResult:
+def evaluate_site(url: str, settings: Settings, llm: LlmClient | None = None) -> SiteResult:
     url = url if "://" in url else "https://" + url
     parts = urlsplit(url)
     base_url = f"{parts.scheme}://{parts.netloc}"
     domain = (parts.hostname or "").lower().removeprefix("www.")
     fetcher = PoliteFetcher(settings)
+    llm = llm if llm is not None else make_llm(settings)
     started = time.monotonic()
     result = SiteResult(url=base_url, outcome="ERROR")
     try:
         probe = probe_site(fetcher, domain, base_url)
         result.site_type = probe.site_type
-        found, result.quality = discover(fetcher, domain, base_url, probe.site_type)  # 온보딩과 같은 판단
+        found, result.quality = discover(fetcher, domain, base_url, probe.site_type, llm=llm, settings=settings)  # 온보딩과 같은 판단
         result.method, result.hubs = found.method, len(found.hubs)
         result.pattern = found.article_pattern.get("signature") or found.article_pattern.get("path")
+        result.recipe_source = found.recipe_source
         result.outcome = "OK"
     except CrawlFailure as e:
         result.code, result.message = e.code.value, str(e)
@@ -89,11 +93,12 @@ def read_sites(args: list[str]) -> list[str]:
 
 
 def summarize(results: list[SiteResult], target: int | None = None) -> str:
-    lines = [f"{'결과':<7}{'사이트':<34}{'방식':<9}{'유형':<8}{'요청':>5}{'초':>7}  비고"]
+    lines = [f"{'결과':<7}{'사이트':<34}{'방식':<9}{'레시피':<10}{'유형':<8}{'요청':>5}{'초':>7}  비고"]
     for r in results:
         note = r.quality if r.outcome == "OK" else f"{r.code}: {r.message}"
-        lines.append(f"{r.outcome:<7}{urlsplit(r.url).netloc[:33]:<34}{r.method or '-':<9}{r.site_type or '-':<8}"
-                     f"{r.requests:>5}{r.seconds:>7}  {note}")
+        recipe = r.recipe_source if r.outcome == "OK" else "-"
+        lines.append(f"{r.outcome:<7}{urlsplit(r.url).netloc[:33]:<34}{r.method or '-':<9}{recipe:<10}"
+                     f"{r.site_type or '-':<8}{r.requests:>5}{r.seconds:>7}  {note}")
     ok = sum(r.outcome == "OK" for r in results)
     goal = f" (목표 {target}곳: {'달성' if ok >= target else '미달'})" if target else ""
     lines.append(f"\n자동 등록 성공 {ok}/{len(results)}곳{goal}")
@@ -112,9 +117,10 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
     settings = Settings()
+    llm = make_llm(settings)   # 설정이 없으면 NoLlm: 온보딩과 같이 휴리스틱만 측정한다
     sites = read_sites(args.sites)
     with ThreadPoolExecutor(max_workers=max(1, args.parallel)) as pool:
-        results = list(pool.map(lambda s: evaluate_site(s, settings), sites))
+        results = list(pool.map(lambda s: evaluate_site(s, settings, llm), sites))
 
     print(summarize(results, args.target))
     if args.json:

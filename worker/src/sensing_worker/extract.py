@@ -55,8 +55,10 @@ class Article:
         return len(self.body or "")
 
 
-def extract_article(html: str, url: str, selectors: dict | None = None, date_hint: str | None = None) -> Article:
-    """date_hint: 목록 행이나 피드에서 본 날짜 문자열. 상세 페이지에 날짜가 없을 때만 쓴다 (공공기관 게시판에 흔하다)."""
+def extract_article(html: str, url: str, selectors: dict | None = None, date_hint: str | None = None,
+                    date_format: str | None = None) -> Article:
+    """date_hint: 목록 행이나 피드에서 본 날짜 문자열. 상세 페이지에 날짜가 없을 때만 쓴다 (공공기관 게시판에 흔하다).
+    date_format: 날짜 텍스트의 strptime 형식 (LLM 레시피). 맞지 않으면 공통 해석으로 넘어간다."""
     soup = BeautifulSoup(html, "lxml")
     selectors = selectors or {}
     art = Article(url=url)
@@ -78,7 +80,7 @@ def extract_article(html: str, url: str, selectors: dict | None = None, date_hin
                 or meta.get("article:published_time") or ld.get("datePublished")
                 or meta.get("og:article:published_time") or meta.get("pubdate") or meta.get("date")
                 or _time_tag(soup) or _date_in_text(soup) or date_hint)
-    art.published_at = _parse_date(date_raw)
+    art.published_at = _parse_date(date_raw, date_format)
 
     author = meta.get("article:author") or meta.get("author") or ld.get("author")
     art.author = author[:200] if isinstance(author, str) else None
@@ -258,10 +260,18 @@ def _title_in_content(soup: BeautifulSoup, site_names: set[str]) -> str | None:
     return None
 
 
-def _parse_date(raw) -> datetime | None:
+def _parse_date(raw, date_format: str | None = None) -> datetime | None:
     if not raw or not isinstance(raw, str):
         return None
     raw = raw.strip()
+    dt: datetime | None = None
+    if date_format:
+        try:
+            dt = datetime.strptime(raw, date_format)
+        except ValueError:
+            dt = None
+    if dt is not None:
+        return _to_utc(dt)
     m = _DATE_RE.search(raw)
     try:
         if m and not re.match(r"^\d{4}-\d{2}-\d{2}T", raw):
@@ -273,6 +283,10 @@ def _parse_date(raw) -> datetime | None:
         return None
     if dt is None:
         return None
+    return _to_utc(dt)
+
+
+def _to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         # 시간대가 없으면 한국 시간으로 본다
         from datetime import timedelta
