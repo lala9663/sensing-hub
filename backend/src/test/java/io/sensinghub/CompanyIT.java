@@ -141,26 +141,35 @@ class CompanyIT {
         assertThat(one("SELECT job_type || ':' || status FROM crawl_job WHERE source_id = ?", watchId)).isEqualTo("ONBOARD:QUEUED");
         assertThat(get("registrar", "/api/v1/watches").toString()).contains("\"name\":\"회사:나부품\"");
 
-        // 점검 소스: kind CHECK 하나, api.odcloud.kr, 1440분, config {provider data_go_kr, check nts_status}, ONBOARD 작업
-        assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(1L);
-        long checkId = jdbc.sql("SELECT id FROM source WHERE kind = 'CHECK'").query(Long.class).single();
-        assertThat(one("SELECT name || '|' || method || '|' || status || '|' || interval_minutes FROM source WHERE id = ?", checkId))
-                .isEqualTo("check:nts_status|API|PENDING|1440");
-        assertThat(one("SELECT t.domain || '|' || t.site_type || '|' || (t.risk_flags->>'api_provider') FROM site t "
-                + "JOIN source s ON s.site_id = t.id WHERE s.id = ?", checkId)).isEqualTo("api.odcloud.kr|PUBLIC|data_go_kr");
-        assertThat(one("SELECT v.version || '|' || v.status || '|' || v.config::text FROM source_config_version v "
-                + "JOIN source s ON s.active_config_version_id = v.id WHERE s.id = ?", checkId))
-                .isEqualTo("1|ACTIVE|{\"check\": \"nts_status\", \"method\": \"API\", \"provider\": \"data_go_kr\"}");
-        assertThat(one("SELECT job_type || ':' || status || ':' || trigger FROM crawl_job WHERE source_id = ?", checkId))
-                .isEqualTo("ONBOARD:QUEUED:REGISTRATION");
+        // 점검 소스: kind CHECK 네 개 (국세청 상태 1440분, DART 고유번호 매핑 10080분, DART 회사별 공시 360분, 조달청 부정당업자 1440분),
+        // 각각 PENDING + 설정 v1 + ONBOARD 작업. DART 두 점검은 site opendart.fss.or.kr을 공유하고 name으로 구분한다
+        assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(4L);
+        assertThat(one("SELECT string_agg(name || '|' || method || '|' || status || '|' || interval_minutes, ',' ORDER BY id) "
+                + "FROM source WHERE kind = 'CHECK'"))
+                .isEqualTo("check:nts_status|API|PENDING|1440,check:dart_corp_map|API|PENDING|10080,"
+                        + "check:dart_disclosure|API|PENDING|360,check:g2b_debarment|API|PENDING|1440");
+        assertThat(one("SELECT string_agg(t.domain || '|' || t.site_type || '|' || (t.risk_flags->>'api_provider'), ',' ORDER BY s.id) "
+                + "FROM source s JOIN site t ON t.id = s.site_id WHERE s.kind = 'CHECK'"))
+                .isEqualTo("api.odcloud.kr|PUBLIC|data_go_kr,opendart.fss.or.kr|PUBLIC|dart,opendart.fss.or.kr|PUBLIC|dart,"
+                        + "apis.data.go.kr|PUBLIC|data_go_kr");
+        assertThat(count("SELECT count(DISTINCT site_id) FROM source WHERE kind = 'CHECK'")).isEqualTo(3L);
+        assertThat(one("SELECT string_agg(v.version || '|' || v.status || '|' || v.config::text, ';' ORDER BY s.id) "
+                + "FROM source_config_version v JOIN source s ON s.active_config_version_id = v.id WHERE s.kind = 'CHECK'"))
+                .isEqualTo("1|ACTIVE|{\"check\": \"nts_status\", \"method\": \"API\", \"provider\": \"data_go_kr\"};"
+                        + "1|ACTIVE|{\"check\": \"dart_corp_map\", \"method\": \"API\", \"provider\": \"dart\"};"
+                        + "1|ACTIVE|{\"days\": 3, \"check\": \"dart_disclosure\", \"method\": \"API\", \"provider\": \"dart\"};"
+                        + "1|ACTIVE|{\"days\": 7, \"check\": \"g2b_debarment\", \"method\": \"API\", \"provider\": \"data_go_kr\"}");
+        assertThat(one("SELECT string_agg(DISTINCT j.job_type || ':' || j.status || ':' || j.trigger, ',') FROM crawl_job j "
+                + "JOIN source s ON s.id = j.source_id WHERE s.kind = 'CHECK'")).isEqualTo("ONBOARD:QUEUED:REGISTRATION");
+        assertThat(count("SELECT count(*) FROM crawl_job j JOIN source s ON s.id = j.source_id WHERE s.kind = 'CHECK'")).isEqualTo(4L);
         // 관리자 소스 목록에 kind CHECK로 보인다
         assertThat(get("admin", "/api/v1/sources").toString()).contains("\"kind\":\"CHECK\"");
 
-        // 두 번째 회사: 점검 소스는 그대로 하나, 감시는 하나 더
+        // 두 번째 회사: 점검 소스는 그대로 네 개, 감시는 하나 더
         createCompany("{\"name\":\"가전자\",\"bizNo\":\"1018112345\"}");
-        assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(1L);
+        assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(4L);
         assertThat(count("SELECT count(*) FROM source WHERE kind = 'WATCH'")).isEqualTo(2L);
-        assertThat(count("SELECT count(*) FROM crawl_job")).isEqualTo(3L);
+        assertThat(count("SELECT count(*) FROM crawl_job")).isEqualTo(6L);
 
         // 검증: 사업자번호 형식·중복, 고유번호 형식, 이름 없음
         assertThat(post("registrar", "/api/v1/companies", "{\"name\":\"다\",\"bizNo\":\"12345\"}").getStatusCode())
@@ -208,7 +217,7 @@ class CompanyIT {
         assertThat(one("SELECT watch_name FROM source WHERE id = ?", nabuWatch)).isEqualTo("회사:나부품 주식회사");
         assertThat(one("SELECT biz_no FROM company WHERE name = '다라인'")).isEqualTo("2018100001");
         assertThat(count("SELECT count(*) FROM source WHERE kind = 'WATCH'")).isEqualTo(3L);
-        assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(1L);
+        assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(4L);
 
         // 한 행이라도 사업자번호 형식이 틀리면 전체 400 (부분 반영 없음), 헤더 없는 CSV도 400
         ResponseEntity<String> bad = call("registrar", HttpMethod.POST, "/api/v1/companies/import",
@@ -260,6 +269,15 @@ class CompanyIT {
         assertThat(d.get("signals").findValuesAsText("severity")).containsExactly("HIGH", "MEDIUM", "LOW");
         assertThat(d.get("signals").get(1).get("documentUrl").asText()).isEqualTo("https://news.example.com/1");
         assertThat(d.get("signals").get(1).get("detail").get("topics").get(0).asText()).isEqualTo("사건·사고");
+        // 종류별 최근 1건: BIZ_STATUS는 observed_at이 늦은 폐업(HIGH), NEWS 1건. 없는 종류(DEBARMENT 등)는 키가 없다. 순서는 KINDS 순
+        JsonNode latest = d.get("latestByKind");
+        assertThat(latest.size()).isEqualTo(2);
+        assertThat(latest.fieldNames().next()).isEqualTo("BIZ_STATUS");
+        assertThat(latest.get("BIZ_STATUS").get("title").asText()).isEqualTo("폐업자 (폐업일 2026-09-30)");
+        assertThat(latest.get("BIZ_STATUS").get("severity").asText()).isEqualTo("HIGH");
+        assertThat(latest.get("NEWS").get("title").asText()).isEqualTo("나부품 공장 화재");
+        assertThat(latest.has("DEBARMENT")).isFalse();
+        assertThat(get("viewer", "/api/v1/companies/" + ga).get("latestByKind").size()).isZero();
         assertThat(d.get("documents")).hasSize(1);
         assertThat(d.get("documents").get(0).get("matchedBy").asText()).isEqualTo("WATCH");
         assertThat(d.get("documents").get(0).get("title").asText()).isEqualTo("나부품 공장 화재");

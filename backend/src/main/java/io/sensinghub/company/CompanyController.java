@@ -37,7 +37,7 @@ import jakarta.validation.constraints.Size;
  * POST   /api/v1/companies            {name, aliases[], bizNo?, corpCode?, externalId?, tags[]}   REGISTRAR 이상
  * POST   /api/v1/companies/import     JSON 배열 또는 CSV 텍스트(name,aliases(;구분),biz_no,corp_code,external_id,tags) — 사업자번호 같으면 갱신
  * GET    /api/v1/companies            목록 (신호 수·최근 신호·연결 문서 수). ?includeArchived=true
- * GET    /api/v1/companies/{id}       상세 (최근 신호 20건, 최근 문서 20건)
+ * GET    /api/v1/companies/{id}       상세 (최근 신호 20건, 종류별 최근 1건 latestByKind, 최근 문서 20건)
  * PUT    /api/v1/companies/{id}       생략한 필드는 그대로. 이름·별칭이 바뀌면 감시 키워드도 새 버전으로
  * DELETE /api/v1/companies/{id}       ARCHIVED 처리 (감시는 EXCLUDED)
  * GET    /api/v1/companies/{id}/signals?since=     회사 하나의 신호
