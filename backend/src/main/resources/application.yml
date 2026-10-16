@@ -10,6 +10,19 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+  mail:
+    # 다이제스트 메일(SMTP). host가 비어 있으면 EMAIL 구독은 FAILED("메일 서버가 설정되지 않았습니다")로 남는다.
+    host: ${SENSING_MAIL_HOST:}
+    port: ${SENSING_MAIL_PORT:587}
+    username: ${SENSING_MAIL_USERNAME:}
+    password: ${SENSING_MAIL_PASSWORD:}
+    properties:
+      # 사내 릴레이(인증 없음, 25번 포트)면 SENSING_MAIL_AUTH=false SENSING_MAIL_STARTTLS=false
+      mail.smtp.auth: ${SENSING_MAIL_AUTH:true}
+      mail.smtp.starttls.enable: ${SENSING_MAIL_STARTTLS:true}
+      mail.smtp.connectiontimeout: 10000
+      mail.smtp.timeout: 10000
+      mail.smtp.writetimeout: 10000
 
 server:
   port: ${SENSING_PORT:8080}
@@ -25,6 +38,14 @@ sensing:
     # 주기 수집 대상 확인 간격
     tick-ms: ${SENSING_SCHEDULER_TICK_MS:60000}
     enabled: ${SENSING_SCHEDULER_ENABLED:true}
+  digest:
+    # 일간 다이제스트: 5분마다 KST 기준 현재 시각이 hour_kst인 구독 중 오늘 아직 보내지 않은 것을 보낸다
+    enabled: ${SENSING_DIGEST_ENABLED:true}
+    tick-ms: ${SENSING_DIGEST_TICK_MS:300000}
+    # 보내는 메일 주소. 비우면 spring.mail.username, 그것도 비면 메일 서버가 정한다
+    from: ${SENSING_MAIL_FROM:}
+    # 웹훅 POST 제한 시간(초)
+    webhook-timeout-seconds: 10
   registration:
     # VIEWER가 등록하면 관리자 승인 대기로 접수한다
     viewer-needs-approval: true

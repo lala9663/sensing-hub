@@ -31,7 +31,7 @@ import io.sensinghub.scheduler.CrawlScheduler;
  */
 @EnabledIfEnvironmentVariable(named = "SENSING_IT_DB_URL", matches = "jdbc:postgresql:.+")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "sensing.scheduler.enabled=false")
+        properties = {"sensing.scheduler.enabled=false", "sensing.digest.enabled=false"})
 class RegistrationFlowIT {
 
     static final String SECRET_KEY = "it-secret-key";
