@@ -52,8 +52,8 @@ class RegistrationFlowIT {
     void clean() {
         jdbc.sql("""
                 TRUNCATE chat_feedback, chat_citation, chat_message, chat_session, chunk, attachment,
-                         document_version, document, crawl_error, crawl_job, registration_request, audit_log,
-                         api_credential
+                         document_version, document_watch, document, crawl_error, crawl_job, registration_request,
+                         audit_log, api_credential
                 RESTART IDENTITY CASCADE
                 """).update();
         jdbc.sql("UPDATE source SET active_config_version_id = NULL").update();
@@ -202,6 +202,124 @@ class RegistrationFlowIT {
         assertThat(http.exchange("/api/v1/api-credentials/dart", HttpMethod.DELETE, new HttpEntity<>(admin), String.class)
                 .getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(get("admin", "/api/v1/api-credentials")).isEmpty();
+    }
+
+    private ResponseEntity<String> put(String user, String path, String json) {
+        HttpHeaders h = new HttpHeaders();
+        h.setContentType(MediaType.APPLICATION_JSON);
+        h.set("X-User", user);
+        return http.exchange(path, HttpMethod.PUT, new HttpEntity<>(json, h), String.class);
+    }
+
+    @Test
+    void registrarCreatesKeywordWatchAsApiSourceWithOnboardJob() {
+        ResponseEntity<String> res = post("registrar", "/api/v1/watches",
+                "{\"name\":\" 자사  보도 \",\"keywords\":[\"메타넷\",\" 메타넷글로벌 \",\"메타넷\",\"\"],\"exclude\":[\"채용\"]}");
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(res.getBody()).contains("\"name\":\"자사 보도\"").contains("\"status\":\"PENDING\"")
+                .contains("\"keywords\":[\"메타넷\",\"메타넷글로벌\"]").contains("\"exclude\":[\"채용\"]")
+                .contains("\"configVersion\":1").contains("\"intervalMinutes\":60")
+                .contains("\"registrationStatus\":\"PROCESSING\"").contains("\"documentCount\":0");
+
+        long sourceId = jdbc.sql("SELECT id FROM source WHERE kind = 'WATCH'").query(Long.class).single();
+        assertThat(jdbc.sql("SELECT watch_name || '|' || method || '|' || status || '|' || interval_minutes || '|' || name "
+                + "FROM source WHERE id = ?").param(sourceId).query(String.class).single())
+                .isEqualTo("자사 보도|API|PENDING|60|watch:자사 보도");
+        assertThat(jdbc.sql("SELECT t.domain || '|' || t.base_url || '|' || (t.risk_flags->>'api_provider') "
+                + "FROM site t JOIN source s ON s.site_id = t.id WHERE s.id = ?").param(sourceId).query(String.class).single())
+                .isEqualTo("news.naver.com|https://news.naver.com|naver_news");
+        assertThat(jdbc.sql("SELECT v.version || '|' || v.status || '|' || v.config::text FROM source_config_version v "
+                + "JOIN source s ON s.active_config_version_id = v.id WHERE s.id = ?").param(sourceId).query(String.class).single())
+                .isEqualTo("1|ACTIVE|{\"method\": \"API\", \"exclude\": [\"채용\"], \"keywords\": [\"메타넷\", \"메타넷글로벌\"], "
+                        + "\"provider\": \"naver_news\"}");
+        assertThat(jdbc.sql("SELECT job_type || ':' || status || ':' || trigger FROM crawl_job WHERE source_id = ?")
+                .param(sourceId).query(String.class).single()).isEqualTo("ONBOARD:QUEUED:REGISTRATION");
+        assertThat(jdbc.sql("SELECT input_url || '|' || normalized_domain || '|' || status || '|' || step "
+                + "FROM registration_request WHERE source_id = ?").param(sourceId).query(String.class).single())
+                .isEqualTo("watch:자사 보도|news.naver.com|PROCESSING|QUEUED");
+
+        // 요청자는 /registrations/mine과 /watches로 진행 상태를 본다. 남의 감시는 안 보이고 ADMIN은 전부 본다
+        assertThat(get("registrar", "/api/v1/registrations/mine").toString()).contains("watch:자사 보도");
+        assertThat(get("registrar", "/api/v1/watches")).hasSize(1);
+        assertThat(get("viewer", "/api/v1/watches")).isEmpty();
+        assertThat(get("admin", "/api/v1/watches")).hasSize(1);
+        HttpHeaders viewer = new HttpHeaders();
+        viewer.set("X-User", "viewer");
+        assertThat(http.exchange("/api/v1/watches/" + sourceId, HttpMethod.GET, new HttpEntity<>(viewer), String.class)
+                .getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        // 관리자 소스 목록에는 kind·watchName이 실린다
+        JsonNode sources = get("admin", "/api/v1/sources");
+        assertThat(sources).hasSize(1);
+        assertThat(sources.get(0).get("kind").asText()).isEqualTo("WATCH");
+        assertThat(sources.get(0).get("watchName").asText()).isEqualTo("자사 보도");
+        assertThat(sources.get(0).get("domain").asText()).isEqualTo("news.naver.com");
+
+        // 같은 이름은 거부, 키워드 없음은 400
+        assertThat(post("registrar", "/api/v1/watches", "{\"name\":\"자사 보도\",\"keywords\":[\"x\"]}").getStatusCode())
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(post("registrar", "/api/v1/watches", "{\"name\":\"빈 감시\",\"keywords\":[\" \"]}").getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        // 감시가 news.naver.com을 쓰고 있어도 사이트 등록은 중복이 아니다 (워커가 KEYWORDS_REQUIRED로 안내한다)
+        assertThat(post("registrar", "/api/v1/registrations", "{\"url\":\"https://news.naver.com\"}").getBody())
+                .contains("\"status\":\"PROCESSING\"");
+        assertThat(jdbc.sql("SELECT count(*) FROM source WHERE kind = 'SITE'").query(Long.class).single()).isEqualTo(1L);
+        assertThat(jdbc.sql("SELECT count(*) FROM site").query(Long.class).single()).isEqualTo(1L);   // site는 한 행
+
+        // 키워드 수정 = 설정 v2 활성화 (v1은 RETIRED), 주인이 아니면 404
+        assertThat(put("viewer", "/api/v1/watches/" + sourceId, "{\"keywords\":[\"남의것\"]}").getStatusCode())
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        ResponseEntity<String> updated = put("registrar", "/api/v1/watches/" + sourceId,
+                "{\"keywords\":[\"메타넷\",\"신사업\"]}");
+        assertThat(updated.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(updated.getBody()).contains("\"configVersion\":2").contains("\"keywords\":[\"메타넷\",\"신사업\"]")
+                .contains("\"exclude\":[\"채용\"]");                                   // 생략한 필드는 그대로
+        assertThat(jdbc.sql("SELECT string_agg(version || ':' || status, ',' ORDER BY version) FROM source_config_version "
+                + "WHERE source_id = ?").param(sourceId).query(String.class).single()).isEqualTo("1:RETIRED,2:ACTIVE");
+        assertThat(jdbc.sql("SELECT v.version FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id "
+                + "WHERE s.id = ?").param(sourceId).query(Integer.class).single()).isEqualTo(2);
+        assertThat(post("admin", "/api/v1/sources/" + sourceId + "/configs/1/activate", "").getBody())
+                .contains("\"configVersion\":1");                                       // 기존 롤백도 그대로 된다
+        assertThat(jdbc.sql("SELECT string_agg(action, ',' ORDER BY id) FROM audit_log").query(String.class).single())
+                .contains("WATCH_CREATED").contains("WATCH_UPDATED");
+    }
+
+    @Test
+    void viewerWatchWaitsForApprovalAndAdminApprovalQueuesOnboard() {
+        ResponseEntity<String> res = post("viewer", "/api/v1/watches", "{\"name\":\"경쟁사\",\"keywords\":[\"A사\",\"B사\"]}");
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(res.getBody()).contains("\"registrationStatus\":\"AWAITING_APPROVAL\"").contains("\"status\":\"PENDING\"");
+        assertThat(jdbc.sql("SELECT count(*) FROM crawl_job").query(Long.class).single()).isZero();
+        long sourceId = jdbc.sql("SELECT id FROM source WHERE kind = 'WATCH'").query(Long.class).single();
+        long requestId = jdbc.sql("SELECT id FROM registration_request WHERE source_id = ?").param(sourceId)
+                .query(Long.class).single();
+
+        JsonNode queue = get("admin", "/api/v1/review-queue");
+        assertThat(queue).hasSize(1);
+        assertThat(queue.get(0).get("kind").asText()).isEqualTo("APPROVAL");
+        assertThat(queue.get(0).get("inputUrl").asText()).isEqualTo("watch:경쟁사");
+        assertThat(queue.get(0).get("domain").asText()).isEqualTo("news.naver.com");
+
+        assertThat(post("admin", "/api/v1/registrations/" + requestId + "/approve", "").getBody())
+                .contains("\"status\":\"PROCESSING\"").contains("키워드 감시를 시작");
+        assertThat(jdbc.sql("SELECT job_type || ':' || status FROM crawl_job WHERE source_id = ?").param(sourceId)
+                .query(String.class).single()).isEqualTo("ONBOARD:QUEUED");
+        assertThat(jdbc.sql("SELECT count(*) FROM source_config_version WHERE source_id = ?").param(sourceId)
+                .query(Long.class).single()).isEqualTo(1L);                             // 승인은 설정을 다시 만들지 않는다
+        assertThat(get("admin", "/api/v1/review-queue")).isEmpty();
+
+        // 반려하면 미리 만들어 둔 감시 소스는 EXCLUDED
+        post("viewer", "/api/v1/watches", "{\"name\":\"이슈\",\"keywords\":[\"규제\"]}");
+        long other = jdbc.sql("SELECT id FROM source WHERE watch_name = '이슈'").query(Long.class).single();
+        long otherRequest = jdbc.sql("SELECT id FROM registration_request WHERE source_id = ?").param(other)
+                .query(Long.class).single();
+        assertThat(post("admin", "/api/v1/registrations/" + otherRequest + "/reject", "{\"reason\":\"중복\"}").getBody())
+                .contains("REJECTED");
+        assertThat(jdbc.sql("SELECT status FROM source WHERE id = ?").param(other).query(String.class).single())
+                .isEqualTo("EXCLUDED");
+        assertThat(jdbc.sql("SELECT count(*) FROM crawl_job WHERE source_id = ?").param(other).query(Long.class).single())
+                .isZero();
     }
 
     @Test

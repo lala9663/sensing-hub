@@ -25,7 +25,9 @@ public class SourceService {
         this.audit = audit;
     }
 
-    public record SourceSummary(long id, String domain, String baseUrl, String siteType, String method, String status,
+    /** kind: SITE(사이트 수집) | WATCH(키워드 감시, watchName이 감시 이름). */
+    public record SourceSummary(long id, String kind, String watchName, String domain, String baseUrl, String siteType,
+                                String method, String status,
                                 String statusReason, Integer configVersion, int intervalMinutes,
                                 OffsetDateTime lastSuccessAt, OffsetDateTime nextRunAt, int consecutiveFailures,
                                 int consecutiveAnomalies, long documentCount, boolean aiRestricted) {
@@ -50,7 +52,7 @@ public class SourceService {
     }
 
     private static final String SUMMARY_SQL = """
-            SELECT s.id, t.domain, t.base_url, t.site_type, s.method, s.status, s.status_reason,
+            SELECT s.id, s.kind, s.watch_name, t.domain, t.base_url, t.site_type, s.method, s.status, s.status_reason,
                    v.version AS config_version, s.interval_minutes, s.last_success_at, s.next_run_at,
                    s.consecutive_failures, s.consecutive_anomalies, t.ai_restricted,
                    (SELECT count(*) FROM document d WHERE d.source_id = s.id) AS document_count
@@ -192,7 +194,8 @@ public class SourceService {
     }
 
     private SourceSummary mapSummary(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
-        return new SourceSummary(rs.getLong("id"), rs.getString("domain"), rs.getString("base_url"),
+        return new SourceSummary(rs.getLong("id"), rs.getString("kind"), rs.getString("watch_name"),
+                rs.getString("domain"), rs.getString("base_url"),
                 rs.getString("site_type"), rs.getString("method"), rs.getString("status"),
                 rs.getString("status_reason"), (Integer) rs.getObject("config_version"),
                 rs.getInt("interval_minutes"), rs.getObject("last_success_at", OffsetDateTime.class),

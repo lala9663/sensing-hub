@@ -72,6 +72,17 @@ public class RegistrationService {
         if (!reg.status().equals("AWAITING_APPROVAL")) {
             throw ApiException.conflict("승인 대기 상태가 아닙니다.");
         }
+        if (reg.sourceId() != null && isWatch(reg.sourceId())) {
+            // 키워드 감시(WatchService.create가 소스·설정을 먼저 만들어 둔다): 승인은 ONBOARD 작업을 넣는 것뿐이다
+            jdbc.sql("""
+                    INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', 'REGISTRATION')
+                    ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
+                    """).param(reg.sourceId()).update();
+            updateRequest(requestId, "PROCESSING", "QUEUED",
+                    "승인되어 키워드 감시를 시작합니다. 네이버 뉴스 검색 API 키를 확인한 뒤 첫 수집을 합니다.", null);
+            audit.log(admin.id(), "REGISTRATION_APPROVED", "registration_request", requestId, null);
+            return get(requestId);
+        }
         UrlNormalizer.Normalized url = UrlNormalizer.normalize(reg.inputUrl());
         if (findOpenSource(url.domain()).isPresent()) {
             updateRequest(requestId, "DUPLICATE", null, "그 사이에 다른 요청으로 등록되었습니다.", null);
@@ -101,6 +112,11 @@ public class RegistrationService {
         String message = "관리자가 등록 요청을 반려했습니다."
                 + (reason == null || reason.isBlank() ? "" : " 사유: " + reason.strip());
         updateRequest(requestId, "REJECTED", "REJECTED", message, null);
+        if (reg.sourceId() != null) {
+            // 승인 전에 만들어 둔 소스(키워드 감시)는 수집 대상에서 뺀다
+            jdbc.sql("UPDATE source SET status = 'EXCLUDED', status_reason = '관리자 반려', updated_at = now() "
+                    + "WHERE id = ? AND status = 'PENDING'").param(reg.sourceId()).update();
+        }
         audit.log(admin.id(), "REGISTRATION_REJECTED", "registration_request", requestId, null);
         return get(requestId);
     }
@@ -156,10 +172,16 @@ public class RegistrationService {
     private record ExistingSource(long id, String status) {
     }
 
+    private boolean isWatch(long sourceId) {
+        return jdbc.sql("SELECT count(*) FROM source WHERE id = ? AND kind = 'WATCH'").param(sourceId)
+                .query(Long.class).single() > 0;
+    }
+
+    /** 같은 도메인의 사이트 소스. 키워드 감시(kind WATCH)는 제공자 도메인을 공유하므로 중복 판정에서 뺀다. */
     private Optional<ExistingSource> findOpenSource(String domain) {
         return jdbc.sql("""
                 SELECT s.id, s.status FROM source s JOIN site t ON t.id = s.site_id
-                WHERE t.domain = ? AND s.status <> 'EXCLUDED'
+                WHERE t.domain = ? AND s.kind = 'SITE' AND s.status <> 'EXCLUDED'
                 ORDER BY s.id LIMIT 1
                 """)
                 .param(domain)
