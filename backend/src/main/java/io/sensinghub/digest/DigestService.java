@@ -73,6 +73,8 @@ public class DigestService {
             return new Filters(null, null, null, null);
         }
 
+        /** 직렬화에서 제외: Jackson이 isEmpty()를 "empty" 속성으로 내보내 응답 JSON이 바뀐다. */
+        @com.fasterxml.jackson.annotation.JsonIgnore
         public boolean isEmpty() {
             return watchIds.isEmpty() && sourceIds.isEmpty() && topics.isEmpty() && companyIds.isEmpty();
         }

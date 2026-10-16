@@ -272,7 +272,7 @@ class CompanyIT {
         assertThat(all).hasSize(3);
         assertThat(all.get(0).get("companyName").asText()).isEqualTo("나부품");
         assertThat(get("viewer", "/api/v1/company-signals?severity=high")).hasSize(1);
-        assertThat(get("viewer", "/api/v1/company-signals?kind=BIZ_STATUS&since=2026-10-16T00:00:00%2B09:00")).hasSize(1);
+        assertThat(get("viewer", "/api/v1/company-signals?kind=BIZ_STATUS&since=2026-10-15T15:00:00Z")).hasSize(1);
         assertThat(call("viewer", HttpMethod.GET, "/api/v1/company-signals?kind=RUMOR", null, null).getStatusCode())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
 
