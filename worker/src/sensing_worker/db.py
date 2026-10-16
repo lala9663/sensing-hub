@@ -115,6 +115,15 @@ class Store:
                 """, (config_id, config["method"], interval_minutes, source_id))
         return config_id, version
 
+    def activate_source(self, source_id: int, method: str, interval_minutes: int) -> None:
+        """설정 버전은 그대로 두고 소스만 ACTIVE로 (키워드 감시: 백엔드가 만든 설정을 쓴다)."""
+        self.conn.execute(
+            """
+            UPDATE source SET method = %s, interval_minutes = %s, status = 'ACTIVE', status_reason = NULL,
+                   consecutive_anomalies = 0, updated_at = now()
+            WHERE id = %s
+            """, (method, interval_minutes, source_id))
+
     def mark_crawl_result(self, source_id: int, success: bool, interval_minutes: int) -> None:
         if success:
             self.conn.execute(
@@ -240,6 +249,14 @@ class Store:
                 WHERE id = %s
                 """, (title, body, content_hash, current["id"]))
             return current["id"], "UPDATED"
+
+    def add_watch_hit(self, document_id: int, source_id: int, keyword: str | None) -> None:
+        """키워드 감시 기록. 같은 문서·감시 쌍은 처음 걸린 검색어만 남긴다."""
+        self.conn.execute(
+            """
+            INSERT INTO document_watch (document_id, source_id, keyword) VALUES (%s, %s, %s)
+            ON CONFLICT (document_id, source_id) DO NOTHING
+            """, (document_id, source_id, (keyword or "")[:200] or None))
 
     def add_attachment(self, document_id: int, url: str, file_name: str) -> None:
         self.conn.execute(

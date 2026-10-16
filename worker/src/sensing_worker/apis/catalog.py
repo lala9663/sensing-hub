@@ -18,6 +18,8 @@ class Provider:
     needs_key: bool
     description: str
     key_required_message: str   # 등록 요청 결과 메시지 (사용자에게 그대로 보인다)
+    # 사이트가 아니라 키워드 묶음(감시, source.kind WATCH)으로 등록하는 제공자. 도메인을 그냥 등록하면 KEYWORDS_REQUIRED
+    keyword_based: bool = False
 
 
 PROVIDERS: tuple[Provider, ...] = (
@@ -30,6 +32,18 @@ PROVIDERS: tuple[Provider, ...] = (
         description="금융감독원 전자공시시스템. 공시 목록을 오픈API(list.json)로 받고 원문은 dart.fss.or.kr 링크로 둔다.",
         key_required_message="DART 공시는 크롤링 대신 공시 API로 받습니다. 관리자가 API 키를 등록하면 자동으로 진행됩니다. "
                              "발급: https://opendart.fss.or.kr/uat/uia/egovLoginUsr.do",
+    ),
+    Provider(
+        id="naver_news",
+        name="네이버 뉴스 검색",
+        domains=("news.naver.com", "n.news.naver.com", "openapi.naver.com"),
+        signup_url="https://developers.naver.com/apps/#/register",
+        needs_key=True,
+        description="네이버 뉴스는 robots.txt가 전체 차단이라 크롤링하지 않고 검색 API(news.json)로 키워드별 보도를 받는다. "
+                    "언론 기사이므로 제목·링크·발행일만 저장한다. 키는 client_id:client_secret 한 문자열.",
+        key_required_message="네이버 뉴스는 크롤링이 금지돼 검색 API로 받습니다. 관리자가 네이버 API 키(client_id:client_secret)를 "
+                             "등록하면 진행됩니다. 발급: https://developers.naver.com/apps/#/register",
+        keyword_based=True,
     ),
 )
 

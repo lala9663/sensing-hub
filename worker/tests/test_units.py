@@ -1015,6 +1015,123 @@ def test_api_fetch_keeps_private_host_guard_but_skips_robots():
     assert e.value.code == Code.INTERNAL_ADDRESS
 
 
+# ---------------------------------------------------------------------- 키워드 감시 (M2, 네이버 뉴스 검색)
+
+def test_naver_news_is_keyword_based_provider():
+    from sensing_worker.apis import catalog
+    naver = catalog.lookup("news.naver.com")
+    assert naver.id == "naver_news" and naver.keyword_based and naver.needs_key
+    assert catalog.lookup("n.news.naver.com").id == "naver_news"
+    assert catalog.lookup("openapi.naver.com").id == "naver_news"
+    assert catalog.lookup("naver.com") is None and catalog.lookup("blog.naver.com") is None
+    assert catalog.get("dart").keyword_based is False                 # 기본값
+    assert "client_id:client_secret" in naver.key_required_message and "developers.naver.com" in naver.signup_url
+
+
+def test_naver_connector_fetches_each_keyword_and_keeps_title_link_only():
+    from fakenaver import GOOD_ID, GOOD_KEY, GOOD_SECRET, KST, article, articles, naver_handler
+    from sensing_worker.apis.naver_news import NaverNewsConnector
+    shared = article("경쟁사", 9, originallink="https://press.example.com/shared")   # 두 검색어에 다 걸리는 기사
+    handler = naver_handler({
+        "삼성전자": [article("삼성전자", 1, pub=datetime(2026, 10, 16, 9, 30, tzinfo=KST)),
+                 article("삼성전자", 2, title="<b>삼성전자</b> 채용 공고"),           # exclude
+                 article("삼성전자", 3, originallink="", title="원문 링크 없음"),       # originallink 비면 link
+                 dict(shared, title="<b>삼성전자</b>·경쟁사 공동 보도")],
+        "경쟁사": [shared] + articles("경쟁사", 2),
+    })
+    c = NaverNewsConnector(_api_fetcher(handler))
+    c.verify(GOOD_KEY)
+    assert handler.calls == [("테스트", 1, 1)]
+    assert c.default_config() == {"method": "API", "provider": "naver_news", "keywords": [], "exclude": []}
+
+    config = {"method": "API", "provider": "naver_news", "keywords": ["삼성전자", " 경쟁사 ", "삼성전자"], "exclude": ["채용"]}
+    items = c.fetch(GOOD_KEY, config, since=datetime(2026, 1, 1).date(), limit=50)
+    assert [i.url for i in items] == [
+        "https://press.example.com/삼성전자/1",
+        "https://n.news.naver.com/mnews/article/001/삼성전자3",                      # originallink가 비어 link
+        "https://press.example.com/shared",
+        "https://press.example.com/경쟁사/1", "https://press.example.com/경쟁사/2"]
+    assert [i.keyword for i in items] == ["삼성전자", "삼성전자", "삼성전자", "경쟁사", "경쟁사"]   # 공유 기사는 먼저 걸린 검색어
+    first = items[0]
+    assert first.title == '삼성전자, "신제품" 공개 1'                                   # <b> 제거, &quot; 복원
+    assert first.published_at == datetime(2026, 10, 16, 0, 30, tzinfo=timezone.utc)   # +0900 → UTC
+    assert first.body is None and first.author is None and first.section is None and first.attachments == []
+    assert all("채용" not in (i.title or "") for i in items)
+    assert handler.calls[1:] == [("삼성전자", 100, 1), ("경쟁사", 100, 1)]            # 검색어마다 한 페이지씩 (100건 미만)
+    assert handler.headers and all(h == (GOOD_ID, GOOD_SECRET) for h in handler.headers)   # 키는 헤더로만
+    assert c.calls == 3
+
+    with pytest.raises(CrawlFailure) as e:                             # 키워드가 없으면 수집하지 않는다
+        c.fetch(GOOD_KEY, {"keywords": [], "exclude": []}, since=datetime(2026, 1, 1).date(), limit=50)
+    assert e.value.code == Code.KEYWORDS_REQUIRED
+
+
+def test_naver_connector_pages_by_date_until_older_than_since():
+    from fakenaver import GOOD_KEY, KST, article, naver_handler
+    from sensing_worker.apis.naver_news import MAX_PAGES, NaverNewsConnector
+    rows = [article("k", 1, pub=datetime(2026, 10, 16, 9, 0, tzinfo=KST)),    # 10-16 00:00Z
+            article("k", 2, pub=datetime(2026, 10, 15, 10, 0, tzinfo=KST)),   # 10-15 01:00Z
+            article("k", 3, pub=datetime(2026, 10, 15, 8, 0, tzinfo=KST)),    # 10-14 23:00Z → since(10-15)보다 오래됨
+            article("k", 4, pub=datetime(2026, 10, 14, 8, 0, tzinfo=KST))]
+    handler = naver_handler({"k": rows}, per_page=1)
+    c = NaverNewsConnector(_api_fetcher(handler))
+    items = c.fetch(GOOD_KEY, {"keywords": ["k"]}, since=datetime(2026, 10, 15).date(), limit=50)
+    assert [i.url for i in items] == ["https://press.example.com/k/1", "https://press.example.com/k/2"]
+    assert handler.calls == [("k", 100, 1), ("k", 100, 2), ("k", 100, 3)]      # 오래된 기사를 본 페이지에서 멈춘다
+
+    handler = naver_handler({"k": [article("k", i) for i in range(1, 10)]}, per_page=1)   # 전부 최신: 최대 3페이지
+    items = NaverNewsConnector(_api_fetcher(handler)).fetch(GOOD_KEY, {"keywords": ["k"]}, since=datetime(2026, 1, 1).date(), limit=50)
+    assert len(items) == MAX_PAGES == 3 and [s for _, _, s in handler.calls] == [1, 2, 3]
+
+    handler = naver_handler({"k": [article("k", i) for i in range(1, 10)]})
+    items = NaverNewsConnector(_api_fetcher(handler)).fetch(GOOD_KEY, {"keywords": ["k"]}, since=datetime(2026, 1, 1).date(), limit=2)
+    assert len(items) == 2 and len(handler.calls) == 1                           # limit
+
+
+def test_naver_connector_classifies_key_errors_and_rate_limit_without_leaking_secret():
+    from fakenaver import GOOD_ID, GOOD_KEY, GOOD_SECRET, naver_handler
+    from sensing_worker.apis.naver_news import NaverNewsConnector
+    since = datetime.now(timezone.utc).date()
+
+    def leaked(e: CrawlFailure) -> bool:
+        blob = str(e) + (e.url or "") + (e.evidence or "")
+        return GOOD_SECRET in blob or GOOD_ID in blob or "wrong-secret" in blob
+
+    with pytest.raises(CrawlFailure) as e:                             # 틀린 시크릿 → 401/024 → API_KEY_INVALID
+        NaverNewsConnector(_api_fetcher(naver_handler())).verify(f"{GOOD_ID}:wrong-secret")
+    assert e.value.code == Code.API_KEY_INVALID and not e.value.retryable and e.value.http_status == 401
+    assert "024" in str(e.value) and not leaked(e.value)
+
+    handler = naver_handler()
+    with pytest.raises(CrawlFailure) as e:                             # 형식이 아니면 호출 없이 API_KEY_INVALID
+        NaverNewsConnector(_api_fetcher(handler)).verify("no-colon-here")
+    assert e.value.code == Code.API_KEY_INVALID and "client_id:client_secret" in str(e.value) and handler.calls == []
+
+    with pytest.raises(CrawlFailure) as e:                             # 429 한도 초과 → API_ERROR(재시도)
+        NaverNewsConnector(_api_fetcher(naver_handler(http_status=429, error_code="010"))).verify(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and e.value.retryable and e.value.http_status == 429
+    assert "한도" in str(e.value) and not leaked(e.value)
+
+    with pytest.raises(CrawlFailure) as e:                             # 5xx → API_ERROR(재시도)
+        NaverNewsConnector(_api_fetcher(naver_handler(http_status=500))).fetch(GOOD_KEY, {"keywords": ["k"]}, since, 10)
+    assert e.value.code == Code.API_ERROR and e.value.retryable and e.value.http_status == 500
+
+    with pytest.raises(CrawlFailure) as e:                             # 잘못된 요청(400 SE01)은 재시도하지 않는다
+        NaverNewsConnector(_api_fetcher(naver_handler(http_status=400, error_code="SE01"))).verify(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and not e.value.retryable and "SE01" in str(e.value)
+
+    def down(request):
+        raise httpx.ConnectError("boom", request=request)
+    with pytest.raises(CrawlFailure) as e:
+        NaverNewsConnector(_api_fetcher(down)).verify(GOOD_KEY)
+    assert e.value.code == Code.TIMEOUT and not leaked(e.value)
+
+    from sensing_worker.apis.naver_news import clean_title, parse_pub_date
+    assert clean_title("  <b>삼성</b>&amp;<b>LG</b> &lt;협력&gt;  ") == "삼성&LG <협력>" and clean_title("") is None
+    assert parse_pub_date("Thu, 16 Oct 2026 09:30:00 +0900") == datetime(2026, 10, 16, 0, 30, tzinfo=timezone.utc)
+    assert parse_pub_date("not a date") is None and parse_pub_date(None) is None
+
+
 def test_discovery_eval_marks_api_domains_without_network():
     from sensing_worker.evaluate import evaluate_site, summarize
     settings = Settings(min_interval_seconds=0, max_retries=1)

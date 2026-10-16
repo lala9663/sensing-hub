@@ -30,6 +30,7 @@ class ApiItem:
     section: str | None = None
     body: str | None = None
     attachments: list[tuple[str, str]] = field(default_factory=list)   # (url, file_name)
+    keyword: str | None = None   # 키워드 감시에서 이 항목을 찾아낸 검색어 (document_watch에 남긴다)
 
 
 class ApiConnector(Protocol):

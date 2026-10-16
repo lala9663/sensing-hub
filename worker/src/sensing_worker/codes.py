@@ -27,6 +27,8 @@ class Code(str, Enum):
     API_KEY_REQUIRED = "API_KEY_REQUIRED"
     API_KEY_INVALID = "API_KEY_INVALID"
     API_ERROR = "API_ERROR"
+    # 키워드 감시 제공자(네이버 뉴스 검색)를 사이트처럼 등록했거나 감시에 키워드가 없다
+    KEYWORDS_REQUIRED = "KEYWORDS_REQUIRED"
 
 
 # 이 코드가 나오면 소스를 BLOCKED로 바꾸고 즉시 멈춘다 (재시도·우회 없음)
@@ -57,6 +59,7 @@ MESSAGES = {
     Code.API_KEY_REQUIRED: "공개 API 키가 필요합니다. 관리자가 키를 등록하면 자동으로 진행됩니다.",
     Code.API_KEY_INVALID: "등록된 API 키가 유효하지 않습니다. 관리자가 키를 다시 등록하면 자동으로 진행됩니다.",
     Code.API_ERROR: "공개 API 호출에 실패했습니다.",
+    Code.KEYWORDS_REQUIRED: "키워드 감시로 등록해야 합니다. 관리자 또는 등록 담당자가 키워드 묶음을 만들어 주세요.",
 }
 
 

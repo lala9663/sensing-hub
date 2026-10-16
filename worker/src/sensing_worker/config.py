@@ -52,6 +52,8 @@ class Settings:
     secret_key: str = field(default_factory=lambda: os.getenv("SENSING_SECRET_KEY", ""))
     # API 소스 실행 1회당 받을 항목 수 상한 (DART는 하루 공시가 수백 건이라 기사 상한과 따로 둔다)
     max_api_items_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_API_ITEMS", "500")))
+    # 네이버 검색 API 일 호출 한도(공식 25,000)보다 낮게 잡은 우리 쪽 상한. 지금은 호출 수를 로그에 남기는 데만 쓴다
+    naver_daily_limit: int = field(default_factory=lambda: int(os.getenv("SENSING_NAVER_DAILY_LIMIT", "20000")))
     # 등록 시 LLM이 수집 레시피(허브·기사 패턴·셀렉터)를 만들게 할지. none(기본) | anthropic | openai(OpenAI 호환 API)
     llm_provider: str = field(default_factory=lambda: os.getenv("SENSING_LLM_PROVIDER", "none"))
     llm_model: str = field(default_factory=lambda: os.getenv("SENSING_LLM_MODEL", "claude-opus-5-5"))

@@ -122,8 +122,16 @@ class JobRunner:
 
         키가 없으면 REVIEW/API_KEY_REQUIRED로 멈춘다 (관리자가 키를 넣으면 백엔드가 ONBOARD를 다시 넣는다).
         키가 틀리면 자격 증명을 INVALID로 표시하고 REVIEW/API_KEY_INVALID로 멈춘다.
+        키워드 감시(source.kind WATCH)는 백엔드가 만든 활성 설정(keywords)을 그대로 쓰고 새 버전을 만들지 않는다.
+        키워드 제공자(네이버 뉴스)의 도메인을 사이트처럼 등록하면 REVIEW/KEYWORDS_REQUIRED로 멈춘다.
         """
-        self.db.update_site(source["site_id"], site_type="PUBLIC", risk_flags={"api_provider": provider.id})
+        watch = source.get("kind") == "WATCH"
+        self.db.update_site(source["site_id"], site_type="NEWS" if provider.keyword_based else "PUBLIC",
+                            risk_flags={"api_provider": provider.id})
+        if provider.keyword_based and not watch:
+            raise CrawlFailure(Code.KEYWORDS_REQUIRED,
+                               f"{provider.name.replace(' 검색', '')}는 키워드 감시로 등록합니다. "
+                               "관리자 또는 등록 담당자가 키워드 묶음을 만들어 주세요.", stage="PROBE")
         self.db.update_registration(job.source_id, step="API_KEY", message=f"{provider.name} API 키를 확인하는 중입니다.")
         secret = self._load_secret(provider.id, provider, stage="PROBE")
         connector = make_connector(provider.id, self.f)
@@ -136,22 +144,30 @@ class JobRunner:
             raise
         self.db.mark_credential(provider.id, "VALID", None)
 
-        defaults = defaults_for("PUBLIC")   # 공시·공공 API: 6시간 주기
-        config = connector.default_config()
-        first = source["config_version"] is None
-        config_id, version = self.db.activate_new_config(
-            job.source_id, config, f"{provider.name} API로 {'생성' if first else '다시 생성'} (키 검증 통과)",
-            defaults["interval_minutes"])
+        # 공시·공공 API는 6시간, 키워드 감시(보도 모니터링)는 60분 주기
+        interval = 60 if provider.keyword_based else defaults_for("PUBLIC")["interval_minutes"]
+        if watch and source.get("config"):
+            config = source["config"]
+            config_id = source["active_config_version_id"]
+            version = source["config_version"]
+            self.db.activate_source(job.source_id, config.get("method", "API"), interval)
+        else:
+            config = connector.default_config()
+            first = source["config_version"] is None
+            config_id, version = self.db.activate_new_config(
+                job.source_id, config, f"{provider.name} API로 {'생성' if first else '다시 생성'} (키 검증 통과)", interval)
 
         self.db.update_registration(job.source_id, step="FIRST_CRAWL", message="첫 수집 중입니다.")
         stats = self._crawl_api(job, source, config, connector=connector, secret=secret)
-        self.db.mark_crawl_result(job.source_id, True, defaults["interval_minutes"])
+        self.db.mark_crawl_result(job.source_id, True, interval)
         status = "PARTIAL" if stats.errors else "SUCCESS"
         self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors, config_id)
+        what = "감시 등록 완료" if watch else "등록 완료"
         self.db.update_registration(
             job.source_id, status="COMPLETED", step="DONE",
-            message=f"등록 완료. {provider.name} API로 {stats.new}건을 받았고 {defaults['interval_minutes']}분마다 업데이트합니다.")
-        log.info("onboard ok source=%s provider=%s method=API v%s new=%s", job.source_id, provider.id, version, stats.new)
+            message=f"{what}. {provider.name} API로 {stats.new}건을 받았고 {interval}분마다 업데이트합니다.")
+        log.info("onboard ok source=%s provider=%s kind=%s method=API v%s new=%s", job.source_id, provider.id,
+                 source.get("kind", "SITE"), version, stats.new)
         return status
 
     def _load_secret(self, provider_id: str, provider: Provider | None, stage: str) -> str:
@@ -326,6 +342,9 @@ class JobRunner:
                 stats.new += 1
             elif result == "UPDATED":
                 stats.updated += 1
+            if item.keyword:
+                # 같은 기사가 다른 감시에서도 잡히면 문서는 하나, 감시별 기록은 각각 (document_watch)
+                self.db.add_watch_hit(doc_id, job.source_id, item.keyword)
             for att_url, name in item.attachments:
                 self.db.add_attachment(doc_id, att_url, name)
         return stats
@@ -352,8 +371,9 @@ class JobRunner:
             self.db.set_source_status(job.source_id, "BLOCKED", code.value)
         elif code in (Code.PARSE_EMPTY, Code.DISCOVERY_FAILED):
             self.db.set_source_status(job.source_id, "BROKEN", code.value)
-        elif code in API_KEY_CODES:
-            # 키가 사라졌거나 만료됐다: 관리자 큐(API_KEY)로 보내고, 키를 다시 넣으면 백엔드가 ONBOARD를 넣는다
+        elif code in API_KEY_CODES or code == Code.KEYWORDS_REQUIRED:
+            # 키가 사라졌거나 만료됐다(관리자 큐 API_KEY, 키를 다시 넣으면 백엔드가 ONBOARD를 넣는다),
+            # 또는 감시의 키워드가 모두 지워졌다(REVIEW)
             self.db.set_source_status(job.source_id, "REVIEW", code.value)
         self.db.mark_crawl_result(job.source_id, False, source["interval_minutes"])
 

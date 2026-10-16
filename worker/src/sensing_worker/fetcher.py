@@ -154,12 +154,14 @@ class PoliteFetcher:
     def get(self, url: str) -> Page:
         return self._request(url, check_robots=True, classify=True)
 
-    def get_api(self, url: str) -> Page:
+    def get_api(self, url: str, headers: dict[str, str] | None = None) -> Page:
         """공개 API 호출. 도메인 간격·내부망 차단·연결 재시도는 같지만 robots 검사와 차단 화면 분류는 하지 않는다
-        (API 주소는 robots 대상이 아니고, 오류는 응답 JSON의 상태 코드로 커넥터가 분류한다). 4xx·5xx도 그대로 돌려준다."""
-        return self._request(url, check_robots=False, classify=False)
+        (API 주소는 robots 대상이 아니고, 오류는 응답 JSON의 상태 코드로 커넥터가 분류한다). 4xx·5xx도 그대로 돌려준다.
+        headers: 헤더로 인증하는 API(네이버 X-Naver-Client-Id 등)용. 로그에 남기지 않는다."""
+        return self._request(url, check_robots=False, classify=False, headers=headers)
 
-    def _request(self, url: str, *, check_robots: bool, classify: bool, redirects: int = 0) -> Page:
+    def _request(self, url: str, *, check_robots: bool, classify: bool, redirects: int = 0,
+                 headers: dict[str, str] | None = None) -> Page:
         if check_robots and not self.allowed(url):
             raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=url)
         self._guard_host(url)
@@ -172,7 +174,7 @@ class PoliteFetcher:
             self._throttle(url)
             client = self._compat() if use_compat else self._client
             try:
-                with client.stream("GET", url) as resp:
+                with client.stream("GET", url, headers=headers) as resp:
                     self.request_count += 1
                     if use_compat:
                         self.compat_hosts.add(host)
@@ -217,7 +219,8 @@ class PoliteFetcher:
                     raise CrawlFailure(Code.LOGIN_REQUIRED, url=url, http_status=page.status)
                 if redirects >= 5:
                     raise CrawlFailure(Code.HTTP_4XX, "리다이렉트가 너무 많습니다.", url=url)
-                return self._request(target, check_robots=check_robots, classify=classify, redirects=redirects + 1)
+                return self._request(target, check_robots=check_robots, classify=classify, redirects=redirects + 1,
+                                     headers=headers if same_host(url, target) else None)
 
             if not classify:
                 return page
@@ -283,6 +286,10 @@ class PoliteFetcher:
             ip = ipaddress.ip_address(info[4][0])
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
                 raise CrawlFailure(Code.INTERNAL_ADDRESS, url=url)
+
+
+def same_host(a: str, b: str) -> bool:
+    return (urlsplit(a).hostname or "").lower() == (urlsplit(b).hostname or "").lower()
 
 
 def _root(url: str) -> str:

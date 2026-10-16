@@ -421,3 +421,109 @@ def test_dart_without_secret_key_or_with_mismatched_key_goes_to_review(env):
     assert process_one(store, runner, s) == "FAILED"
     assert q(store, "SELECT status_reason FROM source WHERE id = %s", source_id)["status_reason"] == "API_KEY_REQUIRED"
     assert q(store, "SELECT count(*) AS c FROM document")["c"] == 0
+
+
+# ---------------------------------------------------------------- 키워드 감시 (M2, 네이버 뉴스 검색)
+
+def register_watch(store: Store, name: str, keywords: list[str], exclude: list[str] | None = None, user_id: int = 2) -> int:
+    """백엔드 WatchService.create와 같은 행: site(news.naver.com) + source(kind WATCH) + 설정 v1 + 등록 요청 + ONBOARD."""
+    import json as _json
+    c = store.conn
+    site_id = c.execute("INSERT INTO site (domain, base_url, risk_flags) VALUES (%s, %s, %s::jsonb) "
+                        "ON CONFLICT (domain) DO UPDATE SET domain = EXCLUDED.domain RETURNING id",
+                        ("news.naver.com", "https://news.naver.com", '{"api_provider":"naver_news"}')).fetchone()["id"]
+    source_id = c.execute(
+        "INSERT INTO source (site_id, name, kind, watch_name, method, status, interval_minutes, requested_by) "
+        "VALUES (%s, %s, 'WATCH', %s, 'API', 'PENDING', 60, %s) RETURNING id",
+        (site_id, "watch:" + name, name, user_id)).fetchone()["id"]
+    config = {"method": "API", "provider": "naver_news", "keywords": keywords, "exclude": exclude or []}
+    config_id = c.execute(
+        "INSERT INTO source_config_version (source_id, version, config, status, change_note, created_by) "
+        "VALUES (%s, 1, %s::jsonb, 'ACTIVE', '키워드 감시 생성', %s) RETURNING id",
+        (source_id, _json.dumps(config, ensure_ascii=False), user_id)).fetchone()["id"]
+    c.execute("UPDATE source SET active_config_version_id = %s WHERE id = %s", (config_id, source_id))
+    c.execute("INSERT INTO registration_request (user_id, input_url, normalized_domain, status, step, source_id) "
+              "VALUES (%s, %s, 'news.naver.com', 'PROCESSING', 'QUEUED', %s)", (user_id, "watch:" + name, source_id))
+    c.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'REGISTRATION')", (source_id,))
+    return source_id
+
+
+def test_keyword_watch_waits_for_naver_key_then_collects_titles_and_hits(env):
+    from fakenaver import GOOD_KEY, GOOD_SECRET, article, articles, naver_handler
+    store, _, settings, _ = env
+    handler = naver_handler({"메타넷": articles("메타넷", 3) + [article("메타넷", 4, title="<b>메타넷</b> 채용 공고")],
+                             "경쟁사": articles("경쟁사", 2)})
+    runner, s = api_runner(store, settings, handler)
+    source_id = register_watch(store, "자사 보도", ["메타넷", "경쟁사"], exclude=["채용"])
+
+    # ① 키가 없다 → 호출 없이 관리자 큐(REVIEW/API_KEY_REQUIRED)
+    assert process_one(store, runner, s) == "FAILED"
+    assert handler.calls == []
+    src = q(store, "SELECT s.status, s.status_reason, s.kind, t.risk_flags, t.site_type FROM source s "
+                   "JOIN site t ON t.id = s.site_id WHERE s.id = %s", source_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_REQUIRED" and src["kind"] == "WATCH"
+    assert src["risk_flags"] == {"api_provider": "naver_news"} and src["site_type"] == "NEWS"
+    reg = q(store, "SELECT status, result_message FROM registration_request WHERE source_id = %s", source_id)
+    assert reg["status"] == "REVIEW" and "client_id:client_secret" in reg["result_message"]
+
+    # ② 관리자가 네이버 키를 넣는다 → 검증 → 기존 설정(키워드) 그대로 ACTIVE → 첫 수집 (제목·링크만, 감시 기록)
+    put_credential(store, "naver_news", GOOD_KEY)
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'MANUAL')", (source_id,))
+    assert process_one(store, runner, s) == "SUCCESS"
+    src = q(store, "SELECT s.status, s.status_reason, s.method, s.interval_minutes, v.version, v.config "
+                   "FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", source_id)
+    assert src["status"] == "ACTIVE" and src["status_reason"] is None and src["method"] == "API"
+    assert src["interval_minutes"] == 60 and src["version"] == 1                   # 새 설정 버전을 만들지 않았다
+    assert src["config"]["keywords"] == ["메타넷", "경쟁사"]
+    assert q(store, "SELECT count(*) AS c FROM source_config_version WHERE source_id = %s", source_id)["c"] == 1
+    docs = store.conn.execute("SELECT url, title, body_text, published_at FROM document ORDER BY id").fetchall()
+    assert len(docs) == 5 and all(d["body_text"] is None and d["published_at"] is not None for d in docs)
+    assert docs[0]["title"] == '메타넷, "신제품" 공개 1' and "<b>" not in docs[0]["title"]
+    assert not any("채용" in d["title"] for d in docs)
+    hits = store.conn.execute("SELECT d.url, w.keyword FROM document_watch w JOIN document d ON d.id = w.document_id "
+                              "WHERE w.source_id = %s ORDER BY d.id", (source_id,)).fetchall()
+    assert [h["keyword"] for h in hits] == ["메타넷"] * 3 + ["경쟁사"] * 2
+    cred = q(store, "SELECT status, last_error FROM api_credential WHERE provider = 'naver_news'")
+    assert cred["status"] == "VALID" and cred["last_error"] is None
+    reg = q(store, "SELECT status, result_message FROM registration_request WHERE source_id = %s", source_id)
+    assert reg["status"] == "COMPLETED" and reg["result_message"].startswith("감시 등록 완료") and "5건" in reg["result_message"]
+    assert "60분" in reg["result_message"]
+    blob = " ".join((r["message"] or "") + (r["url"] or "") for r in store.conn.execute("SELECT message, url FROM crawl_error"))
+    assert GOOD_SECRET not in blob
+
+    # 주기 수집: 같은 기사는 다시 저장하지 않고 감시 기록도 그대로
+    assert crawl(store, runner, s, source_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job ORDER BY id DESC LIMIT 1")
+    assert job["found_count"] == 5 and job["new_count"] == 0
+    assert q(store, "SELECT count(*) AS c FROM document_watch")["c"] == 5
+
+
+def test_two_watches_share_one_document_with_a_hit_each(env):
+    from fakenaver import GOOD_KEY, articles, naver_handler
+    store, _, settings, _ = env
+    put_credential(store, "naver_news", GOOD_KEY)
+    runner, s = api_runner(store, settings, naver_handler({"반도체": articles("반도체", 2)}))
+    a = register_watch(store, "자사", ["반도체"])
+    b = register_watch(store, "경쟁사", ["반도체"], user_id=3)
+    assert process_one(store, runner, s) == "SUCCESS" and process_one(store, runner, s) == "SUCCESS"
+    assert q(store, "SELECT count(*) AS c FROM document")["c"] == 2
+    hits = store.conn.execute("SELECT source_id, count(*) AS c FROM document_watch GROUP BY source_id ORDER BY source_id").fetchall()
+    assert [(h["source_id"], h["c"]) for h in hits] == [(a, 2), (b, 2)]
+    assert q(store, "SELECT count(*) AS c FROM document_watch")["c"] == 4
+    assert q(store, "SELECT count(DISTINCT domain) AS c FROM site")["c"] == 1   # news.naver.com 한 행을 공유
+
+
+def test_naver_domain_registered_as_site_asks_for_keyword_watch(env):
+    from fakenaver import GOOD_KEY, naver_handler
+    store, _, settings, _ = env
+    put_credential(store, "naver_news", GOOD_KEY)
+    handler = naver_handler()
+    runner, s = api_runner(store, settings, handler)
+    source_id = register(store, "https://news.naver.com")
+    assert process_one(store, runner, s) == "FAILED"
+    assert handler.calls == []
+    src = q(store, "SELECT status, status_reason, kind FROM source WHERE id = %s", source_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "KEYWORDS_REQUIRED" and src["kind"] == "SITE"
+    reg = q(store, "SELECT status, result_message FROM registration_request")
+    assert reg["status"] == "REVIEW" and reg["result_message"] == "네이버 뉴스는 키워드 감시로 등록합니다. 관리자 또는 등록 담당자가 키워드 묶음을 만들어 주세요."
+    assert q(store, "SELECT count(*) AS c FROM source_config_version")["c"] == 0
