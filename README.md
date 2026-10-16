@@ -137,6 +137,25 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 다시 시도합니다. 본문이 바뀌어 문서 버전이 오르면 다시 보강 대상이 되고, 워커 여러 대는 `FOR UPDATE SKIP LOCKED`로 겹치지 않습니다.
 결과는 `/api/v1/documents`(VIEWER 이상)로 읽으며 다이제스트(M2-4)의 재료입니다.
 
+### 일간 다이제스트 알림 (M2)
+
+현업은 아침에 정리된 보고를 받아 윗선에 전달합니다. 구독(`/api/v1/digests`: 어떤 감시·토픽·소스를 몇 시에 어디로)을 등록하면
+백엔드 스케줄러가 5분마다 KST 기준 현재 시가 `hourKst`이고 오늘 아직 보내지 않은 구독을 찾아, **지난 다이제스트 이후(`last_sent_at`,
+처음은 24시간 전) 새로 수집된(`collected_at`) 문서**를 ① 감시별(검색어별) → ② 토픽별(정책·규제 → … → 기타) → ③ 분류 전 순으로 묶어
+메일(HTML) 또는 웹훅(`{"text": ...}`, Slack 수신 웹훅·Mattermost 형식)으로 보냅니다. 항목은 "제목 — 출처 도메인 · 발행일 · 링크"이고
+요약이 있으면 다음 줄에 붙습니다 (언론 기사는 요약 없음). 필터 `{"watchIds":[],"sourceIds":[],"topics":[]}`는 셋 중 하나라도 맞으면
+포함(합집합), 모두 비면 전체이며 상한은 200건입니다. 0건이면 보내지 않고 `EMPTY`로만 기록하고, 전송 실패는 `FAILED`로 남긴 뒤 같은
+시간대의 다음 틱에 다시 시도합니다. 보낸 본문은 `digest_run.body_text`에 남아 `/api/v1/digests/{id}/runs`로 다시 볼 수 있습니다.
+웹훅 URL은 사이트 등록과 같은 검사(http(s) 절대 주소, 내부망 거부)를 거칩니다.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_MAIL_HOST` / `SENSING_MAIL_PORT` | (없음) / `587` | SMTP 서버. 호스트가 비어 있으면 EMAIL 구독은 `FAILED`("메일 서버가 설정되지 않았습니다")로 남고 웹훅 구독만 보낸다 |
+| `SENSING_MAIL_USERNAME` / `SENSING_MAIL_PASSWORD` | (없음) | SMTP 계정. 비밀번호는 로그·오류·응답 어디에도 남기지 않는다 |
+| `SENSING_MAIL_FROM` | (없음) | 보내는 주소. 비우면 `SENSING_MAIL_USERNAME`, 그것도 비면 메일 서버가 정한다 |
+| `SENSING_MAIL_AUTH` / `SENSING_MAIL_STARTTLS` | `true` / `true` | 인증 없는 사내 릴레이(25번 포트)면 둘 다 `false` |
+| `SENSING_DIGEST_ENABLED` / `SENSING_DIGEST_TICK_MS` | `true` / `300000` | 다이제스트 스케줄러 켜기·확인 간격 |
+
 ### API 맛보기
 
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
@@ -156,6 +175,11 @@ curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watche
 # 수집 문서 (요약·분류·감시 검색어 포함, 발행일 내림차순). since는 수집 시각 기준, topic·keyword·source_id로 거르고 limit 기본 50·최대 200
 curl 'localhost:8080/api/v1/documents?since=2026-10-15T00:00:00Z&topic=정책·규제&keyword=메타넷' -H 'X-User: viewer'
 curl localhost:8080/api/v1/documents/1 -H 'X-User: viewer'      # 본문·첨부 포함. GET /api/v1/documents/topics?since=... 는 토픽별 건수
+
+# 일간 다이제스트 구독 (매일 hourKst시 KST에 지난 다이제스트 이후 새 문서를 감시별·토픽별로 묶어 메일 또는 웹훅으로) · 내 구독 · 미리보기·즉시 전송
+curl -X POST localhost:8080/api/v1/digests -H 'X-User: viewer' -H 'Content-Type: application/json' -d '{"name":"아침 보고","channel":"EMAIL","target":"me@example.com","hourKst":8,"filters":{"watchIds":[1],"topics":["정책·규제","입찰·공고"]}}'
+curl localhost:8080/api/v1/digests -H 'X-User: viewer'          # PUT /api/v1/digests/1 -d '{"channel":"WEBHOOK","target":"https://hooks.slack.com/services/..."}', DELETE /api/v1/digests/1
+curl -X POST localhost:8080/api/v1/digests/1/preview -H 'X-User: viewer'   # text·html·documentCount. /send-now 는 바로 보내고 digest_run에 기록, /runs 는 보낸 기록
 
 # 관리자: 소스 목록·상세·조치
 curl localhost:8080/api/v1/sources -H 'X-User: admin'
@@ -250,7 +274,11 @@ M2에서 한 일:
 - [x] 수집 시점 요약·분류: 워커 보강 단계(`enrich.py`, 큐가 비었을 때 묶음 10건을 LLM 한 번에, `SENSING_ENRICH_*`)가
   `document_enrichment`(V6)에 토픽·태그·요약을 두고, `GET /api/v1/documents`(since·topic·keyword·source_id 필터, 상세, 토픽별 건수)로
   읽는다. 언론 기사는 제목만 분류하고 요약을 저장하지 않으며, LLM 장애·검증 실패는 수집에 번지지 않는다
-- [ ] 공공데이터포털 커넥터, 네이버 API 쿼터 추적, 일간 다이제스트, 최소 화면
+- [x] 일간 다이제스트 알림: 구독(`digest_subscription`, V7, `/api/v1/digests`: 감시·소스·토픽 필터, `hourKst`, EMAIL 또는 WEBHOOK)을
+  스케줄러가 매일 그 시각(KST)에 처리해 지난 다이제스트 이후 새로 수집된 문서를 감시별(검색어별) → 토픽별 → 분류 전으로 묶어
+  메일(HTML, `SENSING_MAIL_*`) 또는 웹훅(`{"text":...}`)으로 보낸다. 미리보기·즉시 전송 API, 보낸 본문과 결과(`SENT`·`EMPTY`·`FAILED`)는
+  `digest_run`에 남고, 구독 하나의 실패는 다른 구독을 막지 않는다
+- [ ] 공공데이터포털 커넥터, 네이버 API 쿼터 추적, Teams 등 다른 웹훅 형식, 최소 화면
 
 ## 원칙
 

@@ -28,6 +28,14 @@ services:
       SENSING_DB_PASSWORD: sensing
       # 공개 API 키(api_credential)를 암호화하는 대칭키. 워커와 같은 값. 운영에서는 반드시 바꾼다
       SENSING_SECRET_KEY: ${SENSING_SECRET_KEY:-sensing-dev-secret}
+      # 일간 다이제스트 메일(SMTP). 비우면 메일 구독은 FAILED로 남고 웹훅 구독만 보낸다 — README 참고
+      SENSING_MAIL_HOST: ${SENSING_MAIL_HOST:-}
+      SENSING_MAIL_PORT: ${SENSING_MAIL_PORT:-587}
+      SENSING_MAIL_USERNAME: ${SENSING_MAIL_USERNAME:-}
+      SENSING_MAIL_PASSWORD: ${SENSING_MAIL_PASSWORD:-}
+      SENSING_MAIL_FROM: ${SENSING_MAIL_FROM:-}
+      SENSING_MAIL_AUTH: ${SENSING_MAIL_AUTH:-true}
+      SENSING_MAIL_STARTTLS: ${SENSING_MAIL_STARTTLS:-true}
       JAVA_OPTS: "-Xmx1g"
     ports:
       - "8080:8080"
