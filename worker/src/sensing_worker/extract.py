@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from dataclasses import dataclass, field
@@ -295,6 +296,13 @@ def _to_utc(dt: datetime) -> datetime:
 
 
 def _clean_title(title: str) -> str:
+    # 이중 인코딩된 엔티티(korea.kr의 og:title "&amp;middot;" → 파서가 "&middot;"로 돌려준다)를 한 번 더 푼다.
+    # 두 번까지만: 정상 제목에 든 "&amp;"를 더 풀어 뜻이 바뀌는 일은 두 번째 반복에서 끝난다
+    for _ in range(2):
+        unescaped = html.unescape(title)
+        if unescaped == title:
+            break
+        title = unescaped
     title = re.sub(r"\s+", " ", title).strip()
     # "제목 < 섹션 < 기사본문 - 매체명" 형태에서 앞부분만
     for sep in (" < ", " | ", " - "):

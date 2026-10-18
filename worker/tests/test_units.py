@@ -1865,3 +1865,12 @@ def test_adaptive_interval_grows_when_quiet_and_returns_to_base_when_busy():
     # 사람이 정한 주기는 어느 쪽으로도 건드리지 않는다
     assert next_interval(30, 60, [0] * 10, locked=True) == (30, None)
     assert next_interval(480, 60, [40] * 10, locked=True) == (480, None)
+
+
+def test_title_unescapes_double_encoded_entities():
+    # korea.kr은 og:title을 "&amp;middot;"로 내보내 파서가 "&middot;"를 돌려준다 → 한 번 더 풀어 "·"
+    html = ('<html><head><title>x</title><meta property="og:type" content="article">'
+            '<meta property="og:title" content="문체부와 전남, 문화&amp;middot;체육&amp;middot;관광 협력 &amp;amp; 논의">'
+            '<meta property="article:published_time" content="2026-10-17T12:00:00+09:00"></head><body><p>본문</p></body></html>')
+    art = extract_article(html, "https://www.korea.kr/briefing/pressReleaseView.do?newsId=1")
+    assert art.title == "문체부와 전남, 문화·체육·관광 협력 & 논의"
