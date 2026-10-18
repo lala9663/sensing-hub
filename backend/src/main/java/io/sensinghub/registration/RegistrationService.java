@@ -3,6 +3,8 @@ package io.sensinghub.registration;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -35,8 +37,27 @@ public class RegistrationService {
 
     public enum Channel { WEB, CHAT }
 
+    /**
+     * @param batchId 이 요청이 속한 묶음(일괄 등록 {@code registration_request.batch_id}). 링크 모음(포털) 페이지 요청은 묶음에 속하지
+     *                않지만 워커가 대신 등록한 언론사들의 묶음 {@code portal:<소스 id>}를 결과 메시지에 적으므로 그 값을 돌려준다
+     *                — 화면이 {@code GET /registrations/batches/{batchId}}로 언론사들의 진행을 연다
+     */
     public record Registration(long id, String inputUrl, String domain, String channel, String status,
-                               String step, String resultMessage, Long sourceId, OffsetDateTime createdAt) {
+                               String step, String resultMessage, Long sourceId, OffsetDateTime createdAt, String batchId) {
+    }
+
+    /** 결과 메시지에 적힌 언론사 묶음 id ("… [묶음 portal:12]"). 워커 jobs.portal_message와 같은 형식 */
+    private static final Pattern PORTAL_BATCH = Pattern.compile("portal:\\d+");
+
+    static String batchIdOf(String column, String resultMessage) {
+        if (column != null) {
+            return column;
+        }
+        if (resultMessage == null) {
+            return null;
+        }
+        Matcher m = PORTAL_BATCH.matcher(resultMessage);
+        return m.find() ? m.group() : null;
     }
 
     @Transactional
@@ -209,14 +230,15 @@ public class RegistrationService {
                 .update();
     }
 
-    private static final String SELECT = """
-            SELECT id, input_url, normalized_domain, channel, status, step, result_message, source_id, created_at
+    static final String SELECT = """
+            SELECT id, input_url, normalized_domain, channel, status, step, result_message, source_id, created_at, batch_id
             FROM registration_request""";
 
     Registration map(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
+        String message = rs.getString("result_message");
         return new Registration(rs.getLong("id"), rs.getString("input_url"), rs.getString("normalized_domain"),
                 rs.getString("channel"), rs.getString("status"), rs.getString("step"),
-                rs.getString("result_message"), rs.getObject("source_id", Long.class),
-                rs.getObject("created_at", OffsetDateTime.class));
+                message, rs.getObject("source_id", Long.class),
+                rs.getObject("created_at", OffsetDateTime.class), batchIdOf(rs.getString("batch_id"), message));
     }
 }

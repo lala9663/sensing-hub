@@ -29,6 +29,7 @@ App.route('/registrations', async (view) => {
     </div>` : ''}
     <div class="panel">
       <div class="row"><h2 style="flex:1">내 요청</h2><button type="button" id="refresh" class="small">새로 고침</button></div>
+      <div id="mine-batch"></div>
       <div id="mine"></div>
     </div>`;
 
@@ -56,6 +57,7 @@ App.route('/registrations', async (view) => {
               <td>${badge(r.status)}</td>
               <td>${r.step ? badge(r.step) : '<span class="muted">-</span>'}</td>
               <td>${esc(r.resultMessage || '')}
+                ${r.batchId && r.batchId.startsWith('portal:') ? `<div class="small"><a href="#" data-batch="${esc(r.batchId)}">언론사 ${outletCount(r.resultMessage)}진행 보기</a></div>` : ''}
                 ${r.sourceId && App.isAdmin() ? `<div class="small"><a href="#/admin/sources/${r.sourceId}">소스 #${r.sourceId}</a></div>` : ''}</td>
               <td class="nowrap muted small">${App.fmtTime(r.createdAt)}</td>
             </tr>`).join('')}
@@ -64,6 +66,28 @@ App.route('/registrations', async (view) => {
   }
 
   view.querySelector('#refresh').addEventListener('click', () => App.guard(loadMine));
+
+  // 링크 모음(포털) 페이지 요청: 워커가 대신 등록한 언론사들의 묶음(portal:<소스 id>) 진행을 같은 묶음 패널로 연다
+  mineEl.addEventListener('click', e => {
+    const a = e.target.closest('a[data-batch]');
+    if (!a) return;
+    e.preventDefault();
+    const el = view.querySelector('#mine-batch');
+    el.innerHTML = `<div class="row"><span class="muted small">언론사 묶음 ${esc(a.dataset.batch)}</span>
+      <button type="button" class="small" id="mine-batch-close">닫기</button></div><div class="batch-progress mt"></div><div class="batch-items mt"></div>`;
+    el.querySelector('#mine-batch-close').addEventListener('click', () => {
+      if (stopBatchPoll) stopBatchPoll();
+      stopBatchPoll = null;
+      el.innerHTML = '';
+    });
+    startBatchPoll(a.dataset.batch, el);
+  });
+
+  /** 결과 메시지의 "언론사 N곳" → "N곳 " (없으면 빈 문자열) */
+  function outletCount(message) {
+    const m = /언론사 (\d+)곳/.exec(message || '');
+    return m ? `${m[1]}곳 ` : '';
+  }
 
   // ---------------------------------------------------------------- 한 건 등록
   const singleForm = view.querySelector('#single-form');
@@ -126,8 +150,9 @@ App.route('/registrations', async (view) => {
       </div>`;
   }
 
-  function renderBatch(summary) {
-    const el = view.querySelector('#batch-progress');
+  /** 묶음 진행 요약. container가 있으면 그 안의 .batch-progress(와 .batch-items 목록)에, 없으면 일괄 등록 결과의 #batch-progress에 그린다 */
+  function renderBatch(summary, container) {
+    const el = container ? container.querySelector('.batch-progress') : view.querySelector('#batch-progress');
     if (!el) return;
     const steps = Object.entries(summary.byStep || {}).map(([k, v]) => `${App.label(k)} ${v}`).join(' · ');
     el.innerHTML = `
@@ -140,9 +165,20 @@ App.route('/registrations', async (view) => {
         <span class="muted small">${esc(steps)}</span>
         ${summary.processing > 0 ? '<span class="muted small">5초마다 갱신</span>' : '<span class="small" style="color:var(--green)">모두 처리됨</span>'}
       </div>`;
+    const items = container ? container.querySelector('.batch-items') : null;
+    if (items) {
+      items.innerHTML = `
+        <table>
+          <thead><tr><th>언론사</th><th>상태</th><th>단계</th><th>결과</th></tr></thead>
+          <tbody>${(summary.items || []).map(i => `
+            <tr><td>${esc(i.domain)}</td><td>${badge(i.status)}</td><td>${i.step ? badge(i.step) : '<span class="muted">-</span>'}</td>
+                <td class="small">${esc(i.resultMessage || '')}</td></tr>`).join('')}
+          </tbody>
+        </table>`;
+    }
   }
 
-  function startBatchPoll(batchId) {
+  function startBatchPoll(batchId, container) {
     if (stopBatchPoll) stopBatchPoll();
     const tick = async () => {
       let summary;
@@ -153,7 +189,7 @@ App.route('/registrations', async (view) => {
         stopBatchPoll = null;
         throw e;
       }
-      renderBatch(summary);
+      renderBatch(summary, container);
       if (summary.processing === 0 && stopBatchPoll) {
         stopBatchPoll();
         stopBatchPoll = null;

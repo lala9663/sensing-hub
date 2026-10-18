@@ -28,8 +28,10 @@ from .discovery import matches
 from .fetcher import PoliteFetcher
 from .jobs import discover, probe_site
 from .llm import LlmClient, make_llm
+from . import portal
 
-# 온보딩 결과와 같은 분류: OK(자동 등록) | API(공개 API 소스, 키 필요) | REVIEW(관리자 큐) | BLOCKED(등록 불가) | ERROR(그 밖의 실패)
+# 온보딩 결과와 같은 분류: OK(자동 등록) | API(공개 API 소스, 키 필요) | PORTAL(링크 모음, 언론사 대신 등록) | REVIEW(관리자 큐) |
+# BLOCKED(등록 불가) | ERROR(그 밖의 실패)
 REVIEW_CODES = {"DISCOVERY_FAILED", "QUALITY_FAILED"}
 
 
@@ -80,6 +82,12 @@ def evaluate_site(url: str, settings: Settings, llm: LlmClient | None = None,
         result.code, result.message = e.code.value, str(e)
         if e.code.value in REVIEW_CODES:
             result.outcome = "REVIEW"
+            # 온보딩과 같이: 기사를 못 찾은 페이지가 다른 언론사로 가는 링크 모음이면 가리키는 언론사를 대신 등록한다
+            outlets = portal.detect(probe.home.text, probe.home.url, domain) if result.site_type else []
+            if outlets:
+                result.outcome, result.code = "PORTAL", "PORTAL_EXPANDED"
+                result.message = f"언론사 {len(outlets)}곳 대신 등록: " + ", ".join(o.domain for o in outlets[:8]) \
+                    + (" …" if len(outlets) > 8 else "")
         elif e.blocking or e.code.value == "ROBOTS_DISALLOWED":
             result.outcome = "BLOCKED"
     except Exception as e:  # 측정 도구는 한 사이트 오류로 멈추지 않는다
@@ -123,7 +131,7 @@ def summarize(results: list[SiteResult], target: int | None = None) -> str:
     ok = sum(r.outcome == "OK" for r in results)
     goal = f" (목표 {target}곳: {'달성' if ok >= target else '미달'})" if target else ""
     lines.append(f"\n자동 등록 성공 {ok}/{len(results)}곳{goal}")
-    counts = {k: sum(r.outcome == k for r in results) for k in ("API", "REVIEW", "BLOCKED", "ERROR")}
+    counts = {k: sum(r.outcome == k for r in results) for k in ("API", "PORTAL", "REVIEW", "BLOCKED", "ERROR")}
     lines.append("나머지: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
     sampled = [r for r in results if r.sample_url]
     if sampled:

@@ -18,8 +18,9 @@ from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, look
                         matches, parse_feed_entries, same_site, sitemap_urls)
 from .evidence import EvidenceStore
 from .extract import extract_article, links_with_dates
-from .fetcher import EVIDENCE_CHARS, PoliteFetcher
+from .fetcher import EVIDENCE_CHARS, Page, PoliteFetcher
 from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
+from . import portal
 from .policy import defaults_for, guess_site_type, next_interval, passes_quality
 from .recipe import propose_recipe
 
@@ -91,9 +92,19 @@ class JobRunner:
         #    LLM이 설정돼 있으면 홈·샘플 페이지로 레시피를 쓰게 하고, 같은 품질 검사를 통과하면 그것을 쓴다
         self.db.update_registration(job.source_id, step="DISCOVERY",
                                     message="기사 입구와 주소 패턴을 찾고 샘플 기사로 품질을 검사하는 중입니다.")
-        result, detail = discover(
-            self.f, domain, base_url, site_type, llm=self.llm, settings=self.s,
-            progress=lambda msg: self.db.update_registration(job.source_id, step="DISCOVERY", message=msg))
+        try:
+            result, detail = discover(
+                self.f, domain, base_url, site_type, llm=self.llm, settings=self.s,
+                progress=lambda msg: self.db.update_registration(job.source_id, step="DISCOVERY", message=msg))
+        except CrawlFailure as e:
+            # 기사를 못 찾은 페이지가 다른 언론사로 가는 링크 모음(뉴스스탠드 등)이면, 실패시키지 않고
+            # 가리키는 언론사를 대신 등록한다. 사전 점검에서 받은 홈을 다시 써서 요청을 더 보내지 않는다
+            if e.code not in (Code.DISCOVERY_FAILED, Code.QUALITY_FAILED):
+                raise
+            outlets = portal.detect(probe.home.text, probe.home.url, domain)
+            if not outlets:
+                raise
+            return self._expand_portal(job, source, outlets)
 
         # 4) 기본값 적용 → 설정 새 버전 → ACTIVE (레시피의 selectors·recipe_source도 설정에 들어간다)
         defaults = defaults_for(site_type)
@@ -121,6 +132,36 @@ class JobRunner:
         log.info("onboard ok source=%s domain=%s method=%s recipe=%s v%s new=%s", job.source_id, domain,
                  result.method, result.recipe_source, version, stats.new)
         return status
+
+    # ------------------------------------------------------------------ ONBOARD (링크 모음 페이지 → 언론사 확장)
+    def _expand_portal(self, job: Job, source: dict, outlets: list[portal.Outlet]) -> str:
+        """모음 페이지가 가리키는 언론사를 요청자 이름으로 등록하고, 모음 페이지 소스는 EXCLUDED/PORTAL_EXPANDED로 둔다.
+
+        언론사마다 백엔드 등록과 같은 행(사이트·소스 PENDING·ONBOARD 작업·등록 요청)을 만들며 batch_id는 portal:<소스 id>라
+        화면이 묶음 진행(/registrations/batches/portal:<id>)으로 언론사들의 진행을 보여 준다. 이미 열린 소스가 있는 도메인과
+        상한(Settings.portal_max_outlets)을 넘는 것은 건너뛰고 로그에 남긴다.
+        """
+        reg = self.db.load_registration(job.source_id)
+        user_id = reg["user_id"] if reg else source.get("requested_by")
+        channel = reg["channel"] if reg else "WEB"
+        batch_id = portal_batch_id(job.source_id)
+        cap = max(0, self.s.portal_max_outlets)
+        registered: list[str] = []
+        duplicates: list[str] = []
+        for outlet in outlets[:cap]:
+            new_id = self.db.register_outlet(user_id=user_id, channel=channel, input_url=outlet.base_url,
+                                             domain=outlet.domain, base_url=outlet.base_url, name=outlet.name,
+                                             batch_id=batch_id)
+            (registered if new_id is not None else duplicates).append(outlet.domain)
+        over_cap = [o.domain for o in outlets[cap:]]
+
+        message = portal_message(len(registered), batch_id, len(duplicates), len(over_cap))
+        self.db.set_source_status(job.source_id, "EXCLUDED", Code.PORTAL_EXPANDED.value)
+        self.db.update_registration(job.source_id, status="COMPLETED", step="DONE", message=message)
+        self.db.finish_job(job.id, "SUCCESS", found=len(outlets), new=len(registered))
+        log.info("portal expanded source=%s domain=%s batch=%s registered=%s skipped_duplicate=%s skipped_cap=%s",
+                 job.source_id, source["domain"], batch_id, registered, duplicates, over_cap)
+        return "SUCCESS"
 
     # ------------------------------------------------------------------ ONBOARD (공개 API)
     def _onboard_api(self, job: Job, source: dict, provider: Provider) -> str:
@@ -606,6 +647,7 @@ class Probe:
     robots: str
     ai_blocked: bool
     site_type: str
+    home: Page | None = None   # 사전 점검에서 받은 홈. 링크 모음 판정이 다시 받지 않고 쓴다
 
 
 def probe_site(f: PoliteFetcher, domain: str, base_url: str) -> Probe:
@@ -622,7 +664,25 @@ def probe_site(f: PoliteFetcher, domain: str, base_url: str) -> Probe:
             raise CrawlFailure(Code.BOT_CHALLENGE, "사이트가 자동 접근을 거부합니다 (홈 403).", url=base_url,
                                http_status=403, stage="PROBE", evidence=e.evidence) from e
         raise
-    return Probe(robots, ai_blocked, guess_site_type(domain, home.text))
+    return Probe(robots, ai_blocked, guess_site_type(domain, home.text), home)
+
+
+def portal_batch_id(source_id: int) -> str:
+    """모음 페이지 소스가 대신 등록한 언론사들의 묶음 id (registration_request.batch_id, VARCHAR(40))."""
+    return f"portal:{source_id}"
+
+
+def portal_message(registered: int, batch_id: str, duplicates: int = 0, over_cap: int = 0) -> str:
+    """등록 요청 결과 메시지. 화면이 '묶음 portal:<id>'를 읽어 언론사들의 진행을 연다."""
+    msg = MESSAGES[Code.PORTAL_EXPANDED].format(n=registered)
+    notes = []
+    if duplicates:
+        notes.append(f"이미 등록된 {duplicates}곳 제외")
+    if over_cap:
+        notes.append(f"상한을 넘은 {over_cap}곳 제외")
+    if notes:
+        msg += f" ({', '.join(notes)})"
+    return f"{msg} [묶음 {batch_id}]"
 
 
 def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site_type: str = "ETC") -> str:

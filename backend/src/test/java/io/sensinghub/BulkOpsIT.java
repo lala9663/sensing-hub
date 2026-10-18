@@ -206,6 +206,60 @@ class BulkOpsIT {
         assertThat(count("SELECT count(*) FROM registration_request")).isEqualTo(52);
     }
 
+    // ------------------------------------------------------------------ 1-2. 링크 모음(포털) 페이지가 대신 등록한 언론사 묶음
+
+    @Test
+    void portalBatchSummaryWorksForWorkerBatchIdAndPortalRegistrationPointsToIt() {
+        // 워커가 한 일을 SQL로 흉내 낸다: 모음 페이지 소스 1번은 EXCLUDED/PORTAL_EXPANDED, 그 요청은 COMPLETED(메시지에 묶음 id),
+        // 대신 등록한 언론사 2곳은 batch_id = portal:1 (하나는 아직 진행 중, 하나는 끝남)
+        jdbc.sql("""
+                INSERT INTO site (id, domain, base_url) VALUES
+                    (1, 'newsstand.naver.com', 'https://newsstand.naver.com'),
+                    (2, 'a-ilbo.example.com', 'https://www.a-ilbo.example.com'),
+                    (3, 'b-news.example.com', 'https://b-news.example.com')
+                """).update();
+        jdbc.sql("""
+                INSERT INTO source (id, site_id, name, status, status_reason, requested_by) VALUES
+                    (1, 1, 'newsstand.naver.com', 'EXCLUDED', 'PORTAL_EXPANDED', 2),
+                    (2, 2, 'a-ilbo.example.com', 'PENDING', NULL, 2),
+                    (3, 3, 'b-news.example.com', 'ACTIVE', NULL, 2)
+                """).update();
+        jdbc.sql("""
+                INSERT INTO registration_request (user_id, input_url, normalized_domain, channel, status, step, result_message, source_id, batch_id)
+                VALUES (2, 'https://newsstand.naver.com/', 'newsstand.naver.com', 'WEB', 'COMPLETED', 'DONE',
+                        '링크 모음 페이지입니다. 이 페이지가 가리키는 언론사 2곳을 대신 등록했습니다. [묶음 portal:1]', 1, NULL),
+                       (2, 'https://www.a-ilbo.example.com', 'a-ilbo.example.com', 'WEB', 'PROCESSING', 'DISCOVERY', '탐색 중', 2, 'portal:1'),
+                       (2, 'https://b-news.example.com', 'b-news.example.com', 'WEB', 'COMPLETED', 'DONE', '등록 완료.', 3, 'portal:1')
+                """).update();
+
+        JsonNode summary = get("registrar", "/api/v1/registrations/batches/portal:1");
+        assertThat(summary.get("batchId").asText()).isEqualTo("portal:1");
+        assertThat(summary.get("total").asInt()).isEqualTo(2);
+        assertThat(summary.get("completed").asLong()).isEqualTo(1);
+        assertThat(summary.get("processing").asLong()).isEqualTo(1);
+        assertThat(summary.get("byStep").get("DISCOVERY").asLong()).isEqualTo(1);
+        assertThat(summary.get("items")).hasSize(2);
+        assertThat(summary.get("items").get(0).get("domain").asText()).isEqualTo("a-ilbo.example.com");
+        assertThat(summary.get("items").get(0).get("batchId").asText()).isEqualTo("portal:1");
+
+        // 모음 페이지 요청 자체는 묶음에 들지 않지만, 결과 메시지의 묶음 id를 batchId로 돌려줘 화면이 언론사 진행을 연다
+        JsonNode portal = null;
+        for (JsonNode r : get("registrar", "/api/v1/registrations/mine")) {
+            if (r.get("domain").asText().equals("newsstand.naver.com")) {
+                portal = r;
+            }
+        }
+        assertThat(portal).isNotNull();
+        assertThat(portal.get("status").asText()).isEqualTo("COMPLETED");
+        assertThat(portal.get("batchId").asText()).isEqualTo("portal:1");
+        assertThat(get("registrar", "/api/v1/registrations/" + portal.get("id").asLong()).get("batchId").asText()).isEqualTo("portal:1");
+
+        // 요청자 본인과 ADMIN만, 없는 묶음은 404 (일괄 등록 묶음과 같은 규칙)
+        assertThat(getRaw("viewer", "/api/v1/registrations/batches/portal:1").getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(get("admin", "/api/v1/registrations/batches/portal:1").get("total").asInt()).isEqualTo(2);
+        assertThat(getRaw("admin", "/api/v1/registrations/batches/portal:99").getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
     @Test
     void bulkAcceptsPlainTextOneUrlPerLineWithComments() {
         String text = """
