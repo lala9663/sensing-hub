@@ -915,10 +915,10 @@ def test_crawl_fails_with_last_error_when_no_hub_opens(tmp_path):
 
 def test_crawl_stops_at_blocking_hub(tmp_path):
     runner, store, job = _crawl_runner(tmp_path, _news_handler({
-        "/news/articleList.html?sc=A": 404, "/news/articleList.html?sc=B": 403}))
+        "/news/articleList.html?sc=A": 404, "/news/articleList.html?sc=B": 429}))   # 429(요청 제한)는 차단 신호. 봇 확인 화면 없는 403은 이제 비차단
     with pytest.raises(CrawlFailure) as e:
         runner._crawl(job, SOURCE, NEWS_CONFIG)
-    assert e.value.code == Code.BOT_CHALLENGE and e.value.blocking
+    assert e.value.code == Code.RATE_LIMITED and e.value.blocking
     assert store.record_error.call_count == 1                              # 앞서 건너뛴 허브의 404는 남긴다
     assert store.record_error.call_args.args[1].code == Code.HTTP_4XX
 
@@ -1874,3 +1874,30 @@ def test_title_unescapes_double_encoded_entities():
             '<meta property="article:published_time" content="2026-10-17T12:00:00+09:00"></head><body><p>본문</p></body></html>')
     art = extract_article(html, "https://www.korea.kr/briefing/pressReleaseView.do?newsId=1")
     assert art.title == "문체부와 전남, 문화·체육·관광 협력 & 논의"
+
+
+def test_plain_403_is_not_a_site_block_but_home_403_is():
+    """추측 경로(/rss/)의 403은 그 경로만 거부된 것(HTTP_4XX, 비차단). 홈이 403이면 사이트 차단(BOT_CHALLENGE)."""
+    from sensing_worker.jobs import probe_site
+
+    def handler(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        if request.url.path == "/rss/":
+            return httpx.Response(403, text="<html><title>주간조선</title><body>forbidden</body></html>")
+        return httpx.Response(200, text="<html><body>" + "<p>home</p>" * 5 + "</body></html>")
+
+    f = _fetcher(handler)
+    with pytest.raises(CrawlFailure) as e:
+        f.get("https://site.example/rss/")
+    assert e.value.code == Code.HTTP_4XX and e.value.http_status == 403 and not e.value.blocking
+    assert f.get("https://site.example/").status == 200
+
+    def home_forbidden(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(403, text="<html><body>forbidden</body></html>")
+
+    with pytest.raises(CrawlFailure) as e:
+        probe_site(_fetcher(home_forbidden), "site.example", "https://site.example")
+    assert e.value.code == Code.BOT_CHALLENGE and e.value.blocking and e.value.stage == "PROBE"

@@ -262,9 +262,16 @@ class PoliteFetcher:
             evidence = page.text[:EVIDENCE_CHARS]
             if page.status == 429:
                 raise CrawlFailure(Code.RATE_LIMITED, url=url, http_status=429, evidence=evidence)
-            if page.status in (401, 403):
-                code = Code.LOGIN_REQUIRED if page.status == 401 else Code.BOT_CHALLENGE
-                raise CrawlFailure(code, url=url, http_status=page.status, evidence=evidence)
+            if page.status == 401:
+                raise CrawlFailure(Code.LOGIN_REQUIRED, url=url, http_status=401, evidence=evidence)
+            if page.status == 403:
+                # 봇 확인 화면이 보이면 차단(BLOCKED). 그렇지 않은 403은 "이 경로는 거부"일 뿐이다 — 주간조선처럼
+                # 탐색기가 넘겨본 /rss/ 하나가 403이라고 사이트 전체를 차단으로 끝내면 안 된다. 홈이 403이면
+                # probe_site가 사이트 단위 차단으로 올린다
+                if _has_challenge(page.text):
+                    raise CrawlFailure(Code.BOT_CHALLENGE, url=url, http_status=403, evidence=evidence)
+                raise CrawlFailure(Code.HTTP_4XX, "접근이 거부된 페이지입니다 (403).", url=url, http_status=403,
+                                   evidence=evidence)
             if page.status >= 400:
                 raise CrawlFailure(Code.HTTP_4XX, url=url, http_status=page.status, evidence=evidence)
             if _has_challenge(page.text):

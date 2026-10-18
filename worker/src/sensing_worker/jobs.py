@@ -614,7 +614,14 @@ def probe_site(f: PoliteFetcher, domain: str, base_url: str) -> Probe:
     ai_blocked = f.ai_bots_blocked(base_url)
     if robots == "DISALLOWED":
         raise CrawlFailure(Code.ROBOTS_DISALLOWED, url=base_url, stage="PROBE")
-    home = f.get(base_url)
+    try:
+        home = f.get(base_url)
+    except CrawlFailure as e:
+        if e.code == Code.HTTP_4XX and e.http_status == 403:
+            # 홈 자체가 403이면 (봇 확인 화면이 없어도) 사이트 단위 차단으로 본다 — 관리자 재점검으로만 다시 시도
+            raise CrawlFailure(Code.BOT_CHALLENGE, "사이트가 자동 접근을 거부합니다 (홈 403).", url=base_url,
+                               http_status=403, stage="PROBE", evidence=e.evidence) from e
+        raise
     return Probe(robots, ai_blocked, guess_site_type(domain, home.text))
 
 
