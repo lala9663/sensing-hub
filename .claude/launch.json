@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "backend",
-      "runtimeExecutable": "C:\\Windows\\System32\\cmd.exe",
-      "runtimeArgs": ["/c", "scripts\\dev\\run-backend.cmd"],
+      "runtimeExecutable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "runtimeArgs": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\dev\\run-backend.ps1"],
       "port": 8080
     }
   ]

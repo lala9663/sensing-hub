@@ -12,7 +12,7 @@
 #   WSL이 뜰 때 같이 뜨고, 세션 동안 살려 두려면 `wsl -d Ubuntu -u root -- tail -f /dev/null` 같은 프로세스를 하나 띄워 둔다.
 #   sudo 비밀번호 없이 돌리려면 `wsl -d Ubuntu -u root -- bash <이 스크립트>` 로 실행한다.
 #
-# 쓰는 쪽 설정 (scripts/dev/run-backend.cmd, run-worker.cmd가 이 값을 기본으로 쓴다):
+# 쓰는 쪽 설정 (scripts/dev/run-backend.ps1, run-worker.ps1가 이 값을 기본으로 쓴다):
 #   backend: SENSING_DB_URL=jdbc:postgresql://127.0.0.1:5433/sensing  (테스트: SENSING_IT_DB_URL=jdbc:postgresql://127.0.0.1:5433/sensing_it)
 #   worker : SENSING_DB_DSN=postgresql://sensing:sensing@127.0.0.1:5433/sensing (테스트: SENSING_TEST_DSN=...@127.0.0.1:5433/sensing_test)
 set -euo pipefail
