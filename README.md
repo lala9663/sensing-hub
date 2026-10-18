@@ -83,6 +83,7 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 관리자 · 소스 | 상태별 건수 필터, 건강 상태 탭(지연 소스 강조), 소스 상세(작업·오류·설정 버전 활성화·수집 주기 잠금) |
 | 관리자 · 운영 지표 | `/ops/overview`를 카드로(소스 상태·큐 적체·워커 부족 경고·24시간 결과·수집량 상위·실패 코드), 30초마다 갱신 |
 | 관리자 · API 키 | 제공자(dart · naver_news · data_go_kr)·키·메모 등록, 다시 진행된 소스 수 표시, 목록(비밀 없음)·삭제 |
+| 관리자 · 케이던시아 연동 | 연결 주소·목업 표시·마지막 동기화 결과(공급사·생성·갱신·보관·그대로)·이벤트 전달 대기/보낸 수 카드, 지금 동기화 / 지금 전달, 동기화 실행 기록, (데모 전용) 케이던시아가 받은 이벤트 |
 
 ### 워커 환경 변수 (접속)
 
@@ -172,6 +173,17 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 | `SENSING_MAIL_FROM` | (없음) | 보내는 주소. 비우면 `SENSING_MAIL_USERNAME`, 그것도 비면 메일 서버가 정한다 |
 | `SENSING_MAIL_AUTH` / `SENSING_MAIL_STARTTLS` | `true` / `true` | 인증 없는 사내 릴레이(25번 포트)면 둘 다 `false` |
 | `SENSING_DIGEST_ENABLED` / `SENSING_DIGEST_TICK_MS` | `true` / `300000` | 다이제스트 스케줄러 켜기·확인 간격 |
+
+### 케이던시아 연동 환경 변수 (M3, 목업)
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_CAIDENTIA_BASE_URL` | `http://127.0.0.1:<port>/mock/caidentia/api` | 케이던시아 API 주소. **실제 시스템이 나오면 이것만 바꾼다** (기본은 이 서버 안의 가짜 케이던시아) |
+| `SENSING_CAIDENTIA_API_KEY` | `mock-key` | 헤더 `X-Caidentia-Key`로 보내는 키. 가짜 서버도 같은 값을 요구한다 |
+| `SENSING_CAIDENTIA_ENABLED` | `true` | 스케줄러(동기화·전달) 켜기. 꺼도 화면의 "지금 동기화 / 지금 전달"은 된다 |
+| `SENSING_CAIDENTIA_SYNC_CRON` | `0 0 6 * * *` | 공급사 마스터 동기화 시각 (KST) |
+| `SENSING_CAIDENTIA_PUSH_ENABLED` / `SENSING_CAIDENTIA_PUSH_TICK_MS` | `true` / `300000` | HIGH·MEDIUM 회사 신호를 리스크 이벤트로 전달 (5분마다) |
+| `SENSING_CAIDENTIA_MOCK_ENABLED` | `true` | 가짜 케이던시아 서버(`/mock/caidentia/api`) 띄우기. 실제 시스템을 보게 되면 끈다 |
 
 ### 회사(거래처) 마스터와 공급사 리스크 신호 (M3)
 
@@ -284,7 +296,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 | M0 골격·환경 | 스키마, 등록 API, 스케줄러, 작업 큐, 워커 골격 | 완료 |
 | M1 하네스·탐색 | 자동 탐색 고도화, 도메인 단위 간격(워커 간 공유), 이상 감지, 관리자 처리 대기 API, LLM 레시피 생성 | 완료 (허브 한 곳 실패 내성만 남음) |
 | M2 외부 API·키워드 감시 | API 카탈로그·자격 증명 저장소·API 수집기(뉴스 검색·DART·공공데이터포털), 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트 알림, 최소 화면(등록·내 요청·관리자 큐) | 진행 중 |
-| M3 회사 레이어·공급사 리스크 소스 | 회사(거래처) 마스터와 별칭 매칭, 문서→회사 연결, 리스크 신호 분류(재무·제재·사고·경영 변동), 공공 API 커넥터(국세청 사업자 상태, 조달청 부정당업자, DART 기업개황·재무), 회사별 다이제스트, 케이던시아 연동(마스터 동기화·이벤트 전달, SDS API 확인 뒤) | 진행 중 |
+| M3 회사 레이어·공급사 리스크 소스 | 회사(거래처) 마스터와 별칭 매칭, 문서→회사 연결, 리스크 신호 분류(재무·제재·사고·경영 변동), 공공 API 커넥터(국세청 사업자 상태, 조달청 부정당업자, DART 기업개황·재무), 회사별 다이제스트, 케이던시아 연동(마스터 동기화·이벤트 전달 — 목업으로 형태 완료, 실제 API는 SDS 확인 뒤) | 진행 중 |
 | M4 동적·첨부 | Playwright 동적 수집, 첨부 다운로드·HWP/PDF 텍스트 추출, 원문 삭제(GONE) 감지, (합의 시) 회사 계정 로그인 세션 | |
 | M5 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 모달·tool calling(`register_source`·`get_source_status`·`submit_api_key`), 대화 저장 | |
 | M6 관리자·운영 | 레시피 수정·미리보기, 설정 백필, 감사 로그 화면, 운영 지표 | |
@@ -352,7 +364,15 @@ M3에서 한 일:
   24시간 결과·수집량 상위 10·실패 코드 상위 10·처리량 `demandRatio`)와 `GET /api/v1/ops/sources/health`(마지막 성공이 오래된 순, `overdue`), 워커가 최근 10회 주기
   수집의 새 문서 평균으로 주기를 두 배씩 늘리거나(최대 1440분) 기본값으로 되돌림(`SENSING_ADAPTIVE_INTERVAL`, 변경은 로그와 `crawl_job.note`에),
   `PUT /api/v1/sources/{id}`로 사람이 정한 주기는 `interval_locked`로 잠겨 자동 조정이 덮지 않음
-- [ ] DART 기업개황·재무(FINANCIAL), 회사별 다이제스트 구독 화면, 케이던시아 연동
+- [x] 케이던시아 연동(목업): 실제 API가 아직 없어 백엔드 안에 가짜 케이던시아(`/mock/caidentia/api`: 공급사 마스터 `GET/PUT suppliers`, 리스크 이벤트
+  `POST/GET risk-events`, 헤더 `X-Caidentia-Key` 인증 흉내, 가공의 공급사 9곳 메모리 씨앗, `SENSING_CAIDENTIA_MOCK_ENABLED`)를 두고, 연동 코드
+  (`io.sensinghub.caidentia`: `CaidentiaClient` 인터페이스 + RestClient 구현, 10초 제한)는 그것을 외부 시스템처럼 HTTP로 부른다. 공급사 마스터 동기화
+  (`CaidentiaSyncService`, 매일 06:00 KST `SENSING_CAIDENTIA_SYNC_CRON`)는 `external_id`(= supplierId) → 사업자번호 순으로 회사를 맞춰 생성·갱신(보관됐으면 복구)
+  하고 INACTIVE 공급사는 보관하며, 결과를 `caidentia_sync_run`(V10: fetched·created·updated·archived·unchanged·error)에 남긴다. 리스크 이벤트 전달
+  (`CaidentiaPushService`, 5분마다)은 케이던시아 공급사인 회사의 HIGH·MEDIUM 신호를 `{supplierId, companyName, kind, severity, title, observedAt, detail}`로
+  보내고 `company_signal.pushed_at`을 찍는다 (실패는 다음 틱에 재시도). 관리자 API `/api/v1/integrations/caidentia`(상태·`sync-now`·`push-now`·데모용
+  `received-events`)와 화면. **실제 케이던시아가 나오면 `SENSING_CAIDENTIA_BASE_URL`·`SENSING_CAIDENTIA_API_KEY`와 `RestCaidentiaClient`의 필드 매핑만 바꾼다**
+- [ ] DART 기업개황·재무(FINANCIAL), 회사별 다이제스트 구독 화면, 케이던시아 실제 API 연결(SDS 확인 뒤)
 
 ## 원칙
 
