@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
-    store = Store(settings.db_url)
+    store = Store(settings.db_url, onboard_ratio=settings.onboard_ratio)
     throttle = DbThrottle(settings.db_url, settings.min_interval_seconds) if settings.shared_throttle else None
     fetcher = PoliteFetcher(settings, throttle=throttle)
     llm = make_llm(settings)   # 제공자 설정이 잘못됐으면(패키지 없음·주소 없음) 여기서 바로 멈춘다

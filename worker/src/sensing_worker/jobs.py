@@ -20,7 +20,7 @@ from .evidence import EvidenceStore
 from .extract import extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, PoliteFetcher
 from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
-from .policy import defaults_for, guess_site_type, passes_quality
+from .policy import defaults_for, guess_site_type, next_interval, passes_quality
 from .recipe import propose_recipe
 
 LLM_STEP_MESSAGE = "사이트 구조를 분석해 수집 방법을 만드는 중입니다."
@@ -104,18 +104,19 @@ class JobRunner:
             note = "LLM 레시피로 생성" if first else "LLM 레시피 다시 생성"
         else:
             note = "자동 탐색으로 생성" if first else "자동 탐색 다시 실행"
-        config_id, version = self.db.activate_new_config(job.source_id, config, f"{note} ({detail})"[:500],
-                                                         defaults["interval_minutes"])
+        # 사람이 소스 상세에서 정한 주기(interval_locked)는 재탐색해도 그대로 둔다
+        interval = int(source["interval_minutes"]) if source.get("interval_locked") else defaults["interval_minutes"]
+        config_id, version = self.db.activate_new_config(job.source_id, config, f"{note} ({detail})"[:500], interval)
 
         # 5) 첫 수집: 허브(피드·목록 첫 페이지)에 보이는 최신 기사만 가져온다
         self.db.update_registration(job.source_id, step="FIRST_CRAWL", message="첫 수집 중입니다.")
         stats = self._crawl(job, source, config)
-        self.db.mark_crawl_result(job.source_id, True, defaults["interval_minutes"])
+        self.db.mark_crawl_result(job.source_id, True, interval)
         status = "PARTIAL" if stats.errors else "SUCCESS"
         self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors, config_id)
         self.db.update_registration(
             job.source_id, status="COMPLETED", step="DONE",
-            message=f"등록 완료. 기사 {stats.new}건을 수집했고 {defaults['interval_minutes']}분마다 업데이트합니다."
+            message=f"등록 완료. 기사 {stats.new}건을 수집했고 {interval}분마다 업데이트합니다."
                     + (" 언론사로 분류되어 제목·링크·발행일만 저장합니다." if defaults["store_scope"] == "TITLE_LINK" else ""))
         log.info("onboard ok source=%s domain=%s method=%s recipe=%s v%s new=%s", job.source_id, domain,
                  result.method, result.recipe_source, version, stats.new)
@@ -222,11 +223,29 @@ class JobRunner:
             log.warning("source %s BROKEN: %s consecutive anomalies", job.source_id, streak)
         elif streak == 0 and source["status"] in ("BLOCKED", "BROKEN"):  # 관리자 재점검 통과
             self.db.set_source_status(job.source_id, "ACTIVE")
-        self.db.mark_crawl_result(job.source_id, True, source["interval_minutes"])
+        interval, note = self._adapt_interval(job, source, stats)
+        self.db.mark_crawl_result(job.source_id, True, interval)
         status = "PARTIAL" if stats.errors else "SUCCESS"
         self.db.finish_job(job.id, status, stats.found, stats.new, stats.errors,
-                           source["active_config_version_id"])
+                           source["active_config_version_id"], note=note)
         return status
+
+    def _adapt_interval(self, job: Job, source: dict, stats: CrawlStats) -> tuple[int, str | None]:
+        """주기 자동 조정 (SENSING_ADAPTIVE_INTERVAL). 사이트 소스(kind SITE)의 주기 수집에서만, 이번 실행을 포함한 최근
+        adaptive_window회의 새 문서 평균으로 판단한다. 바뀌면 source.interval_minutes만 고치고 로그와 crawl_job.note에 남긴다.
+        사람이 PUT으로 정한 주기(interval_locked)는 그대로 둔다. 키워드 감시는 백엔드가 정한 주기를 쓰므로 건드리지 않는다."""
+        current = int(source["interval_minutes"])
+        if not self.s.adaptive_interval or job.job_type != "CRAWL" or source.get("kind", "SITE") != "SITE":
+            return current, None
+        counts = [stats.new] + self.db.recent_new_counts(job.source_id, self.s.adaptive_window - 1)
+        base = defaults_for(source.get("site_type") or "ETC")["interval_minutes"]
+        new, note = next_interval(current, base, counts, window=self.s.adaptive_window, min_new=self.s.adaptive_min_new,
+                                  max_articles=self.s.max_articles_per_run, max_interval=self.s.adaptive_max_interval,
+                                  locked=bool(source.get("interval_locked")))
+        if note:
+            self.db.set_interval(job.source_id, new)
+            log.info("adaptive interval source=%s domain=%s: %s", job.source_id, source.get("domain"), note)
+        return new, note
 
     def _crawl(self, job: Job, source: dict, config: dict) -> CrawlStats:
         stats = CrawlStats()

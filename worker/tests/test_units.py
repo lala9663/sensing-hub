@@ -18,7 +18,8 @@ from sensing_worker.jobs import discover
 from sensing_worker.fetcher import Page, PoliteFetcher, client_redirect_target, compat_ssl_context
 from sensing_worker.llm import (FALLBACK_BETA, AnthropicLlm, LlmUnavailable, NoLlm, OpenAiCompatLlm, extract_json,
                                 generate_recipe, make_llm, validate_schema)
-from sensing_worker.policy import defaults_for, guess_site_type, passes_quality
+from sensing_worker.db import preferred_job_type
+from sensing_worker.policy import defaults_for, guess_site_type, next_interval, passes_quality
 from sensing_worker.recipe import RECIPE_SCHEMA, clean_html, quick_check
 from sensing_worker.throttle import LocalThrottle, throttle_key
 
@@ -1837,3 +1838,30 @@ def test_g2b_check_kind_records_debarment_signals_with_mock_store(tmp_path):
     assert args[6].isoformat() == "2026-01-01T00:00:00+09:00" and kwargs["source_id"] == 3    # observed_at = 제재 시작일 (KST)
     assert store.finish_job.call_args.args[:4] == (10, "SUCCESS", 2, 1)
     store.load_credential.assert_called_once_with("data_go_kr", "unit-secret")
+
+
+def test_claim_order_alternates_onboard_and_crawl():
+    # 기본 3:1 — 등록 셋을 집으면 네 번째는 주기 수집을 먼저 집는다. 빈 polling은 세지 않으므로 claimed만 본다
+    assert [preferred_job_type(n, 3) for n in range(8)] == ["ONBOARD"] * 3 + ["CRAWL"] + ["ONBOARD"] * 3 + ["CRAWL"]
+    assert [preferred_job_type(n, 1) for n in range(4)] == ["ONBOARD", "CRAWL", "ONBOARD", "CRAWL"]
+    assert all(preferred_job_type(n, 0) == "ONBOARD" for n in range(10))     # 0이면 예전 규칙
+
+
+def test_adaptive_interval_grows_when_quiet_and_returns_to_base_when_busy():
+    # 늘리기: 최근 10회 평균 새 문서 0.2건 → 두 배. 상한 1440분
+    assert next_interval(60, 60, [0, 0, 0, 0, 0, 1, 0, 0, 1, 0])[0] == 120
+    assert next_interval(120, 60, [0] * 10)[0] == 240
+    new, note = next_interval(1000, 60, [0] * 10)
+    assert new == 1440 and "1000→1440분" in note and "평균 새 문서 0.0건" in note
+    assert next_interval(1440, 60, [0] * 10) == (1440, None)                  # 상한에서는 더 안 늘린다
+    # 줄이기: 평균이 실행당 상한(40)의 절반을 넘으면 기본값까지 한 번에
+    new, note = next_interval(480, 60, [25, 30, 21, 40, 22, 35, 28, 19, 33, 40])
+    assert new == 60 and "480→60분" in note and "기본값으로" in note
+    assert next_interval(60, 60, [40] * 10) == (60, None)                     # 이미 기본값
+    # 그 사이는 그대로. 이력이 10회 미만이면 판단 보류
+    assert next_interval(60, 60, [3, 5, 2, 4, 6, 1, 3, 2, 5, 4]) == (60, None)
+    assert next_interval(60, 60, [0] * 9) == (60, None)
+    assert next_interval(60, 60, [0] * 15, window=5)[0] == 120                # 창은 설정 가능 — 최신 5회만 본다
+    # 사람이 정한 주기는 어느 쪽으로도 건드리지 않는다
+    assert next_interval(30, 60, [0] * 10, locked=True) == (30, None)
+    assert next_interval(480, 60, [40] * 10, locked=True) == (480, None)

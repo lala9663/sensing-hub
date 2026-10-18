@@ -39,6 +39,27 @@ def defaults_for(site_type: str) -> dict:
     return {"interval_minutes": 180, "store_scope": "FULL", "collect_attachments": True}
 
 
+def next_interval(current: int, base: int, new_counts: list[int], *, window: int = 10, min_new: float = 0.5,
+                  max_articles: int = 40, max_interval: int = 1440, locked: bool = False) -> tuple[int, str | None]:
+    """주기 자동 조정. (새 주기, 바꾼 이유) — 바꾸지 않으면 (현재 주기, None).
+
+    - 사람이 정한 주기(locked)는 건드리지 않는다.
+    - 최근 window회 주기 수집이 다 모이기 전에는 판단하지 않는다 (등록 직후 몇 번은 지켜본다).
+    - 새 문서 평균이 min_new 미만이면 주기를 두 배로 늘린다 (최대 max_interval분). 조용한 사이트에 요청을 덜 보낸다.
+    - 새 문서 평균이 실행당 상한(max_articles)의 절반을 넘으면 사이트 유형 기본값(base)으로 되돌린다 — 더 자주 봐야 놓치지 않는다.
+    """
+    if locked or window <= 0 or len(new_counts) < window:
+        return current, None
+    recent = new_counts[:window]
+    avg = sum(recent) / len(recent)
+    if avg < min_new and current < max_interval:
+        new = min(current * 2, max_interval)
+        return new, f"주기 자동 조정 {current}→{new}분 (최근 {len(recent)}회 평균 새 문서 {avg:.1f}건)"
+    if avg > max_articles / 2 and current > base:
+        return base, f"주기 자동 조정 {current}→{base}분 (최근 {len(recent)}회 평균 새 문서 {avg:.1f}건, 기본값으로)"
+    return current, None
+
+
 def passes_quality(samples: list[Article], *, now: datetime | None = None, need: int = 4,
                    max_age_days: int = 30, attachments_ok: bool = False) -> tuple[bool, str]:
     """샘플 5건 중 4건 이상이 제목·발행일·본문 200자 이상이고, 최근 30일 안에 발행된 글이 있어야 한다.

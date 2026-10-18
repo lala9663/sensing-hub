@@ -953,3 +953,80 @@ def test_g2b_check_records_debarment_signal_once_and_skips_companies_without_biz
     assert cred["status"] == "INVALID" and "revoked-key" not in cred["last_error"]
     err = q(store, "SELECT code, url FROM crawl_error ORDER BY id DESC LIMIT 1")
     assert err["code"] == "API_KEY_INVALID" and "ServiceKey=***" in err["url"]
+
+
+def test_claim_job_alternates_onboard_and_crawl_three_to_one(env):
+    # 일괄 등록 6건(ONBOARD)과 주기 수집 3건(CRAWL)이 함께 대기 중이면 ONBOARD 셋마다 CRAWL 하나를 집는다
+    store, runner, settings, sites = env
+    waiting = [register(store, f"https://onboard{i}.example") for i in range(6)]
+    for i in range(3):
+        sid = register(store, f"https://due{i}.example")
+        store.conn.execute("UPDATE crawl_job SET status = 'SUCCESS' WHERE source_id = %s", (sid,))
+        store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'CRAWL', 'SCHEDULE')", (sid,))
+
+    order = []
+    while (job := store.claim_job("w1", 30)) is not None:
+        order.append(job.job_type[0])
+    assert "".join(order) == "OOOCOOOCC"
+    assert store.claimed == 9
+    # 같은 유형 안에서는 오래 기다린 순
+    rows = store.conn.execute("SELECT source_id FROM crawl_job WHERE job_type = 'ONBOARD' AND status = 'RUNNING' "
+                              "ORDER BY started_at, id").fetchall()
+    assert [r["source_id"] for r in rows] == waiting
+
+    # 비율 0이면 예전 규칙: ONBOARD만 먼저 다 집는다
+    store.conn.execute("UPDATE crawl_job SET status = 'QUEUED', locked_by = NULL, started_at = NULL WHERE status = 'RUNNING'")
+    legacy = Store(DSN, onboard_ratio=0)
+    try:
+        order = []
+        while (job := legacy.claim_job("w2", 30)) is not None:
+            order.append(job.job_type[0])
+        assert "".join(order) == "OOOOOOCCC"
+    finally:
+        legacy.close()
+
+
+def test_adaptive_interval_doubles_for_quiet_site_and_respects_lock(env):
+    store, runner, settings, sites = env
+    site = Site(news_site_routes()); sites.append(site)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"                   # 온보딩: 60분 (NEWS 기본값)
+
+    # 새 기사가 없는 주기 수집 9회까지는 지켜본다 (ONBOARD의 첫 수집은 세지 않는다)
+    for _ in range(9):
+        assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    src = q(store, "SELECT interval_minutes FROM source WHERE id = %s", source_id)
+    assert src["interval_minutes"] == 60
+    assert q(store, "SELECT count(*) AS c FROM crawl_job WHERE note IS NOT NULL")["c"] == 0
+
+    # 10회째: 최근 10회 평균 0건 → 60→120분, 실행 메모와 next_run_at에 반영
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    src = q(store, "SELECT interval_minutes, next_run_at FROM source WHERE id = %s", source_id)
+    assert src["interval_minutes"] == 120
+    job = q(store, "SELECT note, status FROM crawl_job ORDER BY id DESC LIMIT 1")
+    assert job["status"] == "SUCCESS" and job["note"].startswith("주기 자동 조정 60→120분")
+    assert q(store, "SELECT (next_run_at - now()) > interval '100 minutes' AS later FROM source WHERE id = %s", source_id)["later"]
+
+    # 계속 조용하면 다시 두 배
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    assert q(store, "SELECT interval_minutes FROM source WHERE id = %s", source_id)["interval_minutes"] == 240
+
+    # 사람이 소스 상세에서 주기를 정하면(interval_locked) 자동 조정이 덮지 않는다
+    store.conn.execute("UPDATE source SET interval_minutes = 30, interval_locked = TRUE WHERE id = %s", (source_id,))
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    src = q(store, "SELECT interval_minutes, interval_locked FROM source WHERE id = %s", source_id)
+    assert src["interval_minutes"] == 30 and src["interval_locked"]
+    assert q(store, "SELECT note FROM crawl_job ORDER BY id DESC LIMIT 1")["note"] is None
+
+    # 재탐색(ONBOARD 다시)도 잠긴 주기를 기본값으로 되돌리지 않는다
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'MANUAL')", (source_id,))
+    assert process_one(store, runner, settings) == "SUCCESS"
+    assert q(store, "SELECT interval_minutes FROM source WHERE id = %s", source_id)["interval_minutes"] == 30
+
+    # 설정으로 끌 수 있다
+    store.conn.execute("UPDATE source SET interval_minutes = 60, interval_locked = FALSE WHERE id = %s", (source_id,))
+    off = Settings(db_url=DSN, min_interval_seconds=0, max_retries=1, allow_private_hosts=True, worker_id="test-worker",
+                   evidence_dir=settings.evidence_dir, adaptive_interval=False)
+    quiet_runner = JobRunner(store, runner.f, off)
+    assert crawl(store, quiet_runner, off, source_id) == "SUCCESS"
+    assert q(store, "SELECT interval_minutes FROM source WHERE id = %s", source_id)["interval_minutes"] == 60

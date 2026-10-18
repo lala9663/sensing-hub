@@ -73,3 +73,12 @@ class Settings:
     enrich_batch: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_BATCH", "10")))
     # 문서당 LLM에 보여 줄 본문 글자 수 상한
     enrich_body_chars: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_BODY_CHARS", "4000")))
+    # 작업 큐 교대: 등록(ONBOARD)을 이 횟수 집을 때마다 주기 수집(CRAWL)을 한 번 먼저 집는다 (일괄 등록 수백 건이 주기 수집을 오래 막지 않도록).
+    # 0이면 예전처럼 ONBOARD를 항상 먼저 집는다
+    onboard_ratio: int = field(default_factory=lambda: int(os.getenv("SENSING_ONBOARD_RATIO", "3")))
+    # 주기 자동 조정: 최근 adaptive_window회 주기 수집의 새 문서 평균이 adaptive_min_new 미만이면 주기를 두 배로(최대 adaptive_max_interval분),
+    # max_articles_per_run의 절반을 넘으면 사이트 유형 기본값으로 되돌린다. 사람이 정한 주기(source.interval_locked)는 건드리지 않는다
+    adaptive_interval: bool = field(default_factory=lambda: _bool("SENSING_ADAPTIVE_INTERVAL", True))
+    adaptive_window: int = field(default_factory=lambda: int(os.getenv("SENSING_ADAPTIVE_WINDOW", "10")))
+    adaptive_min_new: float = field(default_factory=lambda: float(os.getenv("SENSING_ADAPTIVE_MIN_NEW", "0.5")))
+    adaptive_max_interval: int = field(default_factory=lambda: int(os.getenv("SENSING_ADAPTIVE_MAX_INTERVAL", "1440")))

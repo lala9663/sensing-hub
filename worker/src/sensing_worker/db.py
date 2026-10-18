@@ -30,27 +30,48 @@ class Job:
     attempt: int
 
 
+def preferred_job_type(claimed: int, onboard_ratio: int) -> str:
+    """이번 claim에서 먼저 집을 작업 유형. 등록(ONBOARD)을 onboard_ratio번 집을 때마다 주기 수집(CRAWL)을 한 번 먼저 집는다.
+
+    기본 3:1 — 일괄 등록 수백 건이 들어와도 주기 수집이 네 번에 한 번은 돌아간다. 원하는 유형이 없으면 다른 유형을 집으므로
+    큐가 한쪽뿐이면 그쪽을 계속 처리한다. onboard_ratio가 0 이하이면 예전 규칙(항상 ONBOARD 먼저)이다.
+    """
+    if onboard_ratio <= 0:
+        return "ONBOARD"
+    return "CRAWL" if claimed % (onboard_ratio + 1) == onboard_ratio else "ONBOARD"
+
+
 class Store:
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, onboard_ratio: int = 3):
         self.conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
+        self.onboard_ratio = onboard_ratio
+        self.claimed = 0   # 이 워커가 집은 작업 수 (교대 규칙의 기준, 빈 polling은 세지 않는다)
 
     def close(self) -> None:
         self.conn.close()
 
     # ------------------------------------------------------------------ 큐
     def claim_job(self, worker_id: str, lease_minutes: int) -> Job | None:
-        """대기 작업 하나를 잠그고 가져간다. 여러 워커가 동시에 돌아도 겹치지 않는다."""
+        """대기 작업 하나를 잠그고 가져간다. 여러 워커가 동시에 돌아도 겹치지 않는다.
+
+        ONBOARD(사용자가 기다리는 등록)를 먼저 집되, preferred_job_type대로 몇 번에 한 번은 CRAWL을 먼저 집어
+        일괄 등록이 주기 수집을 오래 막지 않게 한다. 같은 유형 안에서는 오래 기다린 순이다.
+        """
+        prefer = preferred_job_type(self.claimed, self.onboard_ratio)
         row = self.conn.execute(
             """
             UPDATE crawl_job SET status = 'RUNNING', locked_by = %s, attempt = attempt + 1,
                    lease_until = now() + make_interval(mins => %s), started_at = COALESCE(started_at, now())
             WHERE id = (
                 SELECT id FROM crawl_job WHERE status = 'QUEUED'
-                ORDER BY CASE job_type WHEN 'ONBOARD' THEN 0 ELSE 1 END, created_at
+                ORDER BY CASE WHEN job_type = %s THEN 0 ELSE 1 END, created_at
                 FOR UPDATE SKIP LOCKED LIMIT 1)
             RETURNING id, source_id, job_type, trigger, config_version_id, attempt
-            """, (worker_id, lease_minutes)).fetchone()
-        return Job(**row) if row else None
+            """, (worker_id, lease_minutes, prefer)).fetchone()
+        if row is None:
+            return None
+        self.claimed += 1
+        return Job(**row)
 
     def extend_lease(self, job_id: int, worker_id: str, lease_minutes: int) -> None:
         self.conn.execute(
@@ -58,14 +79,15 @@ class Store:
             (lease_minutes, job_id, worker_id))
 
     def finish_job(self, job_id: int, status: str, found: int = 0, new: int = 0, errors: int = 0,
-                   config_version_id: int | None = None) -> None:
+                   config_version_id: int | None = None, note: str | None = None) -> None:
+        """작업을 끝낸다. locked_by는 남겨 둔다 — 운영 지표(/api/v1/ops/overview)가 최근 5분 안에 일한 워커 수를 이것으로 센다."""
         self.conn.execute(
             """
             UPDATE crawl_job SET status = %s, found_count = %s, new_count = %s, error_count = %s,
-                   config_version_id = COALESCE(%s, config_version_id),
-                   finished_at = now(), locked_by = NULL, lease_until = NULL
+                   config_version_id = COALESCE(%s, config_version_id), note = COALESCE(%s, note),
+                   finished_at = now(), lease_until = NULL
             WHERE id = %s
-            """, (status, found, new, errors, config_version_id, job_id))
+            """, (status, found, new, errors, config_version_id, (note or "")[:200] or None, job_id))
 
     def record_error(self, job_id: int, failure: CrawlFailure, evidence_path: str | None = None) -> None:
         self.conn.execute(
@@ -206,6 +228,26 @@ class Store:
                 ORDER BY j.id DESC LIMIT %s) t
             """, (source_id, config_version_id, runs)).fetchone()
         return float(row["a"]) if row["n"] >= min_runs else None
+
+    def recent_new_counts(self, source_id: int, runs: int) -> list[int]:
+        """최근 주기 수집(CRAWL, SUCCESS·PARTIAL)의 새 문서 수, 최신순. 주기 자동 조정의 재료.
+
+        ONBOARD의 첫 수집은 허브에 보이는 기사를 모두 새로 받으므로 평균을 왜곡한다 — 뺀다.
+        """
+        if runs <= 0:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT new_count FROM crawl_job
+            WHERE source_id = %s AND job_type = 'CRAWL' AND status IN ('SUCCESS', 'PARTIAL')
+            ORDER BY id DESC LIMIT %s
+            """, (source_id, runs)).fetchall()
+        return [int(r["new_count"]) for r in rows]
+
+    def set_interval(self, source_id: int, interval_minutes: int) -> None:
+        """주기 자동 조정: interval_minutes만 바꾼다 (next_run_at은 mark_crawl_result가 새 주기로 잡는다)."""
+        self.conn.execute("UPDATE source SET interval_minutes = %s, updated_at = now() WHERE id = %s",
+                          (interval_minutes, source_id))
 
     def mark_anomaly(self, source_id: int, anomalous: bool) -> int:
         """연속 이상 횟수를 갱신하고 돌려준다."""
