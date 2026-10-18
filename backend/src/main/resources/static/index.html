@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>외부정보 센싱 허브</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <a class="brand" href="#/registrations">외부정보 센싱 허브</a>
+    <div id="loading" class="loading" hidden></div>
+    <div class="spacer"></div>
+    <label class="user-picker">
+      사용자
+      <select id="user-select">
+        <option value="admin">admin</option>
+        <option value="registrar">registrar</option>
+        <option value="viewer">viewer</option>
+      </select>
+    </label>
+    <span id="user-name" class="user-name"></span>
+  </header>
+  <div id="body">
+    <nav id="menu">
+      <a href="#/registrations" data-path="/registrations">등록·내 요청</a>
+      <a href="#/documents" data-path="/documents">문서</a>
+      <a href="#/companies" data-path="/companies">거래처</a>
+      <a href="#/watches" data-path="/watches">키워드 감시</a>
+      <a href="#/digests" data-path="/digests">다이제스트</a>
+      <div class="menu-group admin-only">관리자</div>
+      <a href="#/admin/queue" data-path="/admin/queue" class="admin-only">처리 대기 큐</a>
+      <a href="#/admin/sources" data-path="/admin/sources" class="admin-only">소스</a>
+      <a href="#/admin/ops" data-path="/admin/ops" class="admin-only">운영 지표</a>
+      <a href="#/admin/credentials" data-path="/admin/credentials" class="admin-only">API 키</a>
+    </nav>
+    <main id="content">
+      <div id="notice" class="notice" hidden></div>
+      <div id="error-banner" class="error-banner" hidden>
+        <span id="error-text"></span>
+        <button type="button" id="error-close" class="link">닫기</button>
+      </div>
+      <div id="view"></div>
+    </main>
+  </div>
+</div>
+<script src="app.js"></script>
+<script src="registrations.js"></script>
+<script src="documents.js"></script>
+<script src="companies.js"></script>
+<script src="watches.js"></script>
+<script src="digests.js"></script>
+<script src="admin.js"></script>
+<script src="ops.js"></script>
+<script>App.start();</script>
+</body>
+</html>
