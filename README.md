@@ -277,7 +277,7 @@ worker/    Python 수집 워커
     jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록, CHECK 소스는 회사 상태 점검)
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전, 회사 연결·신호
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
-docs/      설계 메모
+docs/      설계 메모 — 수집 원리는 docs/how-collection-works.md (사이트를 등록하면 기사를 어떻게 찾아 가져오나)
 ```
 
 ## 테스트
