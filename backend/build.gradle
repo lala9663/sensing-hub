@@ -41,6 +41,8 @@ tasks.named('test') {
     testLogging {
         events 'passed', 'skipped', 'failed'
         exceptionFormat 'full'
+        // CI처럼 로컬 DB가 없어 재현할 수 없는 곳에서 서버 쪽 예외(500의 원인)를 보려면 테스트 JVM의 표준 출력도 찍는다
+        showStandardStreams = System.getenv('SENSING_TEST_STDOUT') == 'true'
     }
     // 통합 테스트는 SENSING_IT_DB_URL이 있을 때만 실행된다 (README 참고)
     environment 'SENSING_IT_DB_URL', System.getenv('SENSING_IT_DB_URL') ?: ''
