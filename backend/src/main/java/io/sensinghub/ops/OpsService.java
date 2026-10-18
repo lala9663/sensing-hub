@@ -117,7 +117,7 @@ public class OpsService {
                 rs.getString("status_reason"), rs.getInt("interval_minutes"), rs.getBoolean("interval_locked"),
                 rs.getObject("last_success_at", OffsetDateTime.class), rs.getObject("next_run_at", OffsetDateTime.class),
                 rs.getInt("consecutive_failures"), rs.getInt("consecutive_anomalies"),
-                rs.getObject("avg_found", Double.class), rs.getObject("avg_new", Double.class),
+                dbl(rs, "avg_found"), dbl(rs, "avg_new"),
                 rs.getString("last_job_status"), rs.getObject("last_job_at", OffsetDateTime.class),
                 rs.getBoolean("overdue"))).list();
     }
@@ -158,7 +158,7 @@ public class OpsService {
                        AVG(EXTRACT(EPOCH FROM finished_at - started_at)) FILTER (WHERE started_at IS NOT NULL) AS avg_seconds
                 FROM crawl_job WHERE finished_at >= now() - interval '24 hours'
                 """).query((rs, n) -> new JobResults24h(rs.getLong("success"), rs.getLong("partial"), rs.getLong("failed"),
-                        rs.getObject("avg_seconds", Double.class))).single();
+                        dbl(rs, "avg_seconds"))).single();
     }
 
     private Documents24h documents24h() {
@@ -183,13 +183,19 @@ public class OpsService {
 
     private Throughput throughput() {
         double scheduled = jdbc.sql("SELECT COALESCE(sum(60.0 / GREATEST(interval_minutes, 1)), 0) FROM source WHERE status = 'ACTIVE'")
-                .query(Double.class).single();
+                .query(java.math.BigDecimal.class).single().doubleValue();
         long completed = jdbc.sql("SELECT count(*) FROM crawl_job WHERE finished_at >= now() - interval '1 hour'")
                 .query(Long.class).single();
         long queued = jdbc.sql("SELECT count(*) FROM crawl_job WHERE status = 'QUEUED'").query(Long.class).single();
         Double ratio = completed == 0 ? null : Math.round(scheduled / completed * 100.0) / 100.0;
         boolean workersShort = ratio != null ? ratio > 1.0 : scheduled > 0 && queued > 0;
         return new Throughput(Math.round(scheduled * 100.0) / 100.0, completed, ratio, workersShort);
+    }
+
+    /** numeric(AVG 등) 열을 Double로. PgJDBC는 getObject(name, Double.class)로 numeric을 못 바꾸므로 BigDecimal을 거친다. null은 null. */
+    private static Double dbl(java.sql.ResultSet rs, String column) throws java.sql.SQLException {
+        java.math.BigDecimal value = rs.getBigDecimal(column);
+        return value == null ? null : value.doubleValue();
     }
 
 }
