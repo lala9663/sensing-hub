@@ -25,6 +25,14 @@ public class ApiExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", "BAD_REQUEST", "message", message));
     }
 
+    /** 없는 정적 파일·경로는 404다 (catch-all이 500으로 바꾸거나 스택을 찍지 않게 먼저 잡는다). */
+    @ExceptionHandler(org.springframework.web.servlet.resource.NoResourceFoundException.class)
+    public ResponseEntity<Map<String, String>> handleNoResource(
+            org.springframework.web.servlet.resource.NoResourceFoundException e) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(Map.of("error", "NOT_FOUND", "message", "경로를 찾을 수 없습니다: /" + e.getResourcePath()));
+    }
+
     /** 분류되지 않은 오류. 화면과 테스트가 원인을 볼 수 있게 예외 종류와 메시지를 같은 JSON 형식으로 돌려주고 로그에 남긴다. */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, String>> handleUnexpected(Exception e) {
