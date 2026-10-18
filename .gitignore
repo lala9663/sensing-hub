@@ -19,3 +19,6 @@ worker/data/
 
 # 환경 변수
 .env
+
+# Claude Code 세션 워크트리 (launch.json은 커밋한다)
+.claude/worktrees/
