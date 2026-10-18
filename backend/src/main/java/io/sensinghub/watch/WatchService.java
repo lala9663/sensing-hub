@@ -189,9 +189,9 @@ public class WatchService {
     /** 내 감시. ADMIN은 전체. */
     public List<WatchView> list(CurrentUser user) {
         if (user.role().atLeast(Role.ADMIN)) {
-            return jdbc.sql(SELECT + " ORDER BY s.id").query(this::map).list();
+            return jdbc.sql(SELECT + " WHERE s.kind = 'WATCH' ORDER BY s.id").query(this::map).list();
         }
-        return jdbc.sql(SELECT + " WHERE s.requested_by = ? ORDER BY s.id").param(user.id()).query(this::map).list();
+        return jdbc.sql(SELECT + " WHERE s.kind = 'WATCH' AND s.requested_by = ? ORDER BY s.id").param(user.id()).query(this::map).list();
     }
 
     public WatchView get(CurrentUser user, long id) {
