@@ -189,12 +189,14 @@ public class BulkRegistrationService {
 
     // ------------------------------------------------------------------ 묶음 진행 요약
 
-    /** 요청자 본인 또는 ADMIN만 본다. 묶음이 없으면 404. */
+    /**
+     * 요청자 본인 또는 ADMIN만 본다. 묶음이 없으면 404.
+     * batchId는 일괄 등록의 UUID이거나, 워커가 링크 모음(포털) 페이지 대신 등록한 언론사들의 {@code portal:<소스 id>}다 — 형식을 따로
+     * 검사하지 않고 {@code registration_request.batch_id}로 그대로 찾는다.
+     */
     public BatchSummary summary(CurrentUser user, String batchId) {
-        List<Registration> items = jdbc.sql("""
-                SELECT id, input_url, normalized_domain, channel, status, step, result_message, source_id, created_at
-                FROM registration_request WHERE batch_id = ? ORDER BY id
-                """).param(batchId).query(registrations::map).list();
+        List<Registration> items = jdbc.sql(RegistrationService.SELECT + " WHERE batch_id = ? ORDER BY id")
+                .param(batchId).query(registrations::map).list();
         if (items.isEmpty()) {
             throw ApiException.notFound("등록 묶음");
         }

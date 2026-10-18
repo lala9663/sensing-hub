@@ -41,6 +41,9 @@ flowchart TD
 
 소스 상태: `PENDING → ACTIVE ⇄ PAUSED`, `ACTIVE → BROKEN(0건·급감) → 수정 → ACTIVE`, `ACTIVE → BLOCKED(403·429·챌린지) → 관리자 재점검 → ACTIVE 또는 EXCLUDED`
 
+자동 탐색이 못 찾은 홈이 다른 언론사로 가는 링크 모음(뉴스스탠드 같은 포털)이면 관리자 큐로 보내지 않고, 그 페이지가 가리키는 언론사들을 같은 요청자 이름으로
+대신 등록한다 (모음 페이지 소스는 `EXCLUDED/PORTAL_EXPANDED`, 언론사들은 묶음 `portal:<소스 id>`로 진행을 본다).
+
 ## 빠른 시작
 
 ### Docker Compose
@@ -352,6 +355,10 @@ M3에서 한 일:
   24시간 결과·수집량 상위 10·실패 코드 상위 10·처리량 `demandRatio`)와 `GET /api/v1/ops/sources/health`(마지막 성공이 오래된 순, `overdue`), 워커가 최근 10회 주기
   수집의 새 문서 평균으로 주기를 두 배씩 늘리거나(최대 1440분) 기본값으로 되돌림(`SENSING_ADAPTIVE_INTERVAL`, 변경은 로그와 `crawl_job.note`에),
   `PUT /api/v1/sources/{id}`로 사람이 정한 주기는 `interval_locked`로 잠겨 자동 조정이 덮지 않음
+- [x] 링크 모음(포털) 페이지 등록 시 언론사 자동 확장: 자동 탐색이 실패한 홈이 다른 언론사로 가는 링크 모음(뉴스스탠드 등, `worker/src/sensing_worker/portal.py`:
+  외부 언론사 도메인 10곳 이상이고 외부 링크가 자기 기사형 링크보다 많을 때)이면 REVIEW로 보내지 않고 가리키는 언론사를 요청자 이름으로 등록
+  (백엔드 등록과 같은 행, 이미 열린 소스·상한 `SENSING_PORTAL_MAX_OUTLETS`=50 초과는 건너뜀, 묶음 `batch_id = portal:<소스 id>`), 모음 페이지 소스는
+  `EXCLUDED/PORTAL_EXPANDED`, 요청은 COMPLETED(메시지에 묶음 id, 화면 "언론사 N곳 진행 보기" → `GET /registrations/batches/portal:<id>`)
 - [ ] DART 기업개황·재무(FINANCIAL), 회사별 다이제스트 구독 화면, 케이던시아 연동
 
 ## 원칙
