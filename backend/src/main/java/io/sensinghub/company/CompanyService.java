@@ -104,6 +104,12 @@ public class CompanyService {
     public record ImportResult(int created, int updated, List<Long> ids) {
     }
 
+    /** 외부 시스템 동기화 한 건의 결과. */
+    public enum Outcome { CREATED, UPDATED, ARCHIVED, UNCHANGED }
+
+    public record UpsertResult(long id, Outcome outcome) {
+    }
+
     private final JdbcClient jdbc;
     private final ObjectMapper json;
     private final AuditLogger audit;
@@ -161,6 +167,53 @@ public class CompanyService {
         }
         audit.log(user.id(), "COMPANY_IMPORTED", "company", null, "{\"created\":" + created + ",\"updated\":" + updated + "}");
         return new ImportResult(created, updated, ids);
+    }
+
+    /**
+     * 외부 시스템(케이던시아) 동기화용 upsert. 매칭은 {@code external_id} 우선, 없으면 사업자번호. 있으면 갱신(보관됐으면 복구, 모든 필드를
+     * 외부 값으로 — 태그도 외부가 정한다), 모든 필드가 이미 같고 ACTIVE면 UNCHANGED(쓰지 않음), 없으면 새로 만든다. externalId는 필수.
+     */
+    @Transactional
+    public UpsertResult upsertExternal(CurrentUser user, CompanyInput in) {
+        user.require(Role.REGISTRAR);
+        CompanyInput cleaned = cleanForCreate(in);
+        if (cleaned.externalId() == null) {
+            throw bad("externalId가 필요합니다.");
+        }
+        Optional<CompanyView> existing = findExternal(user, cleaned);
+        if (existing.isEmpty()) {
+            long id = insert(user, cleaned);
+            audit.log(user.id(), "COMPANY_CREATED", "company", id, "{\"name\":" + quote(cleaned.name()) + ",\"externalId\":"
+                    + quote(cleaned.externalId()) + "}");
+            return new UpsertResult(id, Outcome.CREATED);
+        }
+        CompanyView cur = existing.get();
+        boolean same = "ACTIVE".equals(cur.status()) && cur.name().equals(cleaned.name()) && cur.aliases().equals(cleaned.aliases())
+                && java.util.Objects.equals(cur.bizNo(), cleaned.bizNo()) && java.util.Objects.equals(cur.corpCode(), cleaned.corpCode())
+                && cleaned.externalId().equals(cur.externalId()) && cur.tags().equals(cleaned.tags());
+        if (same) {
+            return new UpsertResult(cur.id(), Outcome.UNCHANGED);
+        }
+        applyUpdate(user, cur.id(), cleaned, true);
+        audit.log(user.id(), "COMPANY_UPDATED", "company", cur.id(), "{\"name\":" + quote(cleaned.name()) + ",\"externalId\":"
+                + quote(cleaned.externalId()) + "}");
+        return new UpsertResult(cur.id(), Outcome.UPDATED);
+    }
+
+    /** external_id → 사업자번호 순으로 찾는다 (동기화 매칭). 입력은 정규화하지 않은 값이어도 된다. */
+    public Optional<CompanyView> findExternal(CurrentUser user, CompanyInput in) {
+        user.require(Role.VIEWER);
+        Optional<Long> id = Optional.empty();
+        if (in.externalId() != null && !in.externalId().isBlank()) {
+            id = findByExternalId(in.externalId().strip());
+        }
+        if (id.isEmpty()) {
+            String bizNo = cleanBizNo(in.bizNo());
+            if (bizNo != null) {
+                id = findByBizNo(bizNo);
+            }
+        }
+        return id.map(v -> jdbc.sql(SELECT + " WHERE c.id = ?").param(v).query(this::mapCompany).single());
     }
 
     @Transactional
@@ -478,6 +531,12 @@ public class CompanyService {
 
     private Optional<Long> findByBizNo(String bizNo) {
         return jdbc.sql("SELECT id FROM company WHERE biz_no = ?").param(bizNo).query(Long.class).optional();
+    }
+
+    /** 같은 외부 ID가 여럿이면 ACTIVE를, 그다음 최근 것을. */
+    private Optional<Long> findByExternalId(String externalId) {
+        return jdbc.sql("SELECT id FROM company WHERE external_id = ? ORDER BY (status = 'ACTIVE') DESC, id DESC LIMIT 1")
+                .param(externalId).query(Long.class).optional();
     }
 
     private Optional<Long> findActiveByName(String name) {
