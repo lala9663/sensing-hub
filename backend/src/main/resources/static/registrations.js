@@ -57,7 +57,7 @@ App.route('/registrations', async (view) => {
               <td>${badge(r.status)}</td>
               <td>${r.step ? badge(r.step) : '<span class="muted">-</span>'}</td>
               <td>${esc(r.resultMessage || '')}
-                ${r.batchId && r.batchId.startsWith('portal:') ? `<div class="small"><a href="#" data-batch="${esc(r.batchId)}">언론사 ${outletCount(r.resultMessage)}진행 보기</a></div>` : ''}
+                ${r.batchId && r.batchId.startsWith('portal:') && /\[묶음 portal:/.test(r.resultMessage || '') ? `<div class="small"><a href="#" data-batch="${esc(r.batchId)}">언론사 ${outletCount(r.resultMessage)}진행 보기</a></div>` : ''}
                 ${r.sourceId && App.isAdmin() ? `<div class="small"><a href="#/admin/sources/${r.sourceId}">소스 #${r.sourceId}</a></div>` : ''}</td>
               <td class="nowrap muted small">${App.fmtTime(r.createdAt)}</td>
             </tr>`).join('')}
