@@ -186,6 +186,11 @@ curl -X POST localhost:8080/api/v1/registrations -H 'X-User: registrar' \
 # 내 등록 요청과 진행 단계
 curl localhost:8080/api/v1/registrations/mine -H 'X-User: registrar'
 
+# 사이트 일괄 등록 (REGISTRAR 이상, 최대 500건. JSON 배열 또는 text/plain 한 줄에 하나·# 뒤는 메모. 한 건의 오류가 다른 건을 막지 않는다) → batchId
+curl -X POST localhost:8080/api/v1/registrations/bulk -H 'X-User: registrar' -H 'Content-Type: text/plain' --data-binary @docs/eval-sites.txt
+curl localhost:8080/api/v1/registrations/batches/<batchId> -H 'X-User: registrar'   # 몇 분 뒤: 묶음의 completed·review·rejected·byStatus·byStep
+curl localhost:8080/api/v1/ops/overview -H 'X-User: admin'   # 관리자 운영 지표: 소스 상태별·처리 대기 큐·작업 큐 적체·24시간 결과·수집량·실패 코드·처리량(demandRatio>1이면 워커 부족). /ops/sources/health 는 조용히 멈춘 소스 순
+
 # 키워드 감시 등록 (네이버 뉴스 검색 API, 60분 주기. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
 curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
 curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
@@ -209,6 +214,7 @@ curl localhost:8080/api/v1/sources -H 'X-User: admin'
 curl localhost:8080/api/v1/sources/1 -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/sources/1/actions/recheck -H 'X-User: admin'   # pause|resume|run|recheck|rediscover|exclude
 curl -X POST localhost:8080/api/v1/sources/1/configs/2/activate -H 'X-User: admin'  # 설정 버전 롤백
+curl -X PUT localhost:8080/api/v1/sources/1 -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"intervalMinutes":120}'   # 사람이 정한 주기는 잠겨(intervalLocked) 워커의 자동 조정이 덮지 않는다
 
 # 관리자: 처리 대기 큐 (승인 대기 → API_KEY → REVIEW → BROKEN → BLOCKED, 오래 기다린 순). kind로 거를 수 있다
 curl localhost:8080/api/v1/review-queue -H 'X-User: admin'
@@ -320,6 +326,12 @@ M3에서 한 일:
   `g2b_debarment` 하루 1회 나라장터 사용자정보 서비스 `getUnptRsttCorpInfo02`로 사업자번호별 조회 → DEBARMENT HIGH) 처음 회사를 만들 때 네 점검
   소스를 함께 만들고, 상세 API에 종류별 최근 신호(`latestByKind`). 조달청 API의 응답 항목명은 포털에 공개돼 있지 않아 커넥터 config `fields`로
   바꿀 수 있다 (`worker/src/sensing_worker/apis/g2b_debarment.py` 참고)
+- [x] 사이트 일괄 등록·대량 소스 운영 지표·주기 자동 조정: `POST /api/v1/registrations/bulk`(JSON 또는 text/plain, 최대 500건, 묶음 안 중복은 첫 건만,
+  형식 오류도 INVALID로 같은 묶음에 남김, `registration_request.batch_id` V9)와 `GET /api/v1/registrations/batches/{batchId}` 진행 요약, 워커 큐가 ONBOARD 셋마다
+  CRAWL 하나를 집는 3:1 교대(`SENSING_ONBOARD_RATIO`)로 일괄 등록이 주기 수집을 막지 않음, `GET /api/v1/ops/overview`(소스 상태별·처리 대기 큐·작업 큐 적체·워커 수·
+  24시간 결과·수집량 상위 10·실패 코드 상위 10·처리량 `demandRatio`)와 `GET /api/v1/ops/sources/health`(마지막 성공이 오래된 순, `overdue`), 워커가 최근 10회 주기
+  수집의 새 문서 평균으로 주기를 두 배씩 늘리거나(최대 1440분) 기본값으로 되돌림(`SENSING_ADAPTIVE_INTERVAL`, 변경은 로그와 `crawl_job.note`에),
+  `PUT /api/v1/sources/{id}`로 사람이 정한 주기는 `interval_locked`로 잠겨 자동 조정이 덮지 않음
 - [ ] DART 기업개황·재무(FINANCIAL), 회사별 다이제스트 구독 화면, 케이던시아 연동
 
 ## 원칙

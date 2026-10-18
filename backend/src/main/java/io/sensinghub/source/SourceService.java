@@ -25,17 +25,21 @@ public class SourceService {
         this.audit = audit;
     }
 
-    /** kind: SITE(사이트 수집) | WATCH(키워드 감시, watchName이 감시 이름) | CHECK(회사 단위 점검, M3). */
+    /**
+     * kind: SITE(사이트 수집) | WATCH(키워드 감시, watchName이 감시 이름) | CHECK(회사 단위 점검, M3).
+     * intervalLocked: 사람이 PUT으로 주기를 정해 워커의 주기 자동 조정이 건드리지 않는 소스.
+     */
     public record SourceSummary(long id, String kind, String watchName, String domain, String baseUrl, String siteType,
                                 String method, String status,
-                                String statusReason, Integer configVersion, int intervalMinutes,
+                                String statusReason, Integer configVersion, int intervalMinutes, boolean intervalLocked,
                                 OffsetDateTime lastSuccessAt, OffsetDateTime nextRunAt, int consecutiveFailures,
                                 int consecutiveAnomalies, long documentCount, boolean aiRestricted) {
     }
 
+    /** note: 워커가 실행에 남긴 메모 (예: 주기 자동 조정 60→120분). */
     public record JobRow(long id, String jobType, String trigger, String status, Integer configVersion,
                          int foundCount, int newCount, int errorCount,
-                         OffsetDateTime startedAt, OffsetDateTime finishedAt) {
+                         OffsetDateTime startedAt, OffsetDateTime finishedAt, String note) {
     }
 
     /** evidencePath: 워커 증거 폴더(SENSING_EVIDENCE_DIR) 기준 상대 경로. 증거가 없으면 null. */
@@ -53,7 +57,7 @@ public class SourceService {
 
     private static final String SUMMARY_SQL = """
             SELECT s.id, s.kind, s.watch_name, t.domain, t.base_url, t.site_type, s.method, s.status, s.status_reason,
-                   v.version AS config_version, s.interval_minutes, s.last_success_at, s.next_run_at,
+                   v.version AS config_version, s.interval_minutes, s.interval_locked, s.last_success_at, s.next_run_at,
                    s.consecutive_failures, s.consecutive_anomalies, t.ai_restricted,
                    (SELECT count(*) FROM document d WHERE d.source_id = s.id) AS document_count
             FROM source s
@@ -85,12 +89,13 @@ public class SourceService {
                 .optional().orElseThrow(() -> ApiException.notFound("소스"));
         List<JobRow> jobs = jdbc.sql("""
                 SELECT j.id, j.job_type, j.trigger, j.status, v.version, j.found_count, j.new_count, j.error_count,
-                       j.started_at, j.finished_at
+                       j.started_at, j.finished_at, j.note
                 FROM crawl_job j LEFT JOIN source_config_version v ON v.id = j.config_version_id
                 WHERE j.source_id = ? ORDER BY j.id DESC LIMIT 20
                 """).param(id).query((rs, n) -> new JobRow(rs.getLong(1), rs.getString(2), rs.getString(3),
                         rs.getString(4), (Integer) rs.getObject(5), rs.getInt(6), rs.getInt(7), rs.getInt(8),
-                        rs.getObject(9, OffsetDateTime.class), rs.getObject(10, OffsetDateTime.class))).list();
+                        rs.getObject(9, OffsetDateTime.class), rs.getObject(10, OffsetDateTime.class),
+                        rs.getString(11))).list();
         List<ErrorRow> errors = jdbc.sql("""
                 SELECT e.job_id, e.url, e.stage, e.code, e.http_status, e.message, e.evidence_path, e.created_at
                 FROM crawl_error e JOIN crawl_job j ON j.id = e.job_id
@@ -152,6 +157,40 @@ public class SourceService {
         return detail(user, id).source();
     }
 
+    public static final int MIN_INTERVAL_MINUTES = 5;
+    public static final int MAX_INTERVAL_MINUTES = 10080;
+
+    /**
+     * 소스 수정 (ADMIN): 수집 주기. 사람이 정한 주기는 interval_locked = true가 되어 워커의 주기 자동 조정이 덮지 않는다.
+     * intervalLocked = false를 함께 보내면 값을 바꾸되 자동 조정에 다시 맡긴다. 주기가 바뀌면 다음 실행 시각도 새 주기로 잡는다.
+     */
+    @Transactional
+    public SourceSummary update(CurrentUser user, long id, Integer intervalMinutes, Boolean intervalLocked) {
+        user.require(Role.ADMIN);
+        SourceSummary s = detail(user, id).source();
+        if (intervalMinutes == null && intervalLocked == null) {
+            throw new ApiException(org.springframework.http.HttpStatus.BAD_REQUEST, "BAD_REQUEST",
+                    "intervalMinutes 또는 intervalLocked를 보내 주세요.");
+        }
+        if (intervalMinutes != null && (intervalMinutes < MIN_INTERVAL_MINUTES || intervalMinutes > MAX_INTERVAL_MINUTES)) {
+            throw new ApiException(org.springframework.http.HttpStatus.BAD_REQUEST, "BAD_REQUEST",
+                    "수집 주기는 " + MIN_INTERVAL_MINUTES + "~" + MAX_INTERVAL_MINUTES + "분 사이여야 합니다.");
+        }
+        boolean locked = intervalLocked != null ? intervalLocked : (intervalMinutes != null || s.intervalLocked());
+        int interval = intervalMinutes != null ? intervalMinutes : s.intervalMinutes();
+        jdbc.sql("""
+                UPDATE source SET interval_minutes = ?, interval_locked = ?,
+                       next_run_at = CASE WHEN ? <> interval_minutes AND status = 'ACTIVE'
+                                          THEN LEAST(COALESCE(next_run_at, now()), now() + make_interval(mins => ?))
+                                          ELSE next_run_at END,
+                       updated_at = now()
+                WHERE id = ?
+                """).params(interval, locked, interval, interval, id).update();
+        audit.log(user.id(), "SOURCE_UPDATED", "source", id,
+                "{\"intervalMinutes\":" + interval + ",\"intervalLocked\":" + locked + "}");
+        return detail(user, id).source();
+    }
+
     /** 설정 버전 활성화(롤백 포함): 포인터만 바꾼다. */
     @Transactional
     public SourceSummary activateConfig(CurrentUser user, long id, int version) {
@@ -198,7 +237,8 @@ public class SourceService {
                 rs.getString("domain"), rs.getString("base_url"),
                 rs.getString("site_type"), rs.getString("method"), rs.getString("status"),
                 rs.getString("status_reason"), (Integer) rs.getObject("config_version"),
-                rs.getInt("interval_minutes"), rs.getObject("last_success_at", OffsetDateTime.class),
+                rs.getInt("interval_minutes"), rs.getBoolean("interval_locked"),
+                rs.getObject("last_success_at", OffsetDateTime.class),
                 rs.getObject("next_run_at", OffsetDateTime.class), rs.getInt("consecutive_failures"),
                 rs.getInt("consecutive_anomalies"), rs.getLong("document_count"), rs.getBoolean("ai_restricted"));
     }

@@ -7,6 +7,8 @@ import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -39,6 +41,15 @@ public class SourceController {
     @GetMapping("/{id}")
     public SourceDetail detail(CurrentUser user, @PathVariable long id) {
         return service.detail(user, id);
+    }
+
+    public record UpdateRequest(Integer intervalMinutes, Boolean intervalLocked) {
+    }
+
+    /** 수집 주기 수정. 사람이 정한 값은 잠겨(intervalLocked) 워커의 주기 자동 조정이 덮지 않는다. */
+    @PutMapping("/{id}")
+    public SourceSummary update(CurrentUser user, @PathVariable long id, @RequestBody UpdateRequest body) {
+        return service.update(user, id, body.intervalMinutes(), body.intervalLocked());
     }
 
     /** pause | resume | run | recheck | rediscover | exclude */

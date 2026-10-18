@@ -213,7 +213,7 @@ public class RegistrationService {
             SELECT id, input_url, normalized_domain, channel, status, step, result_message, source_id, created_at
             FROM registration_request""";
 
-    private Registration map(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
+    Registration map(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
         return new Registration(rs.getLong("id"), rs.getString("input_url"), rs.getString("normalized_domain"),
                 rs.getString("channel"), rs.getString("status"), rs.getString("step"),
                 rs.getString("result_message"), rs.getObject("source_id", Long.class),
