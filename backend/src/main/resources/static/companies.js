@@ -6,6 +6,16 @@
   const KINDS = ['BIZ_STATUS', 'DEBARMENT', 'DISCLOSURE', 'NEWS', 'FINANCIAL'];
   const SEVERITIES = ['HIGH', 'MEDIUM', 'LOW'];
 
+  /** 케이던시아에서 온(외부 ID가 있는) 회사 표시. */
+  function caidentiaBadge(c) {
+    return c.externalId ? `<span class="badge badge-blue" title="케이던시아 공급사 ${esc(c.externalId)}">케이던시아</span>` : '';
+  }
+
+  /** 태그 중 공급사 등급("1차"·"2차")만 골라낸다. */
+  function tierOf(c) {
+    return (c.tags || []).find(t => /^\d+차$/.test(t)) || '';
+  }
+
   function signalRows(signals, withCompany) {
     if (!signals.length) return '<div class="empty">신호가 없습니다.</div>';
     return `
@@ -70,7 +80,7 @@
           <thead><tr><th>회사</th><th>사업자번호</th><th class="right">신호</th><th class="right">HIGH</th><th>최근 신호</th><th class="right">문서</th><th>감시</th><th>상태</th></tr></thead>
           <tbody>${list.map(c => `
             <tr>
-              <td><a href="#/companies/${c.id}"><b>${esc(c.name)}</b></a>
+              <td><a href="#/companies/${c.id}"><b>${esc(c.name)}</b></a> ${caidentiaBadge(c)}
                 ${c.aliases && c.aliases.length ? `<div class="muted small">${esc(c.aliases.join(', '))}</div>` : ''}
                 ${tags(c.tags)}</td>
               <td class="mono">${esc(c.bizNo || '-')}${c.corpCode ? `<div class="muted small">DART ${esc(c.corpCode)}</div>` : ''}</td>
@@ -169,7 +179,7 @@
       ? Object.entries(c.lastBizStatus).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' · ') : '';
     view.innerHTML = `
       <div class="row"><a href="#/companies">← 회사 목록</a></div>
-      <div class="row"><h1 style="flex:1;margin:8px 0">${esc(c.name)} ${badge(c.status)}</h1>
+      <div class="row"><h1 style="flex:1;margin:8px 0">${esc(c.name)} ${badge(c.status)} ${caidentiaBadge(c)}</h1>
         ${App.atLeast('REGISTRAR') ? '<button type="button" id="edit" class="small">수정</button>' : ''}
         ${App.atLeast('REGISTRAR') && c.status !== 'ARCHIVED' ? '<button type="button" id="archive" class="small danger">보관</button>' : ''}</div>
       <div class="panel">
@@ -177,7 +187,8 @@
           <dt>별칭</dt><dd>${c.aliases && c.aliases.length ? esc(c.aliases.join(', ')) : '-'}</dd>
           <dt>사업자번호</dt><dd class="mono">${esc(c.bizNo || '-')}</dd>
           <dt>DART 고유번호</dt><dd class="mono">${esc(c.corpCode || '-')}</dd>
-          <dt>외부 ID</dt><dd class="mono">${esc(c.externalId || '-')}</dd>
+          ${c.externalId ? `<dt>케이던시아</dt><dd>공급사 ID <span class="mono">${esc(c.externalId)}</span>${tierOf(c) ? ` · 등급 <b>${esc(tierOf(c))}</b>` : ''}
+            ${App.isAdmin() ? '<a class="small" href="#/admin/caidentia">연동 상태</a>' : ''}</dd>` : '<dt>외부 ID</dt><dd class="muted">-</dd>'}
           <dt>태그</dt><dd>${tags(c.tags) || '-'}</dd>
           <dt>감시</dt><dd>${badge(c.watchStatus)} ${c.watchStatusReason ? `<span class="muted small">${esc(c.watchStatusReason)}</span>` : ''}
             ${c.watchSourceId && App.isAdmin() ? `<a class="small" href="#/admin/sources/${c.watchSourceId}">소스 #${c.watchSourceId}</a>` : ''}</dd>
