@@ -199,6 +199,56 @@ class Store:
             WHERE source_id = %s AND status IN ('RECEIVED', 'PROCESSING', 'REVIEW')
             """, (status, step, message, source_id))
 
+    def load_registration(self, source_id: int) -> dict | None:
+        """소스를 만든 등록 요청 (가장 최근 것). 요청 없이 만든 소스면 None."""
+        return self.conn.execute(
+            "SELECT id, user_id, channel, batch_id FROM registration_request WHERE source_id = %s ORDER BY id DESC LIMIT 1",
+            (source_id,)).fetchone()
+
+    def find_open_source(self, domain: str) -> int | None:
+        """같은 도메인의 열린 사이트 소스 id (백엔드 RegistrationService.findOpenSource와 같은 규칙)."""
+        row = self.conn.execute(
+            """
+            SELECT s.id FROM source s JOIN site t ON t.id = s.site_id
+            WHERE t.domain = %s AND s.kind = 'SITE' AND s.status <> 'EXCLUDED'
+            ORDER BY s.id LIMIT 1
+            """, (domain,)).fetchone()
+        return row["id"] if row else None
+
+    def register_outlet(self, *, user_id: int, channel: str, input_url: str, domain: str, base_url: str,
+                        name: str | None, batch_id: str) -> int | None:
+        """링크 모음 페이지가 가리키는 언론사를 백엔드 RegistrationService.startOnboarding과 같은 행으로 등록한다.
+
+        사이트 upsert → 소스 PENDING → ONBOARD 작업 → 등록 요청 PROCESSING/QUEUED(batch_id) → 감사 로그.
+        같은 도메인의 열린 소스가 있으면 아무것도 만들지 않고 None (백엔드의 DUPLICATE 판정과 같은 조건).
+        돌려주는 값은 새 소스 id.
+        """
+        with self.conn.transaction():
+            if self.find_open_source(domain) is not None:
+                return None
+            site_id = self.conn.execute(
+                """
+                INSERT INTO site (domain, base_url, name) VALUES (%s, %s, %s)
+                ON CONFLICT (domain) DO UPDATE SET base_url = EXCLUDED.base_url, name = COALESCE(site.name, EXCLUDED.name)
+                RETURNING id
+                """, (domain, base_url, name)).fetchone()["id"]
+            source_id = self.conn.execute(
+                "INSERT INTO source (site_id, name, status, requested_by) VALUES (%s, %s, 'PENDING', %s) RETURNING id",
+                (site_id, domain, user_id)).fetchone()["id"]
+            self.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', %s)",
+                              (source_id, "CHAT" if channel == "CHAT" else "REGISTRATION"))
+            self.conn.execute(
+                """
+                INSERT INTO registration_request (user_id, input_url, normalized_domain, channel, status, step,
+                                                  result_message, source_id, batch_id)
+                VALUES (%s, %s, %s, %s, 'PROCESSING', 'QUEUED', %s, %s, %s)
+                """, (user_id, input_url[:2000], domain, channel, "등록 요청을 접수했어요. 자동으로 점검과 탐색을 진행합니다.",
+                      source_id, batch_id))
+            self.conn.execute(
+                "INSERT INTO audit_log (actor_id, action, target_type, target_id, detail) VALUES (%s, 'SOURCE_REGISTERED', 'source', %s, %s::jsonb)",
+                (user_id, source_id, json.dumps({"domain": domain, "channel": channel, "batchId": batch_id}, ensure_ascii=False)))
+        return source_id
+
     # ------------------------------------------------------------------ 문서
     def known_urls(self, url_hashes: list[str]) -> set[str]:
         if not url_hashes:

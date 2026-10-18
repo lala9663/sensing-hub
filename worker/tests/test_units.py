@@ -1874,3 +1874,100 @@ def test_title_unescapes_double_encoded_entities():
             '<meta property="article:published_time" content="2026-10-17T12:00:00+09:00"></head><body><p>본문</p></body></html>')
     art = extract_article(html, "https://www.korea.kr/briefing/pressReleaseView.do?newsId=1")
     assert art.title == "문체부와 전남, 문화·체육·관광 협력 & 논의"
+
+
+# ---------------------------------------------------------------------- 링크 모음(포털) 페이지 → 언론사 확장
+
+PORTAL_URL = "https://stand.example.com/"
+PORTAL_DOMAIN = "stand.example.com"
+
+
+def portal_html(outlets: int = 20, extra: str = "") -> str:
+    """뉴스스탠드처럼 다른 호스트의 언론사 로고(이미지 링크)를 모아 둔 홈. 같은 사이트 메뉴와 SNS 링크도 섞여 있다."""
+    logos = "".join(f'<li><a href="https://www.press{i:02d}.co.kr/"><img alt="프레스{i:02d}일보"></a></li>' for i in range(outlets))
+    nav = ('<a href="/about">소개</a><a href="/notice/list?page=2">공지</a><a href="https://help.stand.example.com/">도움말</a>'
+           '<a href="https://www.naver.com/">네이버</a><a href="https://www.facebook.com/stand">페이스북</a>'
+           '<a href="https://www.youtube.com/@stand">유튜브</a><a href="https://apps.apple.com/app/1">앱</a>'
+           '<a href="http://127.0.0.1:8080/">내부</a><a href="http://localhost/">로컬</a><a href="mailto:a@b.c">메일</a>')
+    return f"<html><body><nav>{nav}</nav><ul>{logos}</ul>{extra}</body></html>"
+
+
+def test_portal_outlets_are_off_site_media_hosts_without_denied_or_internal_ones():
+    from sensing_worker.portal import is_portal, outlet_candidates
+    html = portal_html(20, extra='<a href="https://www.press03.co.kr/economy">프레스03일보 경제</a>'
+                                 '<a href="https://www.press03.co.kr/">프레스03일보</a>')
+    outlets = outlet_candidates(html, PORTAL_URL, PORTAL_DOMAIN)
+    domains = [o.domain for o in outlets]
+    assert len(domains) == 20 and len(set(domains)) == 20                      # 같은 도메인은 한 번 (중복 제거)
+    assert domains[0] == "press03.co.kr"                                       # 가장 많이 가리킨 매체가 먼저
+    assert outlets[0].name == "프레스03일보" and outlets[0].base_url == "https://www.press03.co.kr"  # 이미지 alt가 매체명
+    assert "stand.example.com" not in domains and "help.stand.example.com" not in domains  # 같은 사이트 제외
+    for bad in ("naver.com", "facebook.com", "youtube.com", "apple.com", "apps.apple.com", "127.0.0.1", "localhost"):
+        assert bad not in domains
+    assert is_portal(html, PORTAL_URL, PORTAL_DOMAIN, outlets)
+
+
+def test_portal_requires_media_hint_unless_known_news_portal():
+    from sensing_worker.portal import outlet_candidates
+    # 매체 단서가 없는 외부 링크(쇼핑몰·블로그)는 후보가 아니다
+    html = '<html><body>' + "".join(f'<a href="https://shop{i}.example.org/">쇼핑 {i}</a>' for i in range(12)) + '</body></html>'
+    assert outlet_candidates(html, PORTAL_URL, PORTAL_DOMAIN) == []
+    # 호스트에 news·daily 같은 단서가 있으면 링크 텍스트가 없어도 된다
+    html = '<html><body><a href="https://m.dailyfoo.com/"></a><a href="https://newsbar.kr/">바로가기</a></body></html>'
+    assert [o.domain for o in outlet_candidates(html, PORTAL_URL, PORTAL_DOMAIN)] == ["m.dailyfoo.com", "newsbar.kr"]
+    # 알려진 뉴스 포털(뉴스스탠드)은 외부 링크를 모두 언론사 후보로 본다
+    html = '<html><body>' + "".join(f'<a href="https://www.outlet{i}.com/"></a>' for i in range(3)) + '</body></html>'
+    assert outlet_candidates(html, PORTAL_URL, PORTAL_DOMAIN) == []
+    assert len(outlet_candidates(html, "https://newsstand.naver.com/", "newsstand.naver.com")) == 3
+
+
+def test_is_portal_false_for_few_outlets_or_a_news_home_with_many_own_articles():
+    from sensing_worker.portal import detect, is_portal, outlet_candidates
+    # 언론사 9곳뿐이면 모음 페이지가 아니다
+    few = portal_html(9)
+    assert not is_portal(few, PORTAL_URL, PORTAL_DOMAIN, outlet_candidates(few, PORTAL_URL, PORTAL_DOMAIN))
+    assert detect(few, PORTAL_URL, PORTAL_DOMAIN) == []
+    # 언론사 홈: 제휴 매체 12곳을 링크하지만 자기 기사 링크가 훨씬 많다
+    own = "".join(f'<li><a href="/news/articleView.html?idxno={i}">기사 제목 {i}번</a></li>' for i in range(100, 140))
+    news_home = portal_html(12, extra=f"<ul>{own}</ul>")
+    cands = outlet_candidates(news_home, PORTAL_URL, PORTAL_DOMAIN)
+    assert len(cands) == 12
+    assert not is_portal(news_home, PORTAL_URL, PORTAL_DOMAIN, cands)
+    assert detect(news_home, PORTAL_URL, PORTAL_DOMAIN) == []
+    # 모음 페이지: 외부 매체 링크 20개 > 자기 기사형 링크 0개
+    assert len(detect(portal_html(20), PORTAL_URL, PORTAL_DOMAIN)) == 20
+
+
+def test_portal_registrable_mirrors_backend_url_normalizer():
+    from sensing_worker.portal import registrable
+    assert registrable("https://www.chosun.com:443/x?y=1") == ("chosun.com", "https://www.chosun.com")
+    assert registrable("http://news.example.com:8080/") == ("news.example.com", "http://news.example.com:8080")
+    for bad in ("http://127.0.0.1/", "http://10.0.0.1/", "http://localhost/", "http://host.internal/", "ftp://a.com/",
+                "https://user:pw@a.com/", "http://nodot/", "http://127.1/", "https://[::1]/"):
+        assert registrable(bad) is None, bad
+
+
+def test_portal_reads_press_list_embedded_in_inline_script():
+    """뉴스스탠드 실제 홈: 매체 목록이 <a>가 아니라 인라인 스크립트의 JSON(pressList: nm·home·shcutUrl)에 있다."""
+    from sensing_worker.portal import detect, outlet_candidates, script_links
+    items = ",".join(
+        f'{{"id":"{200 + i}","nm":"매체{i}","home":"http:\\/\\/www.press{i:02d}.co.kr\\/","shcutTitl":"매체{i}",'
+        f'"shcutUrl":"http:\\/\\/www.press{i:02d}.co.kr\\/","logo":"up\\/2025\\/nsd{i}.png",'
+        f'"ombs":"http:\\/\\/cafe.naver.com\\/navernewscast\\/menu\\/{i}"}}' for i in range(12))
+    html = (f'<html><body><a href="http://www.naver.com">NAVER</a><a href="http://www.navercorp.com/">NAVER Corp.</a>'
+            f'<script type="text/javascript">var pressList = [{items}];</script>'
+            f'<script src="/js/c/nsd.min.js"></script></body></html>')
+    found = script_links('var x = [{"nm":"MBC","home":"http:\\/\\/imnews.imbc.com\\/","logo":"a.png"}];')
+    assert found == [("http://imnews.imbc.com/", "MBC")]
+    outlets = outlet_candidates(html, "https://newsstand.naver.com/", "newsstand.naver.com")
+    assert [o.domain for o in outlets][:3] == ["press00.co.kr", "press01.co.kr", "press02.co.kr"] and len(outlets) == 12
+    assert outlets[0].name == "매체0" and outlets[0].base_url == "http://www.press00.co.kr"
+    assert not any(o.domain.endswith(("naver.com", "navercorp.com")) for o in outlets)   # 카페·네이버 자체는 제외
+    assert len(detect(html, "https://newsstand.naver.com/", "newsstand.naver.com")) == 12
+
+
+def test_portal_message_and_batch_id():
+    from sensing_worker.jobs import portal_batch_id, portal_message
+    assert portal_batch_id(7) == "portal:7"
+    assert portal_message(12, "portal:7") == "링크 모음 페이지입니다. 이 페이지가 가리키는 언론사 12곳을 대신 등록했습니다. [묶음 portal:7]"
+    assert portal_message(2, "portal:7", duplicates=1, over_cap=3).endswith("(이미 등록된 1곳 제외, 상한을 넘은 3곳 제외) [묶음 portal:7]")

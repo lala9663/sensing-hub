@@ -82,3 +82,5 @@ class Settings:
     adaptive_window: int = field(default_factory=lambda: int(os.getenv("SENSING_ADAPTIVE_WINDOW", "10")))
     adaptive_min_new: float = field(default_factory=lambda: float(os.getenv("SENSING_ADAPTIVE_MIN_NEW", "0.5")))
     adaptive_max_interval: int = field(default_factory=lambda: int(os.getenv("SENSING_ADAPTIVE_MAX_INTERVAL", "1440")))
+    # 링크 모음(포털) 페이지를 등록하면 가리키는 언론사를 대신 등록한다. 한 페이지에서 등록할 언론사 수 상한
+    portal_max_outlets: int = field(default_factory=lambda: int(os.getenv("SENSING_PORTAL_MAX_OUTLETS", "50")))

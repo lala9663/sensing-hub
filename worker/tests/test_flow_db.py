@@ -1030,3 +1030,101 @@ def test_adaptive_interval_doubles_for_quiet_site_and_respects_lock(env):
     quiet_runner = JobRunner(store, runner.f, off)
     assert crawl(store, quiet_runner, off, source_id) == "SUCCESS"
     assert q(store, "SELECT interval_minutes FROM source WHERE id = %s", source_id)["interval_minutes"] == 60
+
+
+# ---------------------------------------------------------------------- 링크 모음(포털) 페이지 → 언론사 확장
+
+def portal_site() -> Site:
+    """뉴스스탠드처럼 다른 호스트의 언론사 로고만 모아 둔 홈. 같은 사이트 기사가 없어 자동 탐색은 실패한다."""
+    logos = "".join(f'<li><a href="https://www.press{i:02d}.co.kr/"><img alt="프레스{i:02d}일보"></a></li>' for i in range(12))
+    return Site({"/": (200, "text/html; charset=utf-8", f"<html><body><ul>{logos}</ul></body></html>"),
+                 "/robots.txt": (404, "text/plain", "")})
+
+
+OUTLETS = [("a-ilbo.example.com", "https://www.a-ilbo.example.com", "A일보"),
+           ("b-ilbo.example.com", "https://b-ilbo.example.com", "B일보"),
+           ("c-news.example.com", "https://c-news.example.com", "C뉴스")]
+
+
+def stub_portal(monkeypatch, outlets) -> dict:
+    """jobs가 portal.detect로 부르므로 모듈 속성을 바꾸면 된다. 무엇을 받았는지 돌려준다."""
+    from sensing_worker import portal
+    seen: dict = {}
+
+    def fake_detect(html, url, domain):
+        seen.update(html=html, url=url, domain=domain)
+        return [portal.Outlet(*o) for o in outlets]
+
+    monkeypatch.setattr(portal, "detect", fake_detect)
+    return seen
+
+
+def test_portal_page_registers_the_outlets_it_links_to(env, monkeypatch):
+    store, runner, settings, sites = env
+    site = portal_site(); sites.append(site)
+    source_id = register(store, site.base)
+    # B일보는 이미 열린 소스가 있다 → 건너뛴다
+    store.conn.execute("INSERT INTO site (domain, base_url) VALUES ('b-ilbo.example.com', 'https://b-ilbo.example.com')")
+    store.conn.execute("INSERT INTO source (site_id, name, status, requested_by) "
+                       "SELECT id, domain, 'ACTIVE', 1 FROM site WHERE domain = 'b-ilbo.example.com'")
+    seen = stub_portal(monkeypatch, OUTLETS)
+
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    # 사전 점검에서 받은 홈으로 판정했다 (다시 받지 않는다)
+    assert "프레스00일보" in seen["html"] and seen["domain"] == "127.0.0.1" and site.hits.count("/") == 2  # 점검 1 + 탐색 1
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)
+    assert src["status"] == "EXCLUDED" and src["status_reason"] == "PORTAL_EXPANDED"
+    reg = q(store, "SELECT status, step, result_message, batch_id FROM registration_request WHERE source_id = %s", source_id)
+    assert reg["status"] == "COMPLETED" and reg["step"] == "DONE" and reg["batch_id"] is None
+    assert reg["result_message"] == ("링크 모음 페이지입니다. 이 페이지가 가리키는 언론사 2곳을 대신 등록했습니다. "
+                                     f"(이미 등록된 1곳 제외) [묶음 portal:{source_id}]")
+    job = q(store, "SELECT status, found_count, new_count, error_count FROM crawl_job WHERE source_id = %s", source_id)
+    assert job["status"] == "SUCCESS" and job["found_count"] == 3 and job["new_count"] == 2 and job["error_count"] == 0
+    assert q(store, "SELECT count(*) AS c FROM crawl_error")["c"] == 0
+
+    # 언론사 2곳: 백엔드 등록과 같은 행 (사이트·소스 PENDING·등록 요청 PROCESSING/QUEUED·ONBOARD 작업), 같은 요청자·채널
+    rows = store.conn.execute("""
+        SELECT r.normalized_domain, r.input_url, r.user_id, r.channel, r.status, r.step, r.result_message,
+               s.status AS src_status, s.kind, s.requested_by, s.name AS src_name, t.base_url, t.name AS site_name,
+               j.job_type, j.trigger, j.status AS job_status
+        FROM registration_request r JOIN source s ON s.id = r.source_id JOIN site t ON t.id = s.site_id
+        JOIN crawl_job j ON j.source_id = s.id WHERE r.batch_id = %s ORDER BY r.id""", (f"portal:{source_id}",)).fetchall()
+    assert [r["normalized_domain"] for r in rows] == ["a-ilbo.example.com", "c-news.example.com"]
+    a = rows[0]
+    assert a["input_url"] == "https://www.a-ilbo.example.com" and a["base_url"] == "https://www.a-ilbo.example.com"
+    assert a["user_id"] == 2 and a["channel"] == "WEB" and a["status"] == "PROCESSING" and a["step"] == "QUEUED"
+    assert "접수" in a["result_message"]
+    assert a["src_status"] == "PENDING" and a["kind"] == "SITE" and a["requested_by"] == 2
+    assert a["src_name"] == "a-ilbo.example.com" and a["site_name"] == "A일보"
+    assert a["job_type"] == "ONBOARD" and a["trigger"] == "REGISTRATION" and a["job_status"] == "QUEUED"
+    # 이미 있던 B일보는 사이트·소스·요청이 늘지 않았다
+    assert q(store, "SELECT count(*) AS c FROM source s JOIN site t ON t.id = s.site_id WHERE t.domain = 'b-ilbo.example.com'")["c"] == 1
+    assert q(store, "SELECT count(*) AS c FROM registration_request WHERE normalized_domain = 'b-ilbo.example.com'")["c"] == 0
+    assert q(store, "SELECT count(*) AS c FROM audit_log WHERE action = 'SOURCE_REGISTERED'")["c"] == 2
+    # 다음 작업은 언론사들의 ONBOARD다 (큐에 올라가 있다)
+    assert q(store, "SELECT count(*) AS c FROM crawl_job WHERE status = 'QUEUED' AND job_type = 'ONBOARD'")["c"] == 2
+
+
+def test_portal_expansion_respects_outlet_cap(env, monkeypatch):
+    store, runner, settings, sites = env
+    site = portal_site(); sites.append(site)
+    source_id = register(store, site.base)
+    stub_portal(monkeypatch, OUTLETS)
+    capped = Settings(**{**settings.__dict__, "portal_max_outlets": 1})
+    assert process_one(store, runner.__class__(store, runner.f, capped), capped) == "SUCCESS"
+    reg = q(store, "SELECT result_message FROM registration_request WHERE source_id = %s", source_id)
+    assert "언론사 1곳을" in reg["result_message"] and "상한을 넘은 2곳 제외" in reg["result_message"]
+    assert q(store, "SELECT count(*) AS c FROM registration_request WHERE batch_id = %s", f"portal:{source_id}")["c"] == 1
+
+
+def test_non_portal_discovery_failure_still_goes_to_review(env, monkeypatch):
+    """모음 페이지가 아니면(언론사 후보 없음) 예전처럼 REVIEW/DISCOVERY_FAILED."""
+    store, runner, settings, sites = env
+    site = portal_site(); sites.append(site)
+    source_id = register(store, site.base)
+    stub_portal(monkeypatch, [])
+    assert process_one(store, runner, settings) == "FAILED"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)
+    assert src["status"] == "REVIEW" and src["status_reason"] == "DISCOVERY_FAILED"
+    assert q(store, "SELECT status FROM registration_request")["status"] == "REVIEW"
