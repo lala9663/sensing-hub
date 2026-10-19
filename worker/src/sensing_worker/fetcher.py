@@ -179,7 +179,7 @@ class PoliteFetcher:
     def get_api(self, url: str, headers: dict[str, str] | None = None) -> Page:
         """공개 API 호출. 도메인 간격·내부망 차단·연결 재시도는 같지만 robots 검사와 차단 화면 분류는 하지 않는다
         (API 주소는 robots 대상이 아니고, 오류는 응답 JSON의 상태 코드로 커넥터가 분류한다). 4xx·5xx도 그대로 돌려준다.
-        headers: 헤더로 인증하는 API(네이버 X-Naver-Client-Id 등)용. 로그에 남기지 않는다."""
+        headers: 헤더로 인증하는 API(네이버 API HUB X-NCP-APIGW-API-KEY 등)용. 로그에 남기지 않는다."""
         return self._request(url, check_robots=False, classify=False, headers=headers)
 
     def post_api(self, url: str, json_body, headers: dict[str, str] | None = None) -> Page:

@@ -36,7 +36,8 @@ def env(tmp_path):
         for path in sorted(MIGRATIONS.glob("V*__*.sql"), key=lambda p: int(p.name[1:].split("__")[0])):
             c.execute(path.read_text(encoding="utf-8"))
     settings = Settings(db_url=DSN, min_interval_seconds=0, max_retries=1, allow_private_hosts=True,
-                        worker_id="test-worker", evidence_dir=str(tmp_path / "evidence"))
+                        worker_id="test-worker", evidence_dir=str(tmp_path / "evidence"),
+                        naver_mode="display", naver_api="hub", naver_search_url="")
     store = Store(DSN)
     fetcher = PoliteFetcher(settings)
     runner = JobRunner(store, fetcher, settings)
@@ -317,11 +318,13 @@ def test_broken_section_keeps_crawl_partial_and_source_active(env):
 SECRET_KEY = "flow-test-secret"
 
 
-def api_runner(store: Store, settings: Settings, handler, secret_key: str = SECRET_KEY) -> tuple[JobRunner, Settings]:
-    """가짜 DART(MockTransport)를 쓰는 러너. 실제 opendart에는 요청하지 않는다."""
+def api_runner(store: Store, settings: Settings, handler, secret_key: str = SECRET_KEY, *,
+               naver_mode: str = "display", llm=None) -> tuple[JobRunner, Settings]:
+    """가짜 API(MockTransport)를 쓰는 러너. 실제 opendart·네이버에는 요청하지 않는다.
+    naver_mode는 네이버 사용 방식 (기본 display = 표시 전용, 감시의 네이버 저장 수집은 store일 때만)."""
     import httpx
-    s = Settings(**{**settings.__dict__, "secret_key": secret_key})
-    runner = JobRunner(store, PoliteFetcher(s, transport=httpx.MockTransport(handler)), s)
+    s = Settings(**{**settings.__dict__, "secret_key": secret_key, "naver_mode": naver_mode})
+    runner = JobRunner(store, PoliteFetcher(s, transport=httpx.MockTransport(handler)), s, llm=llm)
     return runner, s
 
 
@@ -459,7 +462,7 @@ def test_keyword_watch_waits_for_naver_key_then_collects_titles_and_hits(env):
     store, _, settings, _ = env
     handler = naver_handler({"메타넷": articles("메타넷", 3) + [article("메타넷", 4, title="<b>메타넷</b> 채용 공고")],
                              "경쟁사": articles("경쟁사", 2)})
-    runner, s = api_runner(store, settings, handler)
+    runner, s = api_runner(store, settings, handler, naver_mode="store")    # 법무 확인 뒤 켜는 저장·분석 모드
     source_id = register_watch(store, "자사 보도", ["메타넷", "경쟁사"], exclude=["채용"])
 
     # ① 키가 없다 → 호출 없이 관리자 큐(REVIEW/API_KEY_REQUIRED)
@@ -470,7 +473,8 @@ def test_keyword_watch_waits_for_naver_key_then_collects_titles_and_hits(env):
     assert src["status"] == "REVIEW" and src["status_reason"] == "API_KEY_REQUIRED" and src["kind"] == "WATCH"
     assert src["risk_flags"] == {"api_provider": "naver_news"} and src["site_type"] == "NEWS"
     reg = q(store, "SELECT status, result_message FROM registration_request WHERE source_id = %s", source_id)
-    assert reg["status"] == "REVIEW" and "client_id:client_secret" in reg["result_message"]
+    assert reg["status"] == "REVIEW" and "Client ID:Client Secret" in reg["result_message"]
+    assert "NAVER API HUB" in reg["result_message"]
 
     # ② 관리자가 네이버 키를 넣는다 → 검증 → 기존 설정(키워드) 그대로 ACTIVE → 첫 수집 (제목·링크만, 감시 기록)
     put_credential(store, "naver_news", GOOD_KEY)
@@ -511,7 +515,7 @@ def test_match_mode_watch_needs_no_naver_key_and_hits_crawled_articles(env):
     from sensing_worker.jobs import MATCH_MESSAGE
     store, runner, settings, sites = env
     handler = naver_handler()
-    api, s = api_runner(store, settings, handler)
+    api, s = api_runner(store, settings, handler, naver_mode="store")
     watch = register_watch(store, "산업", ["103번"], naver=False)
 
     # 백엔드는 보통 바로 ACTIVE로 두지만, ONBOARD가 남아 있어도(키를 지운 직후 등) 키 없이 대조 모드로 끝낸다
@@ -545,7 +549,7 @@ def test_naver_mode_watch_still_waits_for_key(env):
     from fakenaver import naver_handler
     store, _, settings, _ = env
     handler = naver_handler()
-    api, s = api_runner(store, settings, handler)
+    api, s = api_runner(store, settings, handler, naver_mode="store")
     watch = register_watch(store, "자사", ["메타넷"], naver=True)
     assert process_one(store, api, s) == "FAILED"
     src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", watch)
@@ -556,7 +560,7 @@ def test_two_watches_share_one_document_with_a_hit_each(env):
     from fakenaver import GOOD_KEY, articles, naver_handler
     store, _, settings, _ = env
     put_credential(store, "naver_news", GOOD_KEY)
-    runner, s = api_runner(store, settings, naver_handler({"반도체": articles("반도체", 2)}))
+    runner, s = api_runner(store, settings, naver_handler({"반도체": articles("반도체", 2)}), naver_mode="store")
     a = register_watch(store, "자사", ["반도체"])
     b = register_watch(store, "경쟁사", ["반도체"], user_id=3)
     assert process_one(store, runner, s) == "SUCCESS" and process_one(store, runner, s) == "SUCCESS"
@@ -565,6 +569,43 @@ def test_two_watches_share_one_document_with_a_hit_each(env):
     assert [(h["source_id"], h["c"]) for h in hits] == [(a, 2), (b, 2)]
     assert q(store, "SELECT count(*) AS c FROM document_watch")["c"] == 4
     assert q(store, "SELECT count(DISTINCT domain) AS c FROM site")["c"] == 1   # news.naver.com 한 행을 공유
+
+
+def test_display_mode_never_collects_naver_results_into_db_or_llm(env):
+    """표시 전용(기본): 키가 있고 감시 설정이 네이버 모드(naver true·V13 이전)여도 워커는 네이버를 부르지 않고,
+    document·document_watch에 아무것도 넣지 않으며 LLM도 부르지 않는다 (개정 약관: 저장·캐싱·AI 입력 금지)."""
+    from fakellm import FakeLlm
+    from fakenaver import GOOD_KEY, articles, naver_handler
+    store, _, settings, _ = env
+    put_credential(store, "naver_news", GOOD_KEY)
+    handler = naver_handler({"반도체": articles("반도체", 3), "메타넷": articles("메타넷", 2)})
+    llm = FakeLlm(['{"summary": "x"}'])
+    runner, s = api_runner(store, settings, handler, llm=llm)
+    assert s.naver_mode == "display"
+    flagged = register_watch(store, "반도체", ["반도체"], naver=True)
+    legacy = register_watch(store, "자사", ["메타넷"])                       # naver 표시 없음 (V13 이전 = 네이버 모드)
+
+    assert process_one(store, runner, s) == "SUCCESS" and process_one(store, runner, s) == "SUCCESS"
+    for watch in (flagged, legacy):
+        src = q(store, "SELECT status, status_reason, next_run_at FROM source WHERE id = %s", watch)
+        assert (src["status"], src["status_reason"], src["next_run_at"]) == ("ACTIVE", None, None)
+        reg = q(store, "SELECT status, step FROM registration_request WHERE source_id = %s", watch)
+        assert (reg["status"], reg["step"]) == ("COMPLETED", "DONE")
+    # 관리자가 지금 수집을 눌러도 네이버를 부르지 않고 next_run_at을 비운다
+    assert crawl(store, runner, s, flagged, trigger="MANUAL") == "SUCCESS"
+    assert q(store, "SELECT note FROM crawl_job ORDER BY id DESC LIMIT 1")["note"] == \
+        "수집 기사 대조 모드: 네이버는 display 모드라 저장 수집하지 않음"
+    assert q(store, "SELECT next_run_at FROM source WHERE id = %s", flagged)["next_run_at"] is None
+
+    assert handler.calls == [] and handler.requests == []                   # 네이버 호출 없음
+    for table in ("document", "document_watch", "document_version", "document_enrichment", "chunk", "crawl_error"):
+        assert q(store, f"SELECT count(*) AS c FROM {table}")["c"] == 0, table
+    assert llm.calls == []                                                  # LLM 호출 없음
+    # 키 상태도 건드리지 않는다 (검증은 표시 전용에서 백엔드가 한다)
+    assert q(store, "SELECT status FROM api_credential WHERE provider = 'naver_news'")["status"] == "UNVERIFIED"
+
+    off, s_off = api_runner(store, settings, handler, naver_mode="off")      # off도 같다
+    assert crawl(store, off, s_off, legacy, trigger="MANUAL") == "SUCCESS" and handler.calls == []
 
 
 def test_naver_domain_registered_as_site_asks_for_keyword_watch(env):
@@ -755,7 +796,7 @@ def test_company_watch_links_articles_and_enrichment_raises_news_signal(env):
                                      article("나부품", 2, title="<b>나부품</b> 신제품 출시")],
                              "NABU": [article("NABU", 3, title="NABU 대표이사 교체")],
                              "가전자": articles("가전자", 1)})
-    runner, s = api_runner(store, settings, handler)
+    runner, s = api_runner(store, settings, handler, naver_mode="store")   # 회사 감시의 네이버 저장 수집 (store)
     nabu, nabu_watch = register_company(store, "나부품", ["NABU"], "1234567890")
     ga, ga_watch = register_company(store, "가전자", [], None)
     plain_watch = register_watch(store, "경쟁사", ["가전자"], user_id=3)        # 회사가 아닌 일반 감시
@@ -824,7 +865,7 @@ def test_check_source_records_biz_status_signals_once_and_waits_for_portal_key(e
     check_id = register_check_source(store)
     # 회사 감시 ONBOARD 세 건은 네이버 키가 없어 REVIEW로 빠진다 (이 테스트의 관심사는 점검 소스)
     handler = nts_handler({"1234567890": continuing("1234567890"), "1018112345": closed("1018112345", "20260930")})
-    runner, s = api_runner(store, settings, handler)
+    runner, s = api_runner(store, settings, handler, naver_mode="store")
     for _ in range(3):
         assert process_one(store, runner, s) == "FAILED"
 
@@ -870,7 +911,7 @@ def test_check_source_records_biz_status_signals_once_and_waits_for_portal_key(e
 
     # ④ 나부품이 휴업으로 바뀌면 HIGH 신호 1건 추가, 가전자는 그대로
     handler2 = nts_handler({"1234567890": suspended("1234567890"), "1018112345": closed("1018112345", "20260930")})
-    runner2, s2 = api_runner(store, settings, handler2)
+    runner2, s2 = api_runner(store, settings, handler2, naver_mode="store")
     assert crawl(store, runner2, s2, check_id) == "SUCCESS"
     rows = signals(store)
     assert [(r["company_id"], r["severity"], r["fingerprint"]) for r in rows] == [(ga, "HIGH", "0320260930"), (nabu, "HIGH", "02")]
@@ -904,7 +945,7 @@ def test_dart_checks_fill_corp_codes_and_record_disclosure_signals_once(env):
             disclosure("00000002", "가전자", "주요사항보고서(유상증자결정)", "20261016000003", stock_code="001234"),
             disclosure("00126380", "테스트전자", "회생절차 개시신청", "20261016000009")]      # 마스터에 없는 회사: 받지 않는다
     handler = dart_handler(rows)
-    runner, s = api_runner(store, settings, handler)
+    runner, s = api_runner(store, settings, handler, naver_mode="store")
     put_credential(store, "dart", GOOD_KEY)
     for _ in range(3):
         assert process_one(store, runner, s) == "FAILED"     # 회사 감시 세 건은 네이버 키가 없어 REVIEW
@@ -968,7 +1009,7 @@ def test_g2b_check_records_debarment_signal_once_and_skips_companies_without_biz
     ga, _ = register_company(store, "가전자", [], None)
     check_id = register_check_source(store, "g2b_debarment")
     handler = g2b_handler({"1234567890": [sanction("1234567890", "나부품")]})
-    runner, s = api_runner(store, settings, handler)
+    runner, s = api_runner(store, settings, handler, naver_mode="store")
     put_credential(store, "data_go_kr", GOOD_KEY)
     for _ in range(2):
         assert process_one(store, runner, s) == "FAILED"     # 회사 감시 두 건: 네이버 키 없음

@@ -21,6 +21,7 @@ import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
+import io.sensinghub.naver.NaverSettings;
 import io.sensinghub.registration.RegistrationService;
 
 /**
@@ -32,10 +33,14 @@ import io.sensinghub.registration.RegistrationService;
  *   <li>기본 동작은 <b>수집 기사 대조</b>다: 워커가 등록된 언론사에서 긁어 온 기사마다 모든 감시의 키워드를 대조해
  *       document_watch로 남긴다(워커 watchmatch). 이 모드({@code naver: false})의 감시는 ACTIVE지만
  *       {@code next_run_at}이 NULL이라 스케줄러가 작업을 넣지 않는다.</li>
- *   <li>네이버 뉴스 검색 API 키(api_credential naver_news, INVALID 아님)가 있으면 {@code naver: true}로 네이버 검색도 함께 붙인다:
- *       ONBOARD → 주기 수집. 네이버는 2026-07-31부터 검색 API 신규 발급을 중단해 키가 없는 것이 보통이다.
- *       키가 나중에 들어오면 {@link #attachNaver}가 대조 모드 감시에 네이버 검색을 붙이고, 키를 지우면 {@link #detachNaver}가
- *       대조 모드로 되돌린다. config에 {@code naver}가 없는 감시(V13 이전에 만든 것)는 네이버 모드로 본다.</li>
+ *   <li>네이버 뉴스 검색은 사용 방식({@link NaverSettings}, SENSING_NAVER_MODE)에 따른다. 기본 {@code display}(표시 전용)에서는
+ *       감시에 네이버 저장 수집을 <b>붙이지 않는다</b> — 개정 약관(2026-09-07)이 검색 결과의 저장·AI 입력을 금지해, 네이버 결과는
+ *       감시 화면의 "네이버 뉴스 실시간"(io.sensinghub.naver)으로 보기만 한다. 감시는 키가 있어도 수집 기사 대조 모드다.</li>
+ *   <li>{@code store}(법무 확인 뒤 켜는 저장·분석)이고 NAVER API HUB 키(api_credential naver_news, INVALID 아님)가 있으면
+ *       {@code naver: true}로 네이버 검색도 함께 붙인다: ONBOARD → 주기 수집. 키가 나중에 들어오면 {@link #attachNaver}가 대조 모드
+ *       감시에 네이버 검색을 붙이고, 키를 지우면 {@link #detachNaver}가 대조 모드로 되돌린다. config에 {@code naver}가 없는
+ *       감시(V13 이전에 만든 것)는 네이버 모드로 본다. 화면의 {@link WatchView#naver()}는 store일 때만 true다(워커도 store일 때만
+ *       네이버를 부른다).</li>
  *   <li>등록 규칙은 사이트 등록과 같다: REGISTRAR 이상은 바로 시작하고, VIEWER는 승인 대기
  *       ({@code registration_request} AWAITING_APPROVAL, 승인은 /registrations/{id}/approve → {@link #start}).</li>
  *   <li>진행 상태는 registration_request 한 행({@code input_url = "watch:<이름>"})으로 /registrations/mine에서 본다.</li>
@@ -55,7 +60,7 @@ public class WatchService {
     /** 수집 기사 대조 모드의 안내 문구 (등록 요청 결과 메시지). */
     public static final String MATCH_MESSAGE = "등록된 언론사에서 수집한 기사에 키워드를 대조합니다.";
 
-    /** @param naver 네이버 뉴스 검색도 함께 쓰는지 (false면 수집 기사 대조만) */
+    /** @param naver 네이버 뉴스 검색으로 저장 수집도 하는지 (store 모드에서만 true, false면 수집 기사 대조만) */
     public record WatchView(long id, String name, List<String> keywords, List<String> exclude, boolean naver,
                             String status, String statusReason, Integer configVersion, int intervalMinutes,
                             OffsetDateTime lastSuccessAt, OffsetDateTime nextRunAt, long documentCount,
@@ -67,13 +72,16 @@ public class WatchService {
     private final AuditLogger audit;
     private final ObjectMapper json;
     private final boolean viewerNeedsApproval;
+    private final NaverSettings naverSettings;
 
     public WatchService(JdbcClient jdbc, AuditLogger audit, ObjectMapper json,
-                        @Value("${sensing.registration.viewer-needs-approval}") boolean viewerNeedsApproval) {
+                        @Value("${sensing.registration.viewer-needs-approval}") boolean viewerNeedsApproval,
+                        NaverSettings naverSettings) {
         this.jdbc = jdbc;
         this.audit = audit;
         this.json = json;
         this.viewerNeedsApproval = viewerNeedsApproval;
+        this.naverSettings = naverSettings;
     }
 
     @Transactional
@@ -154,7 +162,7 @@ public class WatchService {
                 """)
                 .params(siteId, "watch:" + watchName, watchName, intervalMinutes, user.id())
                 .query(Long.class).single();
-        boolean naver = naverAvailable();
+        boolean naver = naverStoreAvailable();
         activateVersion(sourceId, user, terms, excluded, naver, note);
 
         boolean needsApproval = viewerNeedsApproval && !user.role().atLeast(Role.REGISTRAR);
@@ -178,7 +186,8 @@ public class WatchService {
     }
 
     /**
-     * 감시를 시작한다 (REGISTRAR 이상의 생성, VIEWER 요청의 관리자 승인). 지금 네이버 키가 있는지로 모드를 정하고, 설정의 표시가
+     * 감시를 시작한다 (REGISTRAR 이상의 생성, VIEWER 요청의 관리자 승인). 지금 네이버 저장 수집을 붙일 수 있는지(store 모드 +
+     * 키, {@link #naverStoreAvailable})로 모드를 정하고, 설정의 표시가
      * 다르면(승인을 기다리는 사이 키가 들어오거나 빠졌으면, 또는 V13 이전 요청이면) 같은 키워드로 설정 새 버전을 만든다.
      * <ul>
      *   <li>네이버 모드: ONBOARD 작업 → 워커가 키 확인·첫 검색 후 ACTIVE (요청은 PROCESSING).</li>
@@ -188,11 +197,12 @@ public class WatchService {
      */
     @Transactional
     public boolean start(CurrentUser user, long sourceId, long requestId, boolean approved) {
-        boolean naver = naverAvailable();
+        boolean naver = naverStoreAvailable();
         String config = activeConfig(sourceId);
         if (config == null || !parse(config).containsKey("naver") || naverOf(config) != naver) {
             activateVersion(sourceId, user, terms(config, "keywords"), terms(config, "exclude"), naver,
-                    naver ? "네이버 뉴스 검색 키가 있어 네이버 검색 함께" : "네이버 키 없음 — 수집 기사 대조");
+                    naver ? "네이버 뉴스 검색 키가 있어 네이버 검색 함께"
+                            : naverSettings.storeEnabled() ? "네이버 키 없음 — 수집 기사 대조" : "네이버 표시 전용 — 수집 기사 대조");
         }
         String lead = approved ? "승인되어 키워드 감시를 시작합니다. " : "키워드 감시를 시작합니다. ";
         if (naver) {
@@ -213,20 +223,33 @@ public class WatchService {
         return naver;
     }
 
-    /** 네이버 뉴스 검색 API 키가 있는가 (워커가 INVALID로 표시한 키는 없는 것으로 본다). */
-    public boolean naverAvailable() {
-        return jdbc.sql("SELECT count(*) FROM api_credential WHERE provider = ? AND status <> 'INVALID'")
+    /**
+     * 감시에 네이버 저장 수집을 붙일 수 있는가: 사용 방식이 store(법무 확인 뒤 켜는 저장·분석)이고 네이버 키가 있다
+     * (워커가 INVALID로 표시한 키는 없는 것으로 본다). 기본 표시 전용(display)·off에서는 늘 false다.
+     */
+    public boolean naverStoreAvailable() {
+        return naverSettings.storeEnabled()
+                && jdbc.sql("SELECT count(*) FROM api_credential WHERE provider = ? AND status <> 'INVALID'")
                 .param(PROVIDER).query(Long.class).single() > 0;
+    }
+
+    /** 네이버 사용 방식이 저장·분석(store)인가. 아니면(표시 전용·off) 감시의 네이버 표시는 화면에서 false다. */
+    public boolean naverStoreMode() {
+        return naverSettings.storeEnabled();
     }
 
     /**
      * 네이버 키가 들어왔다: 대조 모드 감시에 네이버 검색을 붙인다 (설정 새 버전 naver true). 수집 중(ACTIVE)이면 ONBOARD를 넣어
      * 워커가 키를 확인하고 첫 검색을 하게 하고, 일시정지(PAUSED)면 설정만 바꾼다 (재개하면 네이버로 수집한다).
      * 승인 대기(PENDING) 감시는 승인 때({@link #start}) 정한다. 수집 기사 대조는 모드와 관계없이 계속된다.
+     * 사용 방식이 store가 아니면(기본 표시 전용) 아무것도 붙이지 않는다 — 네이버 결과는 감시 화면에서 실시간으로 보기만 한다.
      * @return 네이버 검색을 붙인 감시 수
      */
     @Transactional
     public int attachNaver(CurrentUser admin) {
+        if (!naverSettings.storeEnabled()) {
+            return 0;
+        }
         List<Long> ids = watchesInMode("s.status IN ('ACTIVE', 'PAUSED')", false);
         for (long id : ids) {
             String config = activeConfig(id);
@@ -284,9 +307,12 @@ public class WatchService {
                 """.formatted(statusCondition)).param(naver).query(Long.class).list();
     }
 
-    /** 네이버 모드로 감시 중이면 다음 틱에 새 키워드로 바로 검색하게 한다. 대조 모드는 next_run_at을 NULL로 둔다. */
+    /**
+     * 네이버 모드로 감시 중이면 다음 틱에 새 키워드로 바로 검색하게 한다. 대조 모드는 next_run_at을 NULL로 둔다.
+     * 표시 전용(store가 아님)에서는 설정이 네이버 모드여도 워커가 수집하지 않으므로 당기지 않는다.
+     */
     private void pullNextRun(long sourceId, boolean naver) {
-        if (naver) {
+        if (naver && naverSettings.storeEnabled()) {
             jdbc.sql("UPDATE source SET next_run_at = now(), updated_at = now() WHERE id = ? AND status = 'ACTIVE'")
                     .param(sourceId).update();
         }
@@ -477,7 +503,8 @@ public class WatchService {
     private WatchView map(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
         String config = rs.getString("config");
         return new WatchView(rs.getLong("id"), rs.getString("watch_name"), terms(config, "keywords"),
-                terms(config, "exclude"), naverOf(config), rs.getString("status"), rs.getString("status_reason"),
+                terms(config, "exclude"), naverOf(config) && naverSettings.storeEnabled(), rs.getString("status"),
+                rs.getString("status_reason"),
                 (Integer) rs.getObject("config_version"), rs.getInt("interval_minutes"),
                 rs.getObject("last_success_at", OffsetDateTime.class), rs.getObject("next_run_at", OffsetDateTime.class),
                 rs.getLong("document_count"), rs.getString("requested_by"),

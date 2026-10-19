@@ -23,7 +23,7 @@ const App = (() => {
     COMPLETED: '완료', REVIEW: '확인 필요', BROKEN: '중단(이상)', BLOCKED: '차단', REJECTED: '반려',
     DUPLICATE: '중복', INVALID: '형식 오류', PAUSED: '일시정지', EXCLUDED: '제외',
     QUEUED: '대기 중', RUNNING: '실행 중', SUCCESS: '성공', PARTIAL: '부분 성공', FAILED: '실패',
-    SENT: '발송', EMPTY: '빈 결과', UNVERIFIED: '미검증', VERIFIED: '검증됨', RETIRED: '이전 버전',
+    SENT: '발송', EMPTY: '빈 결과', UNVERIFIED: '미검증', VERIFIED: '검증됨', VALID: '유효', RETIRED: '이전 버전',
     ARCHIVED: '보관', NONE: '-',
     HIGH: '높음', MEDIUM: '중간', LOW: '낮음',
     APPROVAL: '승인 대기', API_KEY: 'API 키 필요',
@@ -34,7 +34,7 @@ const App = (() => {
     ONBOARD: '등록', CRAWL: '수집', BACKFILL: '과거 기사', CANCELLED: '취소',
   };
   const STATUS_COLORS = {
-    ACTIVE: 'green', COMPLETED: 'green', SUCCESS: 'green', SENT: 'green', VERIFIED: 'green', DONE: 'green',
+    ACTIVE: 'green', COMPLETED: 'green', SUCCESS: 'green', SENT: 'green', VERIFIED: 'green', VALID: 'green', DONE: 'green',
     REVIEW: 'orange', BROKEN: 'orange', PARTIAL: 'orange', AWAITING_APPROVAL: 'orange', UNVERIFIED: 'orange',
     PAUSED: 'orange', MEDIUM: 'orange', APPROVAL: 'orange', API_KEY: 'orange',
     BLOCKED: 'red', REJECTED: 'red', FAILED: 'red', INVALID: 'red', EXCLUDED: 'red', HIGH: 'red',
@@ -66,8 +66,9 @@ const App = (() => {
   }
 
   /**
-   * 키워드 감시 상태 배지. 수집 중(ACTIVE)이면 모드를 보여 준다: 네이버 키가 없으면 "수집 기사 대조 중"(등록된 언론사에서 긁어 온 기사에
-   * 키워드를 대조), 키가 있으면 "수집 중" + "네이버 검색 함께". 그 밖의 상태는 일반 배지.
+   * 키워드 감시 상태 배지. 수집 중(ACTIVE)이면 모드를 보여 준다: 기본은 "수집 기사 대조 중"(등록된 언론사에서 긁어 온 기사에
+   * 키워드를 대조), 네이버 저장·분석 모드(store)에서 키가 있으면 "수집 중" + "네이버 검색 함께". 표시 전용(기본)의 네이버 실시간 보기는
+   * 감시 화면 버튼이라 배지에는 나오지 않는다. 그 밖의 상태는 일반 배지.
    */
   function watchBadge(status, naver) {
     if (status === 'ACTIVE' && naver === false) {

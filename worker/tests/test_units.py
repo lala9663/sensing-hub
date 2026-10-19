@@ -1260,8 +1260,10 @@ def test_crawl_with_legacy_single_pattern_config_is_unchanged(tmp_path):
 
 # ---------------------------------------------------------------------- 공개 API 소스 (M2)
 
-def _api_fetcher(handler) -> PoliteFetcher:
-    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True)
+def _api_fetcher(handler, **overrides) -> PoliteFetcher:
+    # 네이버 주소 설정은 개발자 PC의 환경 변수와 관계없이 기본(hub)으로 고정한다
+    s = Settings(**{"min_interval_seconds": 0, "max_retries": 1, "allow_private_hosts": True,
+                    "naver_api": "hub", "naver_search_url": "", **overrides})
     return PoliteFetcher(s, transport=httpx.MockTransport(handler))
 
 
@@ -1359,9 +1361,11 @@ def test_naver_news_is_keyword_based_provider():
     assert naver.id == "naver_news" and naver.keyword_based and naver.needs_key
     assert catalog.lookup("n.news.naver.com").id == "naver_news"
     assert catalog.lookup("openapi.naver.com").id == "naver_news"
+    assert catalog.lookup("naverapihub.apigw.ntruss.com").id == "naver_news"
     assert catalog.lookup("naver.com") is None and catalog.lookup("blog.naver.com") is None
     assert catalog.get("dart").keyword_based is False                 # 기본값
-    assert "client_id:client_secret" in naver.key_required_message and "developers.naver.com" in naver.signup_url
+    assert "Client ID:Client Secret" in naver.key_required_message and "NAVER API HUB" in naver.key_required_message
+    assert "ncloud.com" in naver.signup_url
 
 
 def test_naver_connector_fetches_each_keyword_and_keeps_title_link_only():
@@ -1396,6 +1400,14 @@ def test_naver_connector_fetches_each_keyword_and_keeps_title_link_only():
     assert handler.calls[1:] == [("삼성전자", 100, 1), ("경쟁사", 100, 1)]            # 검색어마다 한 페이지씩 (100건 미만)
     assert handler.headers and all(h == (GOOD_ID, GOOD_SECRET) for h in handler.headers)   # 키는 헤더로만
     assert c.calls == 3
+    # NAVER API HUB 요청 형식: https 주소·경로, X-NCP-APIGW-API-KEY-ID/KEY 헤더, query·display·start·sort·format 파라미터
+    req = handler.requests[1]
+    assert (req.method, req.url.scheme, req.url.host, req.url.path) == ("GET", "https", "naverapihub.apigw.ntruss.com",
+                                                                         "/search/v1/news")
+    assert list(req.url.params.multi_items()) == [("query", "삼성전자"), ("display", "100"), ("start", "1"), ("sort", "date"),
+                                                  ("format", "json")]
+    assert req.headers["X-NCP-APIGW-API-KEY-ID"] == GOOD_ID and req.headers["X-NCP-APIGW-API-KEY"] == GOOD_SECRET
+    assert "X-Naver-Client-Id" not in req.headers and GOOD_SECRET not in str(req.url)
 
     with pytest.raises(CrawlFailure) as e:                             # 키워드가 없으면 수집하지 않는다
         c.fetch(GOOD_KEY, {"keywords": [], "exclude": []}, since=datetime(2026, 1, 1).date(), limit=50)
@@ -1433,15 +1445,19 @@ def test_naver_connector_classifies_key_errors_and_rate_limit_without_leaking_se
         blob = str(e) + (e.url or "") + (e.evidence or "")
         return GOOD_SECRET in blob or GOOD_ID in blob or "wrong-secret" in blob
 
-    with pytest.raises(CrawlFailure) as e:                             # 틀린 시크릿 → 401/024 → API_KEY_INVALID
+    with pytest.raises(CrawlFailure) as e:                             # 틀린 시크릿 → 401 (API Gateway 200) → API_KEY_INVALID
         NaverNewsConnector(_api_fetcher(naver_handler())).verify(f"{GOOD_ID}:wrong-secret")
     assert e.value.code == Code.API_KEY_INVALID and not e.value.retryable and e.value.http_status == 401
-    assert "024" in str(e.value) and not leaked(e.value)
+    assert "200: Authentication Failed" in str(e.value) and "Client ID" in str(e.value) and not leaked(e.value)
 
     handler = naver_handler()
     with pytest.raises(CrawlFailure) as e:                             # 형식이 아니면 호출 없이 API_KEY_INVALID
         NaverNewsConnector(_api_fetcher(handler)).verify("no-colon-here")
-    assert e.value.code == Code.API_KEY_INVALID and "client_id:client_secret" in str(e.value) and handler.calls == []
+    assert e.value.code == Code.API_KEY_INVALID and "Client ID:Client Secret" in str(e.value) and handler.calls == []
+
+    with pytest.raises(CrawlFailure) as e:                             # 403(권한 없음) → API_KEY_INVALID
+        NaverNewsConnector(_api_fetcher(naver_handler(http_status=403, error_code="210"))).verify(GOOD_KEY)
+    assert e.value.code == Code.API_KEY_INVALID and e.value.http_status == 403 and "권한" in str(e.value)
 
     with pytest.raises(CrawlFailure) as e:                             # 429 한도 초과 → API_ERROR(재시도)
         NaverNewsConnector(_api_fetcher(naver_handler(http_status=429, error_code="010"))).verify(GOOD_KEY)
@@ -1456,6 +1472,19 @@ def test_naver_connector_classifies_key_errors_and_rate_limit_without_leaking_se
         NaverNewsConnector(_api_fetcher(naver_handler(http_status=400, error_code="SE01"))).verify(GOOD_KEY)
     assert e.value.code == Code.API_ERROR and not e.value.retryable and "SE01" in str(e.value)
 
+    with pytest.raises(CrawlFailure) as e:                             # 400 SE02 → 알기 쉬운 문장
+        NaverNewsConnector(_api_fetcher(naver_handler(http_status=400, error_code="SE02"))).verify(GOOD_KEY)
+    assert "display 값이 허용 범위" in str(e.value) and not e.value.retryable
+
+    with pytest.raises(CrawlFailure) as e:                             # 주소가 틀리면 404 SE05 (설정 확인 안내)
+        NaverNewsConnector(_api_fetcher(naver_handler(), naver_search_url="https://naverapihub.apigw.ntruss.com/search/v1/nope")
+                           ).verify(GOOD_KEY)
+    assert e.value.code == Code.API_ERROR and e.value.http_status == 404 and "SENSING_NAVER_API" in str(e.value)
+
+    with pytest.raises(CrawlFailure) as e:                             # 500 SE99 → 재시도
+        NaverNewsConnector(_api_fetcher(naver_handler(http_status=500, error_code="SE99"))).verify(GOOD_KEY)
+    assert e.value.retryable and "네이버 검색 서버 내부 오류" in str(e.value)
+
     def down(request):
         raise httpx.ConnectError("boom", request=request)
     with pytest.raises(CrawlFailure) as e:
@@ -1466,6 +1495,43 @@ def test_naver_connector_classifies_key_errors_and_rate_limit_without_leaking_se
     assert clean_title("  <b>삼성</b>&amp;<b>LG</b> &lt;협력&gt;  ") == "삼성&LG <협력>" and clean_title("") is None
     assert parse_pub_date("Thu, 16 Oct 2026 09:30:00 +0900") == datetime(2026, 10, 16, 0, 30, tzinfo=timezone.utc)
     assert parse_pub_date("not a date") is None and parse_pub_date(None) is None
+
+
+def test_naver_connector_can_use_legacy_developers_api_or_custom_url():
+    from fakenaver import GOOD_ID, GOOD_KEY, GOOD_SECRET, articles, naver_handler
+    from sensing_worker.apis.naver_news import NaverNewsConnector, endpoint_for
+    handler = naver_handler({"k": articles("k", 2)}, api="developers")
+    c = NaverNewsConnector(_api_fetcher(handler, naver_api="developers"))
+    assert len(c.fetch(GOOD_KEY, {"keywords": ["k"]}, since=datetime(2026, 1, 1).date(), limit=10)) == 2
+    req = handler.requests[0]
+    assert (req.url.host, req.url.path) == ("openapi.naver.com", "/v1/search/news.json")
+    assert req.headers["X-Naver-Client-Id"] == GOOD_ID and req.headers["X-Naver-Client-Secret"] == GOOD_SECRET
+    assert "format" not in dict(req.url.params) and "X-NCP-APIGW-API-KEY" not in req.headers
+
+    with pytest.raises(CrawlFailure) as e:                             # 개발자센터 인증 실패(024)도 API_KEY_INVALID
+        NaverNewsConnector(_api_fetcher(naver_handler(api="developers"), naver_api="developers")).verify(f"{GOOD_ID}:bad")
+    assert e.value.code == Code.API_KEY_INVALID and "024" in str(e.value) and GOOD_ID not in str(e.value)
+
+    # 주소만 바꾸면 헤더는 hub 그대로 (프록시·테스트용)
+    custom = endpoint_for(Settings(naver_api="hub", naver_search_url="https://proxy.example.com/naver/news"))
+    assert (custom.url, custom.id_header, custom.extra_params) == ("https://proxy.example.com/naver/news",
+                                                                   "X-NCP-APIGW-API-KEY-ID", (("format", "json"),))
+    assert endpoint_for(Settings(naver_api="nope", naver_search_url="")).api == "hub"     # 모르는 값은 hub
+
+
+def test_naver_describe_error_reads_both_error_body_shapes():
+    from sensing_worker.apis.naver_news import describe_error, error_of
+    assert error_of({"errorCode": "SE03", "errorMessage": "Invalid start value"}) == ("SE03", "Invalid start value")
+    assert error_of({"error": {"errorCode": "200", "message": "Authentication Failed", "details": "missing"}}) == (
+        "200", "Authentication Failed: missing")
+    assert error_of({"items": []}) == ("", "") and error_of([]) == ("", "")
+    assert describe_error(200, "", "") is None
+    code, text, retry = describe_error(429, "", "")
+    assert code == Code.API_ERROR and retry and "하루 허용량" in text
+    for se, word in (("SE04", "sort"), ("SE06", "UTF-8")):
+        code, text, retry = describe_error(400, se, "x")
+        assert code == Code.API_ERROR and not retry and word in text
+    assert describe_error(300, "300", "API 없음")[2] is False
 
 
 def test_discovery_eval_marks_api_domains_without_network():
@@ -2335,11 +2401,26 @@ def test_portal_message_and_batch_id():
 
 def test_naver_enabled_reads_watch_mode_and_defaults_to_naver_for_old_configs():
     from sensing_worker.jobs import naver_enabled
-    assert naver_enabled({"kind": "WATCH", "config": {"naver": False, "keywords": ["a"]}}) is False
-    assert naver_enabled({"kind": "WATCH", "config": {"naver": True}}) is True
-    assert naver_enabled({"kind": "WATCH", "config": {"keywords": ["a"]}}) is True     # V13 이전 감시 = 네이버 모드
-    assert naver_enabled({"kind": "WATCH", "config": None}) is True
-    assert naver_enabled({"kind": "SITE", "config": {"naver": False}}) is True         # 감시가 아니면 해당 없음
+    assert naver_enabled({"kind": "WATCH", "config": {"naver": False, "keywords": ["a"]}}, "store") is False
+    assert naver_enabled({"kind": "WATCH", "config": {"naver": True}}, "store") is True
+    assert naver_enabled({"kind": "WATCH", "config": {"keywords": ["a"]}}, "store") is True     # V13 이전 감시 = 네이버 모드
+    assert naver_enabled({"kind": "WATCH", "config": None}, "store") is True
+    assert naver_enabled({"kind": "SITE", "config": {"naver": False}}, "store") is True         # 감시가 아니면 해당 없음
+    # 표시 전용(기본)·off: 설정과 관계없이 네이버 저장 수집을 하지 않는다 (약관: 저장·AI 입력 금지)
+    for mode in ("display", "off"):
+        assert naver_enabled({"kind": "WATCH", "config": {"naver": True}}, mode) is False
+        assert naver_enabled({"kind": "WATCH", "config": {"keywords": ["a"]}}, mode) is False
+        assert naver_enabled({"kind": "SITE", "config": {}}, mode) is True
+
+
+def test_naver_settings_default_to_display_and_hub(monkeypatch):
+    for name in ("SENSING_NAVER_MODE", "SENSING_NAVER_API", "SENSING_NAVER_SEARCH_URL"):
+        monkeypatch.delenv(name, raising=False)
+    s = Settings()
+    assert (s.naver_mode, s.naver_api, s.naver_search_url) == ("display", "hub", "")
+    monkeypatch.setenv("SENSING_NAVER_MODE", " Store ")
+    monkeypatch.setenv("SENSING_NAVER_API", "DEVELOPERS")
+    assert (Settings().naver_mode, Settings().naver_api) == ("store", "developers")
 
 
 def test_watch_keywords_match_crawled_documents():
