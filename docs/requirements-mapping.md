@@ -48,7 +48,7 @@
 
 | 제공처 | 용도 | 발급 | 비고 |
 | --- | --- | --- | --- |
-| 네이버 뉴스 검색 API | 키워드로 언론 보도 | 앱 등록 후 즉시 | **구현됨** (`apis/naver_news.py`, provider `naver_news`, 키 `client_id:client_secret`). 키워드 감시(`/api/v1/watches`)의 주 소스, 60분 주기, 제목·링크·발행일만. 일 한도 25,000 — 호출 수 로그(`SENSING_NAVER_DAILY_LIMIT`), 정확한 쿼터 추적은 후속 |
+| 네이버 뉴스 검색 API | 키워드로 언론 보도 | **2026-07-31부터 개발자센터 신규 발급 중단** (기존 키 2027-06-30까지, 9-7부터 NAVER API HUB로 이관·유료, 개정 약관상 "검색 결과를 그대로 보여주는 목적"만 허용·AI 요약 활용 금지로 전해짐 — 원문 약관 확인 필요) | 커넥터는 **구현됨** (`apis/naver_news.py`, provider `naver_news`, 키 `client_id:client_secret`). 키워드 감시(`/api/v1/watches`)의 주 소스, 60분 주기, 제목·링크·발행일만. 일 한도 25,000 — 호출 수 로그(`SENSING_NAVER_DAILY_LIMIT`), 정확한 쿼터 추적은 후속 |
 | DART 오픈API | 공시 | 회원가입 후 즉시 | 회사(corp_code)별 조회 |
 | 공공데이터포털 | 부처·기관 데이터 | 활용 신청, 대부분 자동 승인 | 일부는 심의 |
 | 정책브리핑 korea.kr RSS | 정부 보도자료 | 키 없음 | 이미 사이트맵으로 수집 가능 |
