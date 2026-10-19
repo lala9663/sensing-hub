@@ -25,7 +25,7 @@ App.route('/documents', async (view, params, query) => {
         <div class="chips" id="topic-chips" style="margin:0"></div>
       </div>
       <form id="filter-form" class="row mt">
-        <input type="search" name="q" placeholder="제목·본문 검색 (예: 반도체)" value="${esc(filter.q)}" style="min-width:220px">
+        <input type="search" name="q" placeholder="제목·본문 검색 (예: 반도체 수출 — 낱말 모두 포함)" value="${esc(filter.q)}" style="min-width:220px">
         <input type="text" name="keyword" placeholder="감시 검색어 (정확히 일치)" value="${esc(filter.keyword)}">
         <input type="number" name="sourceId" placeholder="소스 ID" value="${esc(filter.sourceId)}" style="width:110px;min-width:0">
         <button type="submit">적용</button>
@@ -82,7 +82,8 @@ App.route('/documents', async (view, params, query) => {
         <div class="doc-item" data-id="${d.id}">
           <div class="title"><a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(d.title || d.url)}</a></div>
           <div class="meta">${esc(d.domain)}${d.section ? ' · ' + esc(d.section) : ''} · 발행 ${App.fmtTime(d.publishedAt)} · 수집 ${App.fmtTime(d.collectedAt)}
-            ${App.isAdmin() ? ` · <a href="#/admin/sources/${d.sourceId}">소스 #${d.sourceId}</a>` : ` · 소스 #${d.sourceId}`}</div>
+            ${App.isAdmin() ? ` · <a href="#/admin/sources/${d.sourceId}">소스 #${d.sourceId}</a>` : ` · 소스 #${d.sourceId}`}
+            ${d.issueId && d.issueDocCount >= 2 ? ` · <a href="#/issues/${d.issueId}" title="같은 사건을 다룬 기사 묶음">이슈 #${d.issueId} (${d.issueDocCount}건)</a>` : ''}</div>
           <div class="meta">${(d.topics || []).map(t => badge(t)).join(' ')} ${tags(d.tags)}
             ${(d.keywords || []).length ? `<span class="muted">검색어:</span> ${tags(d.keywords)}` : ''}</div>
           ${d.summary ? `<div class="summary">${esc(d.summary)}</div>` : ''}

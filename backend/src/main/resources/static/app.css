@@ -210,6 +210,9 @@ td.actions { white-space: nowrap; }
 .doc-item .title { font-size: 14px; font-weight: 600; }
 .doc-item .meta { color: var(--muted); font-size: 12px; margin: 2px 0; }
 .doc-item .summary { margin: 4px 0; }
+.issue-docs { margin: 6px 0; padding-left: 18px; }
+.issue-docs li { margin: 3px 0; }
+.issue-docs li .muted { margin-left: 6px; }
 .doc-body { white-space: pre-wrap; background: #fafbfc; border: 1px solid var(--border); padding: 10px; max-height: 320px; overflow: auto; margin-top: 8px; font-size: 13px; }
 
 .queue-item { padding: 12px 0; border-bottom: 1px solid var(--border); }

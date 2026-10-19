@@ -25,7 +25,7 @@ import io.sensinghub.document.SearchTerms;
  * <ul>
  *   <li>목록 정렬: 언론사 수 → 기사 수 → 마지막 기사 시각 (많은 곳이 다룬 이슈가 위).</li>
  *   <li>since는 이슈의 마지막 기사 시각(last_seen_at) 기준: "그 뒤에도 기사가 나온 이슈".</li>
- *   <li>min_docs 기본 2: 기사가 하나뿐인 이슈(대부분)는 빼고 본다.</li>
+ *   <li>min_docs 기본 2: 기사가 하나뿐인 이슈(대부분)는 빼고 본다. min_sources(기본 1)는 언론사 수 하한 (화면의 2곳+/3곳+/5곳+).</li>
  *   <li>q: 대표 제목 부분 일치 또는 서명 낱말(top_terms) 접두 일치. 낱말이 여럿이면 모두 맞아야 한다.</li>
  * </ul>
  */
@@ -64,11 +64,13 @@ public class IssueService {
             FROM issue i
             """;
 
-    public List<IssueRow> list(CurrentUser user, String since, Integer minDocs, String q, Integer limit) {
+    public List<IssueRow> list(CurrentUser user, String since, Integer minDocs, Integer minSources, String q,
+                               Integer limit) {
         user.require(Role.VIEWER);
-        StringBuilder sql = new StringBuilder(ROW_SQL).append(" WHERE i.doc_count >= ?");
+        StringBuilder sql = new StringBuilder(ROW_SQL).append(" WHERE i.doc_count >= ? AND i.source_count >= ?");
         List<Object> params = new ArrayList<>();
         params.add(minDocs == null ? 2 : Math.max(1, minDocs));
+        params.add(minSources == null ? 1 : Math.max(1, minSources));
         OffsetDateTime from = DocumentService.parseSince(since);
         if (from != null) {
             sql.append(" AND i.last_seen_at >= ?");

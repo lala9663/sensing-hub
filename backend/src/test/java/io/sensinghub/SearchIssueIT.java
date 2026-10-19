@@ -178,6 +178,8 @@ class SearchIssueIT {
         assertThat(ids(get("/api/v1/issues?since=2026-10-16T00:00:00+09:00&min_docs=1")))
                 .containsExactlyInAnyOrder(semis, lone);
         assertThat(get("/api/v1/issues?limit=1")).hasSize(1);
+        assertThat(ids(get("/api/v1/issues?min_sources=5"))).containsExactly(wide);
+        assertThat(ids(get("/api/v1/issues?min_sources=3&min_docs=5"))).containsExactlyInAnyOrder(wide, busy);
         // 검색: 서명 낱말 접두 일치(조사 뗌) 또는 대표 제목 부분 일치, 낱말은 모두 맞아야 한다
         assertThat(ids(get("/api/v1/issues?q=야스쿠니에"))).containsExactly(wide);
         assertThat(ids(get("/api/v1/issues?q=반도"))).containsExactly(semis);

@@ -25,16 +25,17 @@ public class IssueController {
 
     /**
      * 언론사 수 → 기사 수 → 마지막 기사 시각 내림차순.
-     * since: 마지막 기사 시각 기준 (ISO 시각 또는 날짜), min_docs: 기사 수 하한 (기본 2), q: 대표 제목·서명 낱말 검색,
-     * limit: 기본 50, 최대 200.
+     * since: 마지막 기사 시각 기준 (ISO 시각 또는 날짜), min_docs: 기사 수 하한 (기본 2), min_sources: 언론사 수 하한 (기본 1),
+     * q: 대표 제목·서명 낱말 검색, limit: 기본 50, 최대 200.
      */
     @GetMapping
     public List<IssueRow> list(CurrentUser user,
                                @RequestParam(required = false) String since,
                                @RequestParam(name = "min_docs", required = false) Integer minDocs,
+                               @RequestParam(name = "min_sources", required = false) Integer minSources,
                                @RequestParam(required = false) String q,
                                @RequestParam(required = false) Integer limit) {
-        return service.list(user, since, minDocs, q, limit);
+        return service.list(user, since, minDocs, minSources, q, limit);
     }
 
     /** 이슈 + 소속 문서 (발행일 오름차순). */

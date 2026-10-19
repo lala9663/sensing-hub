@@ -42,7 +42,7 @@ class UiIT {
         assertThat(app.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(app.getBody()).contains("X-User");
 
-        for (String script : new String[] {"registrations.js", "documents.js", "companies.js", "watches.js",
+        for (String script : new String[] {"registrations.js", "documents.js", "issues.js", "companies.js", "watches.js",
                 "digests.js", "admin.js", "ops.js", "caidentia.js", "app.css"}) {
             assertThat(http.getForEntity("/" + script, String.class).getStatusCode())
                     .as(script).isEqualTo(HttpStatus.OK);
