@@ -1,0 +1,633 @@
+package io.sensinghub.chat;
+
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Component;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import io.sensinghub.auth.CurrentUser;
+import io.sensinghub.auth.Role;
+import io.sensinghub.common.ApiException;
+import io.sensinghub.common.UrlNormalizer;
+import io.sensinghub.digest.DigestComposer;
+import io.sensinghub.document.DocumentService;
+import io.sensinghub.document.DocumentService.DocumentRow;
+import io.sensinghub.issue.IssueService;
+import io.sensinghub.issue.IssueService.IssueRow;
+import io.sensinghub.llm.LlmClient;
+import io.sensinghub.registration.RegistrationService;
+import io.sensinghub.registration.RegistrationService.Registration;
+import io.sensinghub.watch.WatchService;
+import io.sensinghub.watch.WatchService.WatchView;
+
+/**
+ * 챗봇 도구 (1단계). LLM은 사용자 말을 이 도구 호출로 바꿀 뿐이고, 조회·등록·권한·중복 판정은 화면과 같은 서비스가 한다.
+ * <ul>
+ *   <li>도구 결과는 LLM에 보내는 JSON 문자열이다. 문서·이슈에는 이번 턴의 근거 번호(ref)를 붙이고, 답에 [ref]로 쓰게 한다
+ *       ({@link Refs}). URL은 LLM에 보내지 않고 화면이 번호에 원문 링크를 붙인다.</li>
+ *   <li>언론 기사와 AI 봇을 막은 사이트(site.ai_restricted)의 문서는 제목·분류만 보낸다 (요약 없음). 공공기관·기타 문서는 저장된 요약을 보낸다.</li>
+ *   <li>API 키는 받지 않는다: 키가 필요하면 관리자 'API 키' 화면으로 안내만 한다 (대화가 DB에 영구 저장되므로).</li>
+ *   <li>도구 오류(권한·중복·형식)는 예외가 아니라 {@code {"ok": false, "error": "..."}} 결과로 돌려 LLM이 그대로 전하게 한다.</li>
+ * </ul>
+ */
+@Component
+public class ChatTools {
+
+    public static final String SEARCH_DOCUMENTS = "search_documents";
+    public static final String LIST_ISSUES = "list_issues";
+    public static final String LIST_WATCHES = "list_watches";
+    public static final String CREATE_WATCH = "create_watch";
+    public static final String REGISTER_SOURCE = "register_source";
+    public static final String GET_SOURCE_STATUS = "get_source_status";
+
+    static final int DEFAULT_DOCUMENTS = 10;
+    static final int MAX_DOCUMENTS = 20;
+    static final int DEFAULT_ISSUES = 10;
+    static final int MAX_ISSUES = 20;
+    static final int SUMMARY_CHARS = 300;
+    static final int MAX_WATCHES = 30;
+    static final String CREDENTIALS_PATH = "#/admin/credentials";
+    static final String CREDENTIALS_GUIDE = "API 키는 채팅으로 받지 않습니다. 관리자가 관리자 메뉴의 'API 키' 화면에서 등록하면 "
+            + "그 키를 기다리던 소스가 자동으로 이어서 진행됩니다.";
+
+    private static final Logger log = LoggerFactory.getLogger(ChatTools.class);
+    private static final DateTimeFormatter KST_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    static final Map<String, String> LABELS = Map.of(
+            SEARCH_DOCUMENTS, "문서 검색", LIST_ISSUES, "이슈 목록", LIST_WATCHES, "감시 목록",
+            CREATE_WATCH, "감시 만들기", REGISTER_SOURCE, "사이트 등록", GET_SOURCE_STATUS, "진행 상태");
+
+    static final Map<String, String> STATUS_LABELS = Map.ofEntries(
+            Map.entry("RECEIVED", "접수"), Map.entry("PROCESSING", "진행 중"), Map.entry("REVIEW", "확인 필요(관리자 검토)"),
+            Map.entry("AWAITING_APPROVAL", "관리자 승인 대기"), Map.entry("COMPLETED", "완료"), Map.entry("REJECTED", "반려"),
+            Map.entry("DUPLICATE", "이미 등록됨"), Map.entry("INVALID", "형식 오류"), Map.entry("ACTIVE", "수집 중"),
+            Map.entry("PENDING", "대기"), Map.entry("BROKEN", "중단(이상)"), Map.entry("BLOCKED", "차단"),
+            Map.entry("PAUSED", "일시정지"), Map.entry("EXCLUDED", "제외"));
+
+    static final Map<String, String> STEP_LABELS = Map.of(
+            "QUEUED", "대기 중", "PROBE", "사전 점검", "DISCOVERY", "자동 탐색", "FIRST_CRAWL", "첫 수집", "DONE", "완료",
+            "REJECTED", "반려");
+
+    /** 근거 후보: 문서 또는 이슈. url은 문서면 원문, 이슈면 화면 주소(#/issues/{id}). */
+    public record Ref(int no, String kind, Long documentId, Long issueId, String title, String url, String sourceLabel,
+                      OffsetDateTime publishedAt) {
+    }
+
+    /** 한 턴 동안 도구 결과에 붙인 근거 번호. 같은 문서·이슈는 같은 번호를 받는다. */
+    public static final class Refs {
+        private final Map<String, Ref> byKey = new LinkedHashMap<>();
+        private final Map<Integer, Ref> byNo = new HashMap<>();
+
+        int document(long id, String title, String url, String sourceLabel, OffsetDateTime publishedAt) {
+            return add("D" + id, no -> new Ref(no, "DOCUMENT", id, null, title, url, sourceLabel, publishedAt));
+        }
+
+        int issue(long id, String title, String sourceLabel, OffsetDateTime lastSeenAt) {
+            return add("I" + id, no -> new Ref(no, "ISSUE", null, id, title, "#/issues/" + id, sourceLabel, lastSeenAt));
+        }
+
+        private int add(String key, java.util.function.IntFunction<Ref> make) {
+            Ref existing = byKey.get(key);
+            if (existing != null) {
+                return existing.no();
+            }
+            Ref ref = make.apply(byKey.size() + 1);
+            byKey.put(key, ref);
+            byNo.put(ref.no(), ref);
+            return ref.no();
+        }
+
+        public Ref get(int no) {
+            return byNo.get(no);
+        }
+
+        public List<Ref> all() {
+            return List.copyOf(byKey.values());
+        }
+
+        public boolean isEmpty() {
+            return byKey.isEmpty();
+        }
+    }
+
+    /**
+     * @param content LLM에 보내고 TOOL 메시지로 저장하는 JSON
+     * @param link    화면이 도구 아래에 보여 줄 바로 가기 (해시 경로, 없으면 null)
+     */
+    public record Outcome(String content, boolean ok, String link, String linkLabel) {
+    }
+
+    private final DocumentService documents;
+    private final IssueService issues;
+    private final WatchService watches;
+    private final RegistrationService registrations;
+    private final JdbcClient jdbc;
+    private final ObjectMapper json;
+
+    public ChatTools(DocumentService documents, IssueService issues, WatchService watches,
+                     RegistrationService registrations, JdbcClient jdbc, ObjectMapper json) {
+        this.documents = documents;
+        this.issues = issues;
+        this.watches = watches;
+        this.registrations = registrations;
+        this.jdbc = jdbc;
+        this.json = json;
+    }
+
+    public static String label(String toolName) {
+        return LABELS.getOrDefault(toolName, toolName);
+    }
+
+    // ------------------------------------------------------------------ 정의
+
+    public List<LlmClient.Tool> definitions() {
+        return List.of(
+                new LlmClient.Tool(SEARCH_DOCUMENTS,
+                        "수집한 문서(언론 기사·공공기관 문서)를 찾는다. 검색어의 낱말을 모두 포함하는 문서를 발행일 최신순으로 준다 "
+                                + "(조사는 무시, 낱말 앞부분 일치). 각 문서의 ref 번호를 답에 [1]처럼 붙인다. "
+                                + "type이 '언론'인 문서는 제목·분류만 있고 내용은 없다.",
+                        object(Map.of(
+                                "query", prop("string", "검색어 (예: '반도체 수출'). 비우면 다른 조건에 맞는 최신 문서"),
+                                "days", prop("integer", "최근 며칠 동안 수집한 문서만 (1~90)"),
+                                "since", prop("string", "이 날짜(YYYY-MM-DD, 한국 시각) 이후 수집한 문서만. days보다 우선"),
+                                "topic", enumProp("분류 (이 값 중 하나)", DigestComposer.TOPIC_ORDER),
+                                "watch_id", prop("integer", "이 키워드 감시(list_watches의 id)에 걸린 문서만"),
+                                "limit", prop("integer", "최대 개수 (기본 10, 최대 20)")),
+                                List.of())),
+                new LlmClient.Tool(LIST_ISSUES,
+                        "여러 언론사가 같은 사건을 보도한 기사 묶음(이슈)을 보도한 언론사가 많은 순으로 준다. "
+                                + "'오늘 주요 이슈', '요즘 많이 보도된 일' 같은 질문에 쓴다. 각 이슈의 ref 번호를 답에 붙인다.",
+                        object(Map.of(
+                                "days", prop("integer", "마지막 기사가 최근 며칠 안인 이슈 (기본 3, 1~30)"),
+                                "min_sources", prop("integer", "보도한 언론사 수 하한 (기본 2)"),
+                                "query", prop("string", "이슈 제목·핵심 낱말 검색어"),
+                                "limit", prop("integer", "최대 개수 (기본 10, 최대 20)")),
+                                List.of())),
+                new LlmClient.Tool(LIST_WATCHES,
+                        "내 키워드 감시 목록 (관리자는 전체): id, 이름, 키워드, 상태, 걸린 문서 수. "
+                                + "감시 문서를 찾을 때 search_documents의 watch_id로 쓴다.",
+                        object(Map.of(), List.of())),
+                new LlmClient.Tool(CREATE_WATCH,
+                        "키워드 감시를 새로 만든다. 사용자가 감시(모니터링)를 만들어 달라고 분명히 요청했고 이름과 키워드가 정해졌을 때만 부른다. "
+                                + "등록 규칙은 화면과 같다 (일반 사용자는 관리자 승인 대기).",
+                        object(Map.of(
+                                "name", prop("string", "감시 이름 (예: '자사 보도')"),
+                                "keywords", Map.of("type", "array", "items", Map.of("type", "string"),
+                                        "description", "찾을 키워드들 (하나라도 들어간 기사가 걸린다)"),
+                                "exclude", Map.of("type", "array", "items", Map.of("type", "string"),
+                                        "description", "제외할 낱말들 (선택)")),
+                                List.of("name", "keywords"))),
+                new LlmClient.Tool(REGISTER_SOURCE,
+                        "사이트(언론사·공공기관 등) 주소를 수집 대상으로 등록한다. 사용자가 등록·수집을 분명히 요청했을 때만 부른다. "
+                                + "중복·권한은 시스템이 판정하고 점검·첫 수집은 자동으로 진행된다 (수십 초~수 분).",
+                        object(Map.of("url", prop("string", "사이트 또는 기사 주소 (도메인 단위로 등록된다)")),
+                                List.of("url"))),
+                new LlmClient.Tool(GET_SOURCE_STATUS,
+                        "사이트 등록·키워드 감시 요청의 진행 상태를 본다. registration_id나 url을 주면 그것을, 둘 다 비우면 "
+                                + "내 최근 요청 5건을 준다.",
+                        object(Map.of(
+                                "registration_id", prop("integer", "등록 요청 번호"),
+                                "url", prop("string", "사이트 주소 또는 도메인")),
+                                List.of())));
+    }
+
+    private static Map<String, Object> object(Map<String, Object> properties, List<String> required) {
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        if (!required.isEmpty()) {
+            schema.put("required", required);
+        }
+        return schema;
+    }
+
+    private static Map<String, Object> prop(String type, String description) {
+        return Map.of("type", type, "description", description);
+    }
+
+    private static Map<String, Object> enumProp(String description, List<String> values) {
+        return Map.of("type", "string", "description", description, "enum", values);
+    }
+
+    // ------------------------------------------------------------------ 실행
+
+    public Outcome execute(CurrentUser user, LlmClient.ToolCall call, Refs refs) {
+        Map<String, Object> args = call.arguments() == null ? Map.of() : call.arguments();
+        try {
+            return switch (call.name()) {
+                case SEARCH_DOCUMENTS -> searchDocuments(user, args, refs);
+                case LIST_ISSUES -> listIssues(user, args, refs);
+                case LIST_WATCHES -> listWatches(user);
+                case CREATE_WATCH -> createWatch(user, args);
+                case REGISTER_SOURCE -> registerSource(user, args);
+                case GET_SOURCE_STATUS -> sourceStatus(user, args);
+                default -> failure("알 수 없는 도구입니다: " + call.name());
+            };
+        } catch (ApiException e) {
+            return failure(e.getMessage());
+        } catch (RuntimeException e) {
+            log.error("chat tool {} failed", call.name(), e);
+            return failure("도구를 실행하다 오류가 났습니다. 잠시 후 다시 시도해 주세요.");
+        }
+    }
+
+    private Outcome searchDocuments(CurrentUser user, Map<String, Object> args, Refs refs) {
+        String query = str(args, "query");
+        String since = str(args, "since");
+        Integer days = integer(args, "days");
+        String topic = str(args, "topic");
+        Long watchId = longValue(args, "watch_id");
+        int limit = clamp(integer(args, "limit"), DEFAULT_DOCUMENTS, 1, MAX_DOCUMENTS);
+        List<String> notes = new ArrayList<>();
+        if (topic != null && !DigestComposer.TOPIC_ORDER.contains(topic)) {
+            notes.add("topic '" + topic + "'은(는) 분류 체계에 없어 빼고 찾았습니다.");
+            topic = null;
+        }
+        String from = since != null ? since
+                : days != null ? OffsetDateTime.now(DigestComposer.KST).minusDays(clamp(days, 7, 1, 90)).toString() : null;
+
+        List<DocumentRow> rows = documents.list(user, from, null, topic, watchId, null, query, limit);
+        Map<Long, SiteInfo> sites = sites(rows.stream().map(DocumentRow::sourceId).distinct().toList());
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (DocumentRow d : rows) {
+            SiteInfo site = sites.getOrDefault(d.sourceId(), new SiteInfo("UNKNOWN", null, false));
+            String source = site.name() != null && !site.name().isBlank() ? site.name() : d.domain();
+            int ref = refs.document(d.id(), d.title(), d.url(), source, d.publishedAt());
+            Map<String, Object> doc = new LinkedHashMap<>();
+            doc.put("ref", ref);
+            doc.put("type", typeLabel(site.siteType()));
+            doc.put("source", source);
+            doc.put("title", d.title());
+            doc.put("published", kst(d.publishedAt() != null ? d.publishedAt() : d.collectedAt()));
+            if (!d.topics().isEmpty()) {
+                doc.put("topics", d.topics());
+            }
+            if (!d.tags().isEmpty()) {
+                doc.put("tags", d.tags());
+            }
+            if (!d.keywords().isEmpty()) {
+                doc.put("watch_keywords", d.keywords());
+            }
+            if (d.issueId() != null && d.issueDocCount() != null && d.issueDocCount() > 1) {
+                doc.put("issue_id", d.issueId());
+                doc.put("issue_articles", d.issueDocCount());
+            }
+            boolean titleOnly = "NEWS".equals(site.siteType()) || site.aiRestricted();
+            if (!titleOnly && d.summary() != null && !d.summary().isBlank()) {
+                doc.put("summary", cut(d.summary(), SUMMARY_CHARS));
+            } else if (site.aiRestricted() && !"NEWS".equals(site.siteType())) {
+                doc.put("content", "이 사이트는 AI 이용을 막아 제목만 보여 줍니다");
+            }
+            out.add(doc);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("count", out.size());
+        if (out.size() == limit) {
+            result.put("more", "더 있을 수 있습니다 (최대 " + limit + "건만 보냄)");
+        }
+        result.put("documents", out);
+        if (out.isEmpty()) {
+            notes.add("조건에 맞는 문서가 없습니다.");
+        }
+        if (!notes.isEmpty()) {
+            result.put("note", String.join(" ", notes));
+        }
+        return success(result, null, null);
+    }
+
+    private Outcome listIssues(CurrentUser user, Map<String, Object> args, Refs refs) {
+        int days = clamp(integer(args, "days"), 3, 1, 30);
+        Integer minSources = integer(args, "min_sources");
+        int limit = clamp(integer(args, "limit"), DEFAULT_ISSUES, 1, MAX_ISSUES);
+        String since = OffsetDateTime.now(DigestComposer.KST).minusDays(days).toString();
+        List<IssueRow> rows = issues.list(user, since, 2, minSources == null ? 2 : Math.max(1, minSources),
+                str(args, "query"), limit);
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (IssueRow i : rows) {
+            int ref = refs.issue(i.id(), i.title(), "언론사 " + i.sourceCount() + "곳 · 기사 " + i.docCount() + "건",
+                    i.lastSeenAt());
+            Map<String, Object> issue = new LinkedHashMap<>();
+            issue.put("ref", ref);
+            issue.put("title", i.title());
+            issue.put("outlets", i.sourceCount());
+            issue.put("articles", i.docCount());
+            issue.put("first_article", kst(i.firstSeenAt()));
+            issue.put("last_article", kst(i.lastSeenAt()));
+            issue.put("terms", i.topTerms().stream().limit(8).toList());
+            out.add(issue);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("period", "마지막 기사가 최근 " + days + "일 안");
+        result.put("count", out.size());
+        result.put("issues", out);
+        if (out.isEmpty()) {
+            result.put("note", "조건에 맞는 이슈가 없습니다. 기간을 늘리거나 언론사 수 조건을 낮춰 볼 수 있습니다.");
+        }
+        return success(result, "#/issues", "이슈 화면");
+    }
+
+    private Outcome listWatches(CurrentUser user) {
+        List<WatchView> list = watches.list(user).stream().filter(w -> !"EXCLUDED".equals(w.status())).toList();
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (WatchView w : list.stream().limit(MAX_WATCHES).toList()) {
+            out.add(watchJson(w));
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("scope", user.role().atLeast(Role.ADMIN) ? "전체 감시 (관리자)" : "내가 만든 감시");
+        result.put("count", list.size());
+        result.put("watches", out);
+        if (out.isEmpty()) {
+            result.put("note", "키워드 감시가 없습니다. 감시 이름과 키워드를 알려 주면 만들 수 있다고 안내합니다.");
+        }
+        return success(result, "#/watches", "키워드 감시 화면");
+    }
+
+    private Outcome createWatch(CurrentUser user, Map<String, Object> args) {
+        String name = str(args, "name");
+        List<String> keywords = strings(args, "keywords");
+        if (name == null) {
+            return failure("감시 이름(name)이 필요합니다. 사용자에게 물어보세요.");
+        }
+        if (keywords.isEmpty()) {
+            return failure("키워드(keywords)가 하나 이상 필요합니다. 사용자에게 물어보세요.");
+        }
+        WatchView w = watches.create(user, name, keywords, strings(args, "exclude"), RegistrationService.Channel.CHAT);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("watch", watchJson(w));
+        result.put("message", w.registrationMessage());
+        return success(result, "#/watches", "키워드 감시 화면");
+    }
+
+    private Map<String, Object> watchJson(WatchView w) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", w.id());
+        m.put("name", w.name());
+        m.put("keywords", w.keywords());
+        if (!w.exclude().isEmpty()) {
+            m.put("exclude", w.exclude());
+        }
+        m.put("status", statusLabel(w.status()));
+        if ("ACTIVE".equals(w.status())) {
+            m.put("mode", w.naver() ? "수집 기사 대조 + 네이버 뉴스 검색" : "수집 기사 대조");
+        }
+        m.put("documents", w.documentCount());
+        if (w.registrationStatus() != null && !"COMPLETED".equals(w.registrationStatus())) {
+            m.put("request", statusLabel(w.registrationStatus()));
+        }
+        return m;
+    }
+
+    private Outcome registerSource(CurrentUser user, Map<String, Object> args) {
+        String url = str(args, "url");
+        if (url == null) {
+            return failure("등록할 주소(url)가 필요합니다. 사용자에게 물어보세요.");
+        }
+        Registration r = registrations.register(user, url, RegistrationService.Channel.CHAT);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("registration", registrationJson(r));
+        if ("PROCESSING".equals(r.status()) || "RECEIVED".equals(r.status())) {
+            result.put("note", "점검·자동 탐색·첫 수집은 시스템이 자동으로 진행하며 수십 초~수 분 걸립니다. "
+                    + "결과는 아직 모르므로 약속하지 말고, 나중에 진행 상태를 물어보면 알려 줄 수 있다고 안내합니다.");
+        }
+        return success(result, "#/registrations", "등록·내 요청 화면");
+    }
+
+    private Outcome sourceStatus(CurrentUser user, Map<String, Object> args) {
+        Long id = longValue(args, "registration_id");
+        String url = str(args, "url");
+        List<Registration> list;
+        String domain = null;
+        if (id != null) {
+            Registration r = registrations.get(id);
+            if (!user.role().atLeast(Role.ADMIN) && registrations.mine(user).stream().noneMatch(m -> m.id() == id)) {
+                return failure("등록 요청 #" + id + "을(를) 찾을 수 없습니다 (내 요청만 볼 수 있습니다).");
+            }
+            list = List.of(r);
+        } else if (url != null) {
+            domain = UrlNormalizer.normalize(url).domain();
+            String d = domain;
+            list = registrations.mine(user).stream().filter(r -> d.equals(r.domain())).limit(3).toList();
+        } else {
+            list = registrations.mine(user).stream().limit(5).toList();
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        boolean keyNeeded = false;
+        for (Registration r : list) {
+            Map<String, Object> item = registrationJson(r);
+            if (r.sourceId() != null) {
+                Map<String, Object> source = sourceJson(r.sourceId());
+                if (source != null) {
+                    item.put("source", source);
+                    keyNeeded |= source.containsKey("api_key");
+                }
+            }
+            out.add(item);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("requests", out);
+        if (domain != null && out.isEmpty()) {
+            // 내 요청은 없지만 이미 수집 중인 사이트인지는 알려 준다 (중복 등록 시에도 같은 정보가 보인다)
+            Long sourceId = jdbc.sql("""
+                    SELECT s.id FROM source s JOIN site t ON t.id = s.site_id
+                    WHERE t.domain = ? AND s.kind = 'SITE' ORDER BY (s.status = 'EXCLUDED'), s.id LIMIT 1
+                    """).param(domain).query(Long.class).optional().orElse(null);
+            Map<String, Object> source = sourceId == null ? null : sourceJson(sourceId);
+            if (source != null) {
+                source.put("domain", domain);
+                result.put("site", source);
+                keyNeeded |= source.containsKey("api_key");
+            } else {
+                result.put("note", domain + "은(는) 등록된 사이트가 아닙니다. 등록해 달라고 하면 등록할 수 있습니다.");
+            }
+        } else if (out.isEmpty()) {
+            result.put("note", "등록 요청이 없습니다.");
+        }
+        return keyNeeded ? success(result, CREDENTIALS_PATH, "API 키 화면(관리자)")
+                : success(result, "#/registrations", "등록·내 요청 화면");
+    }
+
+    private Map<String, Object> registrationJson(Registration r) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("registration_id", r.id());
+        m.put("input", r.inputUrl());
+        if (r.inputUrl() == null || !r.inputUrl().startsWith("watch:")) {
+            m.put("domain", r.domain());
+        }
+        m.put("status", statusLabel(r.status()));
+        if (r.step() != null) {
+            m.put("step", STEP_LABELS.getOrDefault(r.step(), r.step()));
+        }
+        if (r.resultMessage() != null) {
+            m.put("message", r.resultMessage());
+        }
+        m.put("requested_at", kst(r.createdAt()));
+        if (r.batchId() != null) {
+            m.put("batch", r.batchId());
+        }
+        return m;
+    }
+
+    /** 소스 상태 (관리자 화면의 소스 상세는 ADMIN 전용이라 요청자에게 필요한 만큼만 직접 읽는다). */
+    private Map<String, Object> sourceJson(long sourceId) {
+        return jdbc.sql("""
+                SELECT s.status, s.status_reason, s.last_success_at, t.risk_flags->>'api_provider' AS provider,
+                       (SELECT count(*) FROM document d WHERE d.source_id = s.id) AS documents
+                FROM source s JOIN site t ON t.id = s.site_id WHERE s.id = ?
+                """).param(sourceId).query((rs, n) -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    String status = rs.getString("status");
+                    String reason = rs.getString("status_reason");
+                    m.put("status", statusLabel(status));
+                    if (reason != null) {
+                        m.put("reason", reason);
+                    }
+                    OffsetDateTime last = rs.getObject("last_success_at", OffsetDateTime.class);
+                    if (last != null) {
+                        m.put("last_collected", kst(last));
+                    }
+                    m.put("documents", rs.getLong("documents"));
+                    if ("REVIEW".equals(status) && ("API_KEY_REQUIRED".equals(reason) || "API_KEY_INVALID".equals(reason))) {
+                        Map<String, Object> key = new LinkedHashMap<>();
+                        key.put("provider", rs.getString("provider"));
+                        key.put("state", "API_KEY_INVALID".equals(reason) ? "등록된 키가 틀렸습니다" : "키가 없습니다");
+                        key.put("guide", CREDENTIALS_GUIDE);
+                        m.put("api_key", key);
+                    }
+                    return m;
+                }).optional().orElse(null);
+    }
+
+    // ------------------------------------------------------------------ 도우미
+
+    private record SiteInfo(String siteType, String name, boolean aiRestricted) {
+    }
+
+    private Map<Long, SiteInfo> sites(List<Long> sourceIds) {
+        Map<Long, SiteInfo> out = new HashMap<>();
+        if (sourceIds.isEmpty()) {
+            return out;
+        }
+        jdbc.sql("""
+                SELECT s.id, t.site_type, t.name, t.ai_restricted FROM source s JOIN site t ON t.id = s.site_id
+                WHERE s.id IN (:ids)
+                """).param("ids", sourceIds).query(rs -> {
+                    out.put(rs.getLong("id"), new SiteInfo(rs.getString("site_type"), rs.getString("name"),
+                            rs.getBoolean("ai_restricted")));
+                });
+        return out;
+    }
+
+    static String typeLabel(String siteType) {
+        if ("NEWS".equals(siteType)) {
+            return "언론";
+        }
+        if ("PUBLIC".equals(siteType)) {
+            return "공공기관";
+        }
+        return "기타";
+    }
+
+    static String statusLabel(String status) {
+        return status == null ? null : STATUS_LABELS.getOrDefault(status, status);
+    }
+
+    static String kst(OffsetDateTime t) {
+        return t == null ? null : t.atZoneSameInstant(DigestComposer.KST).format(KST_TIME);
+    }
+
+    private static String cut(String s, int max) {
+        String flat = s.replaceAll("\\s+", " ").strip();
+        return flat.length() > max ? flat.substring(0, max) + "…" : flat;
+    }
+
+    private Outcome success(Map<String, Object> result, String link, String linkLabel) {
+        return new Outcome(toJson(result), true, link, linkLabel);
+    }
+
+    private Outcome failure(String message) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", false);
+        result.put("error", message);
+        return new Outcome(toJson(result), false, null, null);
+    }
+
+    private String toJson(Object value) {
+        try {
+            return json.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    static String str(Map<String, Object> args, String key) {
+        Object v = args.get(key);
+        if (v == null) {
+            return null;
+        }
+        String s = String.valueOf(v).strip();
+        return s.isEmpty() ? null : s;
+    }
+
+    static Integer integer(Map<String, Object> args, String key) {
+        Long v = longValue(args, key);
+        return v == null ? null : (int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, v));
+    }
+
+    static Long longValue(Map<String, Object> args, String key) {
+        Object v = args.get(key);
+        if (v instanceof Number n) {
+            return n.longValue();
+        }
+        String s = str(args, key);
+        if (s == null) {
+            return null;
+        }
+        try {
+            return (long) Double.parseDouble(s);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 배열 또는 쉼표로 이은 문자열. */
+    static List<String> strings(Map<String, Object> args, String key) {
+        Object v = args.get(key);
+        List<String> out = new ArrayList<>();
+        if (v instanceof List<?> list) {
+            for (Object o : list) {
+                if (o != null && !String.valueOf(o).isBlank()) {
+                    out.add(String.valueOf(o).strip());
+                }
+            }
+        } else if (v != null) {
+            for (String part : String.valueOf(v).split(",")) {
+                if (!part.isBlank()) {
+                    out.add(part.strip());
+                }
+            }
+        }
+        return out;
+    }
+
+    static int clamp(Integer value, int fallback, int min, int max) {
+        int v = value == null ? fallback : value;
+        return Math.max(min, Math.min(max, v));
+    }
+}

@@ -28,6 +28,8 @@ class UiIT {
         r.add("spring.datasource.url", () -> System.getenv("SENSING_IT_DB_URL"));
         r.add("spring.flyway.clean-disabled", () -> "false");
         r.add("sensing.secret-key", () -> "it-secret-key");
+        // 테스트 환경에 SENSING_LLM_PROVIDER가 있어도 실제 LLM을 부르지 않는다
+        r.add("sensing.llm.provider", () -> "none");
     }
 
     @Autowired TestRestTemplate http;
@@ -43,7 +45,7 @@ class UiIT {
         assertThat(app.getBody()).contains("X-User");
 
         for (String script : new String[] {"registrations.js", "documents.js", "issues.js", "companies.js", "watches.js",
-                "digests.js", "admin.js", "ops.js", "caidentia.js", "app.css"}) {
+                "digests.js", "chat.js", "admin.js", "ops.js", "caidentia.js", "app.css"}) {
             assertThat(http.getForEntity("/" + script, String.class).getStatusCode())
                     .as(script).isEqualTo(HttpStatus.OK);
         }
@@ -59,6 +61,27 @@ class UiIT {
         ResponseEntity<JsonNode> none = http.getForEntity("/api/v1/me", JsonNode.class);
         assertThat(none.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(none.getBody().get("role").asText()).isEqualTo("REGISTRAR");
+    }
+
+    /** LLM 설정이 없으면(기본) 챗봇은 오류 대신 "설정되지 않았습니다" 안내를 답으로 저장한다. */
+    @Test
+    void chatWithoutLlmAnswersThatItIsNotConfigured() {
+        HttpHeaders h = new HttpHeaders();
+        h.set("X-User", "viewer");
+        h.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+        JsonNode status = http.exchange("/api/v1/chat/status", HttpMethod.GET, new HttpEntity<>(h), JsonNode.class).getBody();
+        assertThat(status.get("configured").asBoolean()).isFalse();
+
+        ResponseEntity<JsonNode> created = http.exchange("/api/v1/chat/sessions", HttpMethod.POST,
+                new HttpEntity<>("{}", h), JsonNode.class);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        long id = created.getBody().get("id").asLong();
+        ResponseEntity<JsonNode> sent = http.exchange("/api/v1/chat/sessions/" + id + "/messages", HttpMethod.POST,
+                new HttpEntity<>("{\"content\":\"오늘 이슈 알려 줘\"}", h), JsonNode.class);
+        assertThat(sent.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode answer = sent.getBody().get("assistant");
+        assertThat(answer.get("error").asBoolean()).isTrue();
+        assertThat(answer.get("content").asText()).contains("LLM이 설정되지 않았습니다");
     }
 
     private JsonNode me(String user) {

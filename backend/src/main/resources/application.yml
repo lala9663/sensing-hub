@@ -82,6 +82,26 @@ sensing:
   registration:
     # VIEWER가 등록하면 관리자 승인 대기로 접수한다
     viewer-needs-approval: true
+  llm:
+    # 챗봇이 쓰는 LLM (LlmConfig). 워커와 같은 환경 변수를 읽는다: none(기본) | openai(OpenAI 호환) | anthropic.
+    # 로컬은 scripts/dev/run-backend.ps1이 scripts/dev/worker.local.env의 SENSING_LLM_*·ANTHROPIC_* 값을 읽어 준다
+    provider: ${SENSING_LLM_PROVIDER:none}
+    model: ${SENSING_LLM_MODEL:}
+    base-url: ${SENSING_LLM_BASE_URL:}
+    api-key: ${SENSING_LLM_API_KEY:}
+    anthropic-api-key: ${ANTHROPIC_API_KEY:}
+    anthropic-base-url: ${ANTHROPIC_BASE_URL:https://api.anthropic.com}
+    # 호출 한 번의 제한 시간(초). 워커와 같은 변수
+    timeout-seconds: ${SENSING_LLM_TIMEOUT:60}
+    # 답 최대 토큰. 0이면 openai는 보내지 않고(서버 기본), anthropic은 4096
+    max-tokens: ${SENSING_LLM_MAX_TOKENS:0}
+    # 5xx·529 한 번 재시도 전 대기(ms). 429는 재시도하지 않는다
+    retry-delay-ms: 1500
+  chat:
+    # 한 턴에 도구를 부르는 왕복 수 상한. 넘으면 도구 없이 지금까지의 결과로 답하게 한다
+    max-tool-rounds: 4
+    # LLM에 다시 보여 주는 지난 대화 턴 수
+    history-turns: 6
   auth:
     # PoC 인증: X-User 헤더의 login_id로 사용자를 찾는다. SSO 연동 시 교체한다.
     default-user: ${SENSING_DEFAULT_USER:registrar}
