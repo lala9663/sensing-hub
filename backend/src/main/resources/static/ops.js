@@ -39,7 +39,7 @@ App.route('/admin/ops', async (view) => {
         <dl class="kv">
           <dt>가장 오래 기다린 작업</dt><dd class="${(q.oldestQueuedWaitSeconds || 0) > 3600 ? 'warn' : ''}">${App.fmtSeconds(q.oldestQueuedWaitSeconds)}</dd>
           <dt>실행 중</dt><dd>${App.fmtNum(q.running)}</dd>
-          <dt>워커 (최근 5분)</dt><dd class="${q.workers === 0 ? 'warn' : ''}">${App.fmtNum(q.workers)}${q.workers === 0 ? ' — 워커가 보이지 않습니다' : ''}</dd>
+          <dt>살아 있는 워커</dt><dd class="${q.workers === 0 ? 'warn' : ''}">${App.fmtNum(q.workers)}${q.workers === 0 ? ' — 최근 2분 안에 신호를 보낸 워커가 없습니다' : ''}</dd>
         </dl>
       </div>
       <div class="card">
@@ -72,7 +72,26 @@ App.route('/admin/ops', async (view) => {
         ${(o.topErrors24h || []).length ? `<table><tbody>${o.topErrors24h.map(e => `
           <tr><td><span class="badge badge-orange">${esc(e.code)}</span></td><td class="right"><b>${App.fmtNum(e.count)}</b></td></tr>`).join('')}
         </tbody></table>` : '<div class="muted small">실패가 없습니다.</div>'}
+      </div>
+      <div class="card" style="grid-column:1 / -1">
+        <h3>워커 <span class="muted small" style="font-weight:400">30초마다 신호 · 2분 넘게 없으면 멈춤으로 봄 · 최근 24시간</span></h3>
+        ${workerTable(o.workers || [])}
       </div>`;
+  }
+
+  function workerTable(workers) {
+    if (!workers.length) return '<div class="warn">최근 24시간 안에 신호를 보낸 워커가 없습니다. 워커(sensing-worker)가 떠 있는지 확인하세요.</div>';
+    return `<table><thead><tr><th>워커</th><th>상태</th><th>마지막 신호</th><th>현재 작업</th><th>시작</th><th>버전</th></tr></thead><tbody>${workers.map(w => `
+      <tr>
+        <td><code>${esc(w.workerId)}</code>${w.host && !String(w.workerId).startsWith(w.host) ? ` <span class="muted small">${esc(w.host)}</span>` : ''}</td>
+        <td>${w.alive ? '<span class="badge badge-green">동작</span>' : '<span class="badge badge-red">신호 없음</span>'}</td>
+        <td class="${w.alive ? '' : 'warn'}">${App.fmtSeconds(w.secondsSinceSeen)} 전 <span class="muted small">${App.fmtTime(w.lastSeenAt)}</span></td>
+        <td>${w.currentJobId == null ? '<span class="muted">쉬는 중</span>'
+          : `${esc(w.currentJobType || '')} #${w.currentJobId}${w.currentSourceId ? ` · <a href="#/admin/sources/${w.currentSourceId}">${esc(w.currentDomain || '')}</a>` : ''}`}</td>
+        <td class="small">${App.fmtTime(w.startedAt)}</td>
+        <td class="small muted">${esc(w.version || '-')}</td>
+      </tr>`).join('')}
+    </tbody></table>`;
   }
 
   view.querySelector('#refresh').addEventListener('click', () => App.guard(load));

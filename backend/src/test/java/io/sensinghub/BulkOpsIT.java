@@ -47,7 +47,7 @@ class BulkOpsIT {
         jdbc.sql("""
                 TRUNCATE digest_run, digest_subscription, chat_feedback, chat_citation, chat_message, chat_session, chunk,
                          attachment, document_version, document_watch, document_enrichment, document_company, company_signal,
-                         company, document, crawl_error, crawl_job, registration_request, audit_log, api_credential
+                         company, document, crawl_error, worker_heartbeat, crawl_job, registration_request, audit_log, api_credential
                 RESTART IDENTITY CASCADE
                 """).update();
         jdbc.sql("UPDATE source SET active_config_version_id = NULL").update();
@@ -323,6 +323,14 @@ class BulkOpsIT {
                 .query(Long.class).single();
     }
 
+    /** 워커 생존 신호를 흉내 낸다 (워커 heartbeat.py가 30초마다 남기는 행). */
+    private void heartbeat(String workerId, String seenAgo, Long currentJobId) {
+        jdbc.sql("""
+                INSERT INTO worker_heartbeat (worker_id, host, started_at, last_seen_at, version, current_job_id)
+                VALUES (?, ?, now() - interval '1 day', now() - CAST(? AS interval), '0.1.0', ?)
+                """).params(workerId, "host-" + workerId, seenAgo, currentJobId).update();
+    }
+
     private void error(long jobId, String code, String createdAgo) {
         jdbc.sql("INSERT INTO crawl_error (job_id, stage, code, created_at) VALUES (?, 'LIST', ?, now() - CAST(? AS interval))")
                 .params(jobId, code, createdAgo).update();
@@ -348,6 +356,12 @@ class BulkOpsIT {
         error(part, "BOT_CHALLENGE", "2 hours");
         error(ok1, "BOT_CHALLENGE", "1 minute");
         error(ok2, "TIMEOUT", "2 days");                                                // 24시간 밖
+        // 워커 생존 신호: worker-1은 작업 중, worker-2는 큐가 비어 쉬는 중(그래도 산 워커), worker-3은 5분째 신호 없음, worker-9는 이틀 전
+        long running = jdbc.sql("SELECT id FROM crawl_job WHERE status = 'RUNNING'").query(Long.class).single();
+        heartbeat("worker-1", "10 seconds", running);
+        heartbeat("worker-2", "40 seconds", null);
+        heartbeat("worker-3", "5 minutes", null);
+        heartbeat("worker-9", "2 days", null);
 
         HttpHeaders viewer = new HttpHeaders();
         viewer.set("X-User", "viewer");
@@ -371,12 +385,27 @@ class BulkOpsIT {
         assertThat(o.get("reviewQueue").toString())
                 .isEqualTo("{\"APPROVAL\":0,\"API_KEY\":0,\"REVIEW\":1,\"BROKEN\":1,\"BLOCKED\":1}");
 
-        // 작업 큐 적체: 대기 1(10분째), 실행 1, 최근 5분 안에 일한 워커 2 (worker-1·worker-2; worker-3은 3시간 전)
+        // 작업 큐 적체: 대기 1(10분째), 실행 1, 최근 2분 안에 생존 신호를 남긴 워커 2 (worker-1·worker-2; worker-3은 5분 전)
         JsonNode q = o.get("jobQueue");
         assertThat(q.get("queued").asLong()).isEqualTo(1);
         assertThat(q.get("oldestQueuedWaitSeconds").asLong()).isBetween(590L, 700L);
         assertThat(q.get("running").asLong()).isEqualTo(1);
         assertThat(q.get("workers").asLong()).isEqualTo(2);
+
+        // 워커 목록: 최근 24시간, 마지막 신호가 최근인 순. worker-9(이틀 전)는 빠진다
+        JsonNode workers = o.get("workers");
+        assertThat(workers.findValuesAsText("workerId")).containsExactly("worker-1", "worker-2", "worker-3");
+        JsonNode w1 = workers.get(0);
+        assertThat(w1.get("alive").asBoolean()).isTrue();
+        assertThat(w1.get("currentJobId").asLong()).isEqualTo(running);
+        assertThat(w1.get("currentJobType").asText()).isEqualTo("ONBOARD");
+        assertThat(w1.get("currentSourceId").asLong()).isEqualTo(review);
+        assertThat(w1.get("currentDomain").asText()).isEqualTo("review.example.org");
+        assertThat(w1.get("host").asText()).isEqualTo("host-worker-1");
+        assertThat(w1.get("secondsSinceSeen").asLong()).isBetween(9L, 30L);
+        assertThat(workers.get(1).get("alive").asBoolean()).isTrue();
+        assertThat(workers.get(1).get("currentJobId").isNull()).isTrue();      // 쉬는 중
+        assertThat(workers.get(2).get("alive").asBoolean()).isFalse();         // 2분 넘게 신호 없음
 
         // 최근 24시간 결과
         JsonNode j = o.get("jobs24h");
@@ -411,6 +440,38 @@ class BulkOpsIT {
         assertThat(t.get("completedLastHour").asLong()).isEqualTo(6);
         assertThat(t.get("demandRatio").asDouble()).isEqualTo(0.5);
         assertThat(t.get("workersShort").asBoolean()).isFalse();
+    }
+
+    @Test
+    void idleWorkersAreCountedWhenTheQueueIsEmpty() {
+        // 큐가 비어 아무 작업도 잡지 않은 워커 둘. 예전 지표(최근 5분 안에 작업을 잡은 워커 수)로는 0이라 "워커가 보이지 않습니다"였다
+        long calm = source("calm.example.org", "ACTIVE", 60, "3 hours");
+        job(calm, "CRAWL", "SUCCESS", "worker-a", "3 hours 1 minute", "3 hours", 1, 0);
+        heartbeat("worker-a", "5 seconds", null);
+        heartbeat("worker-b", "70 seconds", null);
+
+        JsonNode o = get("admin", "/api/v1/ops/overview");
+        assertThat(o.get("jobQueue").get("queued").asLong()).isZero();
+        assertThat(o.get("jobQueue").get("running").asLong()).isZero();
+        assertThat(o.get("jobQueue").get("workers").asLong()).isEqualTo(2);
+        assertThat(o.get("workers").findValuesAsText("workerId")).containsExactly("worker-a", "worker-b");
+
+        // 신호가 끊기면 (2분 넘게) 살아 있는 워커에서 빠지고 목록에는 남는다
+        jdbc.sql("UPDATE worker_heartbeat SET last_seen_at = now() - interval '3 minutes'").update();
+        o = get("admin", "/api/v1/ops/overview");
+        assertThat(o.get("jobQueue").get("workers").asLong()).isZero();
+        assertThat(o.get("workers").findValuesAsText("alive")).containsExactly("false", "false");
+    }
+
+    @Test
+    void jsonResponsesDeclareUtf8() {
+        // charset이 없으면 PowerShell 5.1 Invoke-RestMethod 등은 ISO-8859-1로 읽어 "카드뉴스"가 "ì¹´ëë´ì¤"로 깨진다
+        HttpHeaders h = new HttpHeaders();
+        h.set("X-User", "admin");
+        ResponseEntity<byte[]> res = http.exchange("/api/v1/ops/overview", HttpMethod.GET, new HttpEntity<>(h), byte[].class);
+        assertThat(res.getHeaders().getContentType()).isNotNull();
+        assertThat(res.getHeaders().getContentType().isCompatibleWith(MediaType.APPLICATION_JSON)).isTrue();
+        assertThat(res.getHeaders().getContentType().getCharset()).isEqualTo(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     @Test
