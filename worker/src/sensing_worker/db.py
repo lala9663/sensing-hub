@@ -516,6 +516,23 @@ class Store:
             FOR UPDATE OF d SKIP LOCKED
             """, (limit,)).fetchall()
 
+    def lock_pending_embedding(self, identity: str, limit: int) -> list[dict]:
+        """임베딩이 필요한 조각(embed_model이 지금 설정과 다른 것 — 아직 안 했거나 모델을 바꿨다)을 최신 수집 문서부터 limit건
+        잠그고 돌려준다. self.conn.transaction() 안에서 부른다. 문서의 제목·사이트 유형·AI 봇 차단 여부를 함께 준다
+        (embed.embed_text가 보낼 글을 정한다)."""
+        return self.conn.execute(
+            """
+            SELECT c.id, c.document_id, c.seq, c.text, d.title, t.site_type, t.ai_restricted
+            FROM chunk c
+            JOIN document d ON d.id = c.document_id
+            JOIN source s ON s.id = d.source_id
+            JOIN site t ON t.id = s.site_id
+            WHERE c.embed_model IS DISTINCT FROM %s
+            ORDER BY d.collected_at DESC, c.document_id DESC, c.seq
+            LIMIT %s
+            FOR UPDATE OF c SKIP LOCKED
+            """, (identity, limit)).fetchall()
+
     def load_watch_hits(self, document_ids: list[int]) -> dict[int, list[tuple[str | None, str | None]]]:
         """문서별 (감시 이름, 걸린 검색어) 목록."""
         if not document_ids:

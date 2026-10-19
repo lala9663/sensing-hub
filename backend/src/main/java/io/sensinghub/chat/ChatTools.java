@@ -21,8 +21,8 @@ import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.common.UrlNormalizer;
 import io.sensinghub.digest.DigestComposer;
-import io.sensinghub.document.DocumentService;
 import io.sensinghub.document.DocumentService.DocumentRow;
+import io.sensinghub.document.HybridSearch;
 import io.sensinghub.issue.IssueService;
 import io.sensinghub.issue.IssueService.IssueRow;
 import io.sensinghub.llm.LlmClient;
@@ -39,6 +39,8 @@ import io.sensinghub.watch.WatchService.WatchView;
  *   <li>언론 기사와 AI 봇을 막은 사이트(site.ai_restricted)의 문서는 제목·분류만 보낸다 (요약 없음). 공공기관·기타 문서는 저장된 요약을 보낸다.</li>
  *   <li>API 키는 받지 않는다: 키가 필요하면 관리자 'API 키' 화면으로 안내만 한다 (대화가 DB에 영구 저장되므로).</li>
  *   <li>도구 오류(권한·중복·형식)는 예외가 아니라 {@code {"ok": false, "error": "..."}} 결과로 돌려 LLM이 그대로 전하게 한다.</li>
+ *   <li>문서 검색은 2단계부터 하이브리드({@link HybridSearch}: 낱말 일치 + 의미 유사도, RRF)다. 문서마다 match(낱말·의미·낱말+의미)를
+ *       붙여 LLM이 '뜻만 가까운' 문서를 가려 쓰게 한다. 임베딩이 없거나 실패하면 1단계와 같은 전문 검색(최신순)이다.</li>
  * </ul>
  */
 @Component
@@ -128,16 +130,16 @@ public class ChatTools {
     public record Outcome(String content, boolean ok, String link, String linkLabel) {
     }
 
-    private final DocumentService documents;
+    private final HybridSearch search;
     private final IssueService issues;
     private final WatchService watches;
     private final RegistrationService registrations;
     private final JdbcClient jdbc;
     private final ObjectMapper json;
 
-    public ChatTools(DocumentService documents, IssueService issues, WatchService watches,
+    public ChatTools(HybridSearch search, IssueService issues, WatchService watches,
                      RegistrationService registrations, JdbcClient jdbc, ObjectMapper json) {
-        this.documents = documents;
+        this.search = search;
         this.issues = issues;
         this.watches = watches;
         this.registrations = registrations;
@@ -149,16 +151,22 @@ public class ChatTools {
         return LABELS.getOrDefault(toolName, toolName);
     }
 
+    /** 문서 검색 방식 (상태 표시용): "낱말+의미 (모델/차원)" 또는 "낱말". */
+    public String searchMode() {
+        return search.describe();
+    }
+
     // ------------------------------------------------------------------ 정의
 
     public List<LlmClient.Tool> definitions() {
         return List.of(
                 new LlmClient.Tool(SEARCH_DOCUMENTS,
-                        "수집한 문서(언론 기사·공공기관 문서)를 찾는다. 검색어의 낱말을 모두 포함하는 문서를 발행일 최신순으로 준다 "
-                                + "(조사는 무시, 낱말 앞부분 일치). 각 문서의 ref 번호를 답에 [1]처럼 붙인다. "
+                        "수집한 문서(언론 기사·공공기관 문서)를 찾는다. 검색어의 낱말을 모두 포함하는 문서(조사는 무시, 낱말 앞부분 일치)와 "
+                                + "낱말은 달라도 뜻이 가까운 문서(의미 검색이 켜져 있을 때)를 관련도순으로 준다. 문서의 match가 "
+                                + "'의미'면 검색어 낱말은 없고 뜻만 가까운 문서다. 각 문서의 ref 번호를 답에 [1]처럼 붙인다. "
                                 + "type이 '언론'인 문서는 제목·분류만 있고 내용은 없다.",
                         object(Map.of(
-                                "query", prop("string", "검색어 (예: '반도체 수출'). 비우면 다른 조건에 맞는 최신 문서"),
+                                "query", prop("string", "검색어 (예: '반도체 수출', '가정폭력 피해자 보호'). 비우면 다른 조건에 맞는 최신 문서"),
                                 "days", prop("integer", "최근 며칠 동안 수집한 문서만 (1~90)"),
                                 "since", prop("string", "이 날짜(YYYY-MM-DD, 한국 시각) 이후 수집한 문서만. days보다 우선"),
                                 "topic", enumProp("분류 (이 값 중 하나)", DigestComposer.TOPIC_ORDER),
@@ -257,15 +265,22 @@ public class ChatTools {
         String from = since != null ? since
                 : days != null ? OffsetDateTime.now(DigestComposer.KST).minusDays(clamp(days, 7, 1, 90)).toString() : null;
 
-        List<DocumentRow> rows = documents.list(user, from, null, topic, watchId, null, query, limit);
-        Map<Long, SiteInfo> sites = sites(rows.stream().map(DocumentRow::sourceId).distinct().toList());
+        HybridSearch.Result found = search.search(user, from, topic, watchId, query, limit);
+        boolean hybrid = found.mode() == HybridSearch.Mode.HYBRID;
+        Map<Long, SiteInfo> sites = sites(found.hits().stream().map(h -> h.row().sourceId()).distinct().toList());
         List<Map<String, Object>> out = new ArrayList<>();
-        for (DocumentRow d : rows) {
+        boolean meaningOnly = false;
+        for (HybridSearch.Hit hit : found.hits()) {
+            DocumentRow d = hit.row();
             SiteInfo site = sites.getOrDefault(d.sourceId(), new SiteInfo("UNKNOWN", null, false));
             String source = site.name() != null && !site.name().isBlank() ? site.name() : d.domain();
             int ref = refs.document(d.id(), d.title(), d.url(), source, d.publishedAt());
             Map<String, Object> doc = new LinkedHashMap<>();
             doc.put("ref", ref);
+            if (hybrid) {
+                doc.put("match", hit.words() && hit.meaning() ? "낱말+의미" : hit.words() ? "낱말" : "의미");
+                meaningOnly |= !hit.words();
+            }
             doc.put("type", typeLabel(site.siteType()));
             doc.put("source", source);
             doc.put("title", d.title());
@@ -294,12 +309,20 @@ public class ChatTools {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("ok", true);
         result.put("count", out.size());
+        result.put("order", switch (found.mode()) {
+            case HYBRID -> "관련도순 (낱말 일치와 의미 유사도를 합친 순위)";
+            case FULLTEXT -> "최신순 (검색어 낱말을 모두 포함한 문서)";
+            case LATEST -> "최신순";
+        });
         if (out.size() == limit) {
             result.put("more", "더 있을 수 있습니다 (최대 " + limit + "건만 보냄)");
         }
         result.put("documents", out);
         if (out.isEmpty()) {
             notes.add("조건에 맞는 문서가 없습니다.");
+        }
+        if (meaningOnly) {
+            notes.add("match가 '의미'인 문서는 검색어 낱말은 없고 뜻만 가까운 문서입니다. 질문과 실제로 관련 있는 것만 답에 쓰세요.");
         }
         if (!notes.isEmpty()) {
             result.put("note", String.join(" ", notes));

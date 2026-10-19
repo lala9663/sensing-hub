@@ -95,3 +95,20 @@ class Settings:
     issue_threshold: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_THRESHOLD", "0.4")))
     issue_min_shared: int = field(default_factory=lambda: int(os.getenv("SENSING_ISSUE_MIN_SHARED", "2")))
     issue_pair_threshold: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_PAIR_THRESHOLD", "0.66")))
+    # 의미 검색용 임베딩 (M5 챗봇 2단계, embed.py). none(기본) | openai(OpenAI 호환 /embeddings — Gemini OpenAI 호환 주소 포함).
+    # 백엔드(EmbeddingConfig)도 질의를 같은 설정으로 임베딩하므로 두 쪽 값이 같아야 한다
+    embed_provider: str = field(default_factory=lambda: os.getenv("SENSING_EMBED_PROVIDER", "none"))
+    embed_model: str = field(default_factory=lambda: os.getenv("SENSING_EMBED_MODEL", ""))
+    # 비우면 SENSING_LLM_BASE_URL·SENSING_LLM_API_KEY를 함께 쓴다 (Gemini처럼 같은 키·주소). 주소를 따로 주면 키도 따로 준다 —
+    # LLM 키를 다른 서버에 보내지 않기 위해서다
+    embed_base_url: str = field(default_factory=lambda: os.getenv("SENSING_EMBED_BASE_URL", ""))
+    embed_api_key: str = field(default_factory=lambda: os.getenv("SENSING_EMBED_API_KEY", ""))
+    # chunk.embedding이 VECTOR(1024)라 1024여야 한다. dimensions를 받는 모델(OpenAI text-embedding-3, Gemini)은 줄여서 주고,
+    # 받지 않는 서버는 빼고 다시 보낸다 (그때는 모델 자체가 1024차원이어야 한다, 예: bge-m3)
+    embed_dimensions: int = field(default_factory=lambda: int(os.getenv("SENSING_EMBED_DIMENSIONS", "1024")))
+    # 호출 한 번에 보내는 조각 수, 분당 보내는 조각 수 상한(0이면 없음 — Gemini 무료 등급은 묶음 안의 글 하나를 요청 하나로 세어
+    # 분당 100개), 제한 시간, 실패 뒤 다시 시도하기까지 쉬는 시간(초, 실패가 이어지면 두 배씩 최대 30분)
+    embed_batch: int = field(default_factory=lambda: int(os.getenv("SENSING_EMBED_BATCH", "20")))
+    embed_per_minute: float = field(default_factory=lambda: float(os.getenv("SENSING_EMBED_PER_MINUTE", "80")))
+    embed_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_EMBED_TIMEOUT", "30")))
+    embed_backoff_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_EMBED_BACKOFF", "60")))

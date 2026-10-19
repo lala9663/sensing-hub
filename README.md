@@ -14,12 +14,12 @@ flowchart LR
     B -->|작업 등록·조회| DB[(PostgreSQL 16<br/>+ pgvector)]
     W[Python worker<br/>수집 하네스] -->|FOR UPDATE SKIP LOCKED| DB
     W -->|robots·간격·차단 시 중단| S[등록된 외부 사이트]
-    B -->|챗봇 도구 호출| L[LLM API<br/>OpenAI 호환·Claude]
-    W -->|요약·분류·레시피| L
+    B -->|챗봇 도구 호출·질의 임베딩| L[LLM API<br/>OpenAI 호환·Claude]
+    W -->|요약·분류·레시피·조각 임베딩| L
 ```
 
-- **backend (Java)**: 시스템 본체. 등록 API, 관리자 API, 스케줄러, 권한, 챗봇(도구 호출형, M5 1단계).
-- **worker (Python)**: 교체 가능한 작업자. 사전 점검, 자동 탐색, 기사 추출, (M2) 첨부 변환, (M3) 임베딩.
+- **backend (Java)**: 시스템 본체. 등록 API, 관리자 API, 스케줄러, 권한, 챗봇(도구 호출형, 하이브리드 문서 검색 — M5 1·2단계).
+- **worker (Python)**: 교체 가능한 작업자. 사전 점검, 자동 탐색, 기사 추출, 요약·분류, 전문 검색 색인·이슈 묶기, 의미 검색 임베딩, (M4) 첨부 변환.
 - 둘은 DB 작업 큐(`crawl_job`)로만 연결됩니다. 메시지 브로커는 쓰지 않습니다.
 
 ## 사이트 등록 흐름
@@ -245,16 +245,16 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 서비스 활용신청 필요, DART `dart`) 그 점검 소스는 다른 API 소스처럼 관리자 큐 `API_KEY`에서 기다립니다. 다이제스트는 기간 안의 회사 신호를 맨 앞
 "거래처 신호" 절로 넣고(HIGH 먼저), 신호가 있으면 문서가 0건이어도 보냅니다. 삭제는 보관(ARCHIVED)이며 그 감시는 제외됩니다.
 
-### 챗봇 (M5 1단계, 2026-10-19)
+### 챗봇 (M5 1·2단계, 2026-10-19)
 
 화면 "챗봇"(`#/chat`)에서 물어보거나 요청하면 LLM이 말을 **도구 호출**로 바꾸고, 조회·등록·권한·중복 판정은 화면과 같은 서비스가 합니다
 (LLM은 결과를 말로 풀 뿐). 답의 `[1]` 같은 번호는 아래 근거 목록의 원문 링크(이슈는 이슈 화면)로 이어집니다. 대화·도구 호출·도구 결과·근거는
 모두 DB(`chat_session`·`chat_message`·`chat_citation`, V14)에 남고, 대화는 **만든 사람만** 봅니다 (관리자도 남의 대화는 404).
-의미 검색(임베딩)은 2단계입니다.
+문서 검색은 2단계부터 낱말 일치와 의미 유사도를 합친 하이브리드입니다 (아래 "의미 검색").
 
 | 도구 | 하는 일 | 부르는 코드 |
 | --- | --- | --- |
-| `search_documents` | 전문 검색(낱말 모두 포함, 조사 무시)·기간(`days`·`since`)·토픽·감시로 문서 찾기, 최대 20건 | `DocumentService.list` |
+| `search_documents` | 하이브리드 검색(낱말 모두 포함 + 뜻이 가까운 문서, RRF 관련도순)·기간(`days`·`since`)·토픽·감시로 문서 찾기, 최대 20건. 문서마다 `match`(낱말·의미·낱말+의미). 임베딩이 없으면 전문 검색(최신순) | `HybridSearch.search` |
 | `list_issues` | 최근 주요 이슈 (언론사 많은 순, 기본 최근 3일·2곳 이상) | `IssueService.list` |
 | `list_watches` | 내 키워드 감시 (관리자는 전체) | `WatchService.list` |
 | `create_watch` | 키워드 감시 만들기 — 화면과 같은 규칙 (VIEWER는 승인 대기), 등록 요청 채널 `CHAT` | `WatchService.create(..., Channel.CHAT)` |
@@ -284,7 +284,8 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 | `SENSING_LLM_TIMEOUT` | `60` | 호출 한 번의 제한 시간(초) |
 | `SENSING_LLM_MAX_TOKENS` | `0` | 답 최대 토큰 (0: `openai`는 서버 기본, `anthropic`은 4096) |
 
-추가 의존성 없이 `java.net.http`로 부릅니다 (`io.sensinghub.llm`). 화면은 `GET /api/v1/chat/status`로 설정 여부와 모델을 보여 줍니다.
+추가 의존성 없이 `java.net.http`로 부릅니다 (`io.sensinghub.llm`). 화면은 `GET /api/v1/chat/status`로 설정 여부와 모델, 문서 검색 방식
+(`search`: "낱말+의미 (모델/차원)" 또는 "낱말")을 보여 줍니다.
 
 **실측 (2026-10-19, Gemini `gemini-3.5-flash-lite` 무료 등급, 운영 DB를 복사한 sensing_test, LLM 호출 17번)** — "오늘 많이 보도된 이슈"(이슈 10개, 제목과
 언론사 수·기사 수 근거), "최근 3일 반도체 기사"(10건, 제목·언론사·날짜·분류), "1번 기사 내용 요약해 줘"(→ 저작권 원칙상 제목·언론사·날짜·분류만
@@ -293,6 +294,59 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 결과 포함)이고, 서버에서 답까지 1~3초였습니다. Gemini는 도구 호출마다 `extra_content.google.thought_signature`를 붙였고(Google 안내상 Gemini 3는
 이것을 돌려주지 않으면 도구 결과를 담은 요청을 거절한다), `ToolCall.providerData`로 보관해 돌려준 후속 턴이 모두 성공했습니다. 처음엔 도구 이름
 ("`get_source_status` 도구로 확인")을 말하거나 등록 답에 엉뚱한 `[1]`을 붙여 프롬프트·도구 안내문을 보강했습니다.
+
+### 의미 검색 (M5 챗봇 2단계, 2026-10-19)
+
+전문 검색은 검색어 낱말이 제목·본문에 그대로 있어야 찾습니다. "배드민턴"으로는 "안세영, 덴마크오픈 우승"을, "가정폭력 피해자 보호 장치"로는
+"스마트워치 받았지만…전남편에 피습"을 못 찾습니다. 그래서 문서 조각을 **임베딩**(뜻을 숫자 벡터로)해 두고 챗봇의 `search_documents`가
+**낱말 일치와 의미 유사도를 함께** 봅니다.
+
+1. **워커**(`embed.py`, 큐가 빌 때 색인 다음 단계): 전문 검색 색인이 만든 조각(`chunk`)을 OpenAI 호환 `/embeddings`로 보내 `chunk.embedding`
+   (pgvector `VECTOR(1024)`)을 채우고, 어떤 모델의 벡터인지 `chunk.embed_model`('모델/차원', V15)에 남깁니다. **언론 기사는 제목만**(색인 조각이 원래
+   제목 하나), **공공기관·기타 문서는 제목 + 본문 조각**(본문 조각 앞에 제목을 붙여 보냄)이고, AI 봇을 막은 사이트(`ai_restricted`)는 본문 조각을
+   외부로 보내지 않고 제목만 임베딩합니다. 호출이 실패하면 아무것도 쓰지 않고 쉬었다가(60초부터 두 배씩, 최대 30분) 다시 하며, 모델을 바꾸면
+   모든 조각이 다시 대상이 됩니다. 문서가 다시 색인되면(본문 변경) 새 조각만 다시 임베딩합니다.
+2. **백엔드**(`HybridSearch`): 질의를 같은 설정으로 임베딩해 `embed_model`이 같은 조각과 코사인 유사도를 재고(문서마다 가장 가까운 조각,
+   하한 0.58), 전문 검색 결과(발행일 최신순)와 **RRF**(문서마다 두 목록의 1/(60+순위) 합)로 합쳐 관련도순으로 줍니다. 두 목록에 다 있는 문서가 맨 앞,
+   낱말만·뜻만 맞는 문서가 뒤를 잇습니다. 기간·토픽·감시 조건은 두 쪽에 똑같이 걸립니다.
+3. **챗봇**: 도구 결과의 문서마다 `match`(낱말·의미·낱말+의미)를 붙이고, '의미'뿐인 문서가 있으면 "질문과 실제로 관련 있는 것만 쓰라"는 안내를 함께
+   보냅니다. LLM에 보내는 내용(근거 번호·제목·분류, 언론 기사 요약 없음, URL 없음)은 1단계와 같습니다.
+
+**임베딩이 없으면 그대로 전문 검색**입니다: 미설정(`SENSING_EMBED_PROVIDER=none`, 기본), 그 모델로 임베딩된 조각이 아직 없음(질의를 임베딩하지 않아
+호출 한도를 아낌), 질의 임베딩 실패(429·5xx·시간 초과·차원 불일치 — 그 뒤 60초는 부르지 않음) 모두 1단계와 같은 전문 검색 결과(최신순)를 줍니다.
+화면의 문서 검색(`/api/v1/documents?q=`)은 지금처럼 전문 검색만 합니다.
+
+| 변수 (워커·백엔드 공통) | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_EMBED_PROVIDER` | `none` | `none`(전문 검색만) \| `openai`(OpenAI 호환 `/embeddings`: Gemini OpenAI 호환 주소·OpenAI·vLLM·Ollama) |
+| `SENSING_EMBED_MODEL` | (없음) | 필수. 예: `gemini-embedding-001`(실측), `text-embedding-3-small`, `bge-m3` |
+| `SENSING_EMBED_BASE_URL` / `SENSING_EMBED_API_KEY` | (없음) | 주소를 비우면 `SENSING_LLM_BASE_URL`·`SENSING_LLM_API_KEY`를 함께 쓴다 (Gemini처럼 같은 키). 주소를 따로 주면 키도 따로 준다 — LLM 키를 다른 서버에 보내지 않는다 |
+| `SENSING_EMBED_DIMENSIONS` | `1024` | `chunk.embedding` 열 크기라 1024여야 한다. `dimensions`를 보내 줄여 받고(Gemini·OpenAI), 모르는 서버가 400을 내면 빼고 다시 보낸다(그때는 1024차원 모델이어야 함) |
+
+| 변수 (워커) | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_EMBED_BATCH` / `SENSING_EMBED_PER_MINUTE` | `20` / `80` | 한 번에 보내는 조각 수, 분당 보내는 조각 수 상한(0이면 없음) |
+| `SENSING_EMBED_TIMEOUT` / `SENSING_EMBED_BACKOFF` | `30` / `60` | 묶음 호출 제한 시간(초), 실패 뒤 쉬는 시간(초, 이어지면 두 배씩 최대 30분) |
+
+| 변수 (백엔드) | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_EMBED_QUERY_TIMEOUT` | `10` | 질의 임베딩 제한 시간(초). 넘으면 전문 검색만으로 답한다 |
+| `SENSING_EMBED_MIN_SIMILARITY` | `0.58` | 의미 후보의 코사인 유사도 하한 (아래 실측으로 정함, 모델을 바꾸면 다시 맞춘다). 후보 수(50)·RRF k(60)는 `sensing.search.*` |
+
+이미 쌓인 조각은 유휴 시간에 조금씩 채워지고, 한 번에 하려면 `sensing-embed-backfill [--limit N]`(분당 상한을 지킨다)입니다.
+로컬은 `scripts/dev/worker.local.env`에 `SENSING_EMBED_*`를 넣으면 워커와 `run-backend.ps1`이 함께 읽습니다.
+
+**실측 (2026-10-19, Gemini OpenAI 호환 주소, 실제 호출 9번 — 모델 목록 1·임베딩 성공 6·한도 초과 2)** — ① `gemini-embedding-001`은 `dimensions: 1024`를 받아
+1024차원(정규화 안 된 MRL 절단 벡터, 코사인에는 무관)을 주고, 응답의 첫 항목은 `index`(0)가 빠져 온다(두 클라이언트 모두 순서로 처리). 모델 목록에는
+`gemini-embedding-2`도 있다. ② **무료 등급은 묶음 안의 글 하나를 요청 하나로 세어 분당 100개**(`EmbedContentRequestsPerMinute…FreeTier`)라
+75개 묶음 한 번이 429였다 — 기본값을 20개 묶음·분당 80개로 잡은 이유다. 하루 한도도 있어 운영 DB의 조각 9,096개를 무료 등급으로 한 번에 채우기는
+어렵고(유휴 시간에 조금씩), 실제 운영은 유료 등급이나 사내 임베딩 모델(bge-m3 등, 1024차원)을 권한다. ③ 운영 DB의 최근 기사 제목 60건(읽기만)과
+질의 7개로 품질을 보았다: "배드민턴" → 안세영 우승 기사 2건(0.59·0.61), "가정폭력 피해자 보호 장치" → 스마트워치 피습 기사 4건(0.62~0.64),
+"AI 반도체 인프라 투자" → GPU·데이터센터·반도체 기사 4건(0.61~0.63), "프로야구 포스트시즌" → 준PO·KS·구단 인사 3건(0.59~0.66), "개인정보 유출" →
+할리스 유출(0.70) — 모두 낱말이 겹치지 않거나 일부만 겹친다. 관련 없는 기사는 대부분 0.56 이하(질의별 중앙값 0.47~0.50, 가장 높은 것이 "기상 악화
+피해" → 축제 식중독 피해 0.579)여서 하한을 0.58로 두었다. 표본이 작으므로 운영 데이터가 임베딩되면 다시 본다. ④ 워커(`OpenAiCompatEmbedder`)가 만든
+제목 벡터와 백엔드(`OpenAiCompatEmbeddingClient`)가 만든 질의 벡터가 같은 공간인지 확인했다: "배드민턴" ↔ 안세영 우승 0.609(③과 같은 값), ↔ 마을버스
+요금 인상 0.511.
 
 ### API 맛보기
 
@@ -358,8 +412,9 @@ curl localhost:8080/api/v1/api-credentials -H 'X-User: admin'   # DELETE /api/v1
 
 ```
 backend/   Spring Boot 3 (Java 17), Flyway 스키마: src/main/resources/db/migration
-  io/sensinghub/llm/   LLM 클라이언트 (OpenAI 호환 · Claude · 미설정), 오류 분류 (챗봇용)
+  io/sensinghub/llm/   LLM 클라이언트 (OpenAI 호환 · Claude · 미설정), 질의 임베딩 클라이언트, 오류 분류 (챗봇용)
   io/sensinghub/chat/  챗봇: 도구(ChatTools), 대화·도구 루프·근거(ChatService), 시스템 프롬프트, 키 가리기
+  io/sensinghub/document/  문서 조회·전문 검색(DocumentService), 하이브리드 검색(HybridSearch: 전문 + 의미, RRF)
 worker/    Python 수집 워커
   src/sensing_worker/
     fetcher.py    수집 하네스 HTTP 계층: 간격·robots·재시도·차단 분류·내부망 차단
@@ -372,6 +427,8 @@ worker/    Python 수집 워커
     company.py    회사 레이어 규칙: 태그 → 회사 정확 일치, 회사 신호(BIZ_STATUS·NEWS)의 심각도·fingerprint
     jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록, CHECK 소스는 회사 상태 점검)
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전, 회사 연결·신호
+    indexer.py    전문 검색 색인(조각·낱말)과 이슈 묶기 (textindex.py·issues.py)
+    embed.py      의미 검색 임베딩: 색인 조각 → OpenAI 호환 /embeddings → chunk.embedding (분당 상한·실패 시 쉬기)
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
 docs/      설계 메모 — 수집 원리는 docs/how-collection-works.md (사이트를 등록하면 기사를 어떻게 찾아 가져오나)
 ```
@@ -387,7 +444,7 @@ cd backend && SENSING_IT_DB_URL=jdbc:postgresql://localhost:5432/sensing_it ./gr
 ```
 
 GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector DB와 함께 검증합니다.
-챗봇·LLM 테스트는 가짜 LLM HTTP 서버(`MockLlmServer`)만 부르므로 CI에서 실제 LLM 호출이 없습니다.
+챗봇·LLM·임베딩 테스트는 가짜 LLM HTTP 서버(`MockLlmServer`, 워커는 `httpx.MockTransport`·`FakeEmbedder`)만 부르므로 CI에서 실제 LLM·임베딩 호출이 없습니다.
 통합 테스트는 클래스마다 Spring 컨텍스트(연결 풀)를 캐시하므로 테스트에서는 풀을 4개로 줄입니다(`backend/src/test/resources/config/application.properties`) —
 기본 10개면 IT 9개만으로 PostgreSQL 기본 한도(100)에 닿고, 같은 DB 서버에 로컬 백엔드·워커가 붙어 있으면 "too many clients"로 실패합니다.
 
@@ -400,7 +457,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 | M2 외부 API·키워드 감시 | API 카탈로그·자격 증명 저장소·API 수집기(뉴스 검색·DART·공공데이터포털), 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트 알림, 최소 화면(등록·내 요청·관리자 큐) | 완료 (2026-10-18, 최소 화면 포함) |
 | M3 회사 레이어·공급사 리스크 소스 | 회사(거래처) 마스터와 별칭 매칭, 문서→회사 연결, 리스크 신호 분류(재무·제재·사고·경영 변동), 공공 API 커넥터(국세청 사업자 상태, 조달청 부정당업자, DART 기업개황·재무), 회사별 다이제스트, 케이던시아 연동(마스터 동기화·이벤트 전달 — 목업으로 형태 완료, 실제 API는 SDS 확인 뒤) | 거의 완료 — 남은 것: DART 재무(FINANCIAL), 회사별 다이제스트 화면, 실제 케이던시아 API(SDS 확인 뒤) |
 | M4 동적·첨부 | Playwright 동적 수집, 첨부 다운로드·HWP/PDF 텍스트 추출, 원문 삭제(GONE) 감지, (합의 시) 회사 계정 로그인 세션 | 다음 |
-| M5 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 tool calling(`search_documents`·`list_issues`·`list_watches`·`create_watch`·`register_source`·`get_source_status`), 대화 저장 | 진행 중 — 된 것: 전문 검색 색인(Kiwi·tsvector)과 이슈 묶기·화면, 챗봇 1단계(도구 호출·대화 저장·근거 링크·화면, 2026-10-19). 남은 것: 임베딩·하이브리드 검색(챗봇 2단계) |
+| M5 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 tool calling(`search_documents`·`list_issues`·`list_watches`·`create_watch`·`register_source`·`get_source_status`), 대화 저장 | 진행 중 — 된 것: 전문 검색 색인(Kiwi·tsvector)과 이슈 묶기·화면, 챗봇 1단계(도구 호출·대화 저장·근거 링크·화면), 챗봇 2단계 의미 검색(조각 임베딩·하이브리드 RRF, 2026-10-19). 남은 것: 대화 요약·답 피드백, 운영 데이터 임베딩(유료 등급 또는 사내 임베딩 모델) |
 | M6 관리자·운영 | 레시피 수정·미리보기, 설정 백필, 감사 로그 화면, 운영 지표 | |
 
 로드맵은 현업 요청서(대외협력·커뮤니케이션 대상 외부정보 센싱)에 맞춰 2026-10-16에 다시 짰다. 요건 대응표와
@@ -425,7 +482,8 @@ LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 
   등록 이전 기사를 평소 수집이 쉬는 틈에 천천히 채운다 (`docs/how-collection-works.md` "입구 파일이 보여 주는 범위와 과거 기사").
 - 사이트 하나에 기사 종류 여러 개: korea.kr이 보도자료만 모이는 문제(정책뉴스·브리핑·연설문 누락). 종류별 품질 검사·켜고 끄기,
   특정 목록 주소로 등록하면 그 종류만, 이미 있는 사이트에 다른 목록 주소를 넣으면 종류 추가.
-- 챗봇 2단계: 임베딩 의미 검색 (1단계 — 도구 호출·대화 저장·근거 링크·화면 — 은 10-19 완료, 아래 M5 체크리스트).
+- 챗봇: 1단계 도구 호출형 챗봇(문서 검색·이슈·감시·사이트 등록·상태), 대화 저장, 근거 링크, 챗봇 화면. 2단계 의미 검색 — 워커가 색인 조각을
+  임베딩하고 `search_documents`가 낱말 일치와 의미 유사도를 RRF로 합친다 (임베딩이 없거나 실패하면 전문 검색 그대로).
 
 **남은 것 (순서대로)**
 
@@ -434,8 +492,8 @@ LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 
    본문을 품은 `<header>` 보존, `[부고]` 단신 표본 제외 — `docs/how-collection-works.md` 4절). 남은 것: 규칙이 못 잡는 다음 사례가
    나오면 LLM 레시피로 붙이는 실측(Gemini 무료 키로 가능).
 3. M4 동적·첨부: Playwright 동적 수집, HWP/PDF 첨부 텍스트 추출(공공기관 보도자료 본문), 원문 삭제 감지, (합의 시) 회사 계정 로그인 수집.
-4. M5 검색·챗봇 2단계: 임베딩·하이브리드 검색으로 `search_documents` 교체, 대화 요약(`chat_session.summary`)·답 피드백(`chat_feedback`) (전문 검색 색인과
-   이슈 묶기, 챗봇 1단계 — 도구 호출·대화 저장·근거 링크·화면 — 는 2026-10-19 완료).
+4. M5 검색·챗봇: 대화 요약(`chat_session.summary`)·답 피드백(`chat_feedback`), 운영 데이터 임베딩(무료 등급은 분당 100개·하루 한도라 유료 등급 또는
+   사내 임베딩 모델 결정 필요), 화면 문서 검색에도 하이브리드를 쓸지 (전문 검색 색인과 이슈 묶기, 챗봇 1단계, 2단계 의미 검색은 2026-10-19 완료).
 5. M6 관리자·운영: 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면. (워커 하트비트 기반 지표는 10-19 완료: `worker_heartbeat`,
    운영 지표의 워커 수 = 최근 2분 안 신호, 워커 목록)
 6. 작은 것: 네이버 API 쿼터 추적, Teams 웹훅 형식, favicon.
@@ -531,11 +589,16 @@ M5에서 한 일:
   `java.net.http`, 워커와 같은 `SENSING_LLM_*`·`ANTHROPIC_*`, 429·5xx·시간 초과를 사용자 문장으로), 챗봇 서비스·API(`/api/v1/chat/sessions`, 한 턴 도구 왕복 4번,
   모든 단계 `chat_message` 저장, 답의 `[n]` → `chat_citation`, 세션 소유자만), 도구 6개(문서 검색·이슈·감시 조회/생성·사이트 등록·진행 상태 — 화면과 같은 서비스),
   API 키는 채팅으로 받지 않고 붙여 넣은 키는 가림, 화면 "챗봇"(대화 목록·생각 중·근거 링크, 좁은 화면). 가짜 LLM 서버로 도구 루프·권한·저장·인용·429 통합 테스트
-- [ ] 임베딩(`chunk.embedding`)·하이브리드 검색 (챗봇 2단계), 대화 요약·피드백
+- [x] 챗봇 2단계 의미 검색 (2026-10-19): 워커 임베딩 단계(`embed.py`: 색인 조각 → OpenAI 호환 `/embeddings`, 언론 기사는 제목만·공공 문서는 제목+본문 조각,
+  AI 봇 차단 사이트는 제목만, `chunk.embed_model`로 모델 구분(V15), 분당 상한·실패 시 쉬기, `sensing-embed-backfill`), 백엔드 질의 임베딩 클라이언트
+  (`LlmHttp`와 같은 오류 분류)와 하이브리드 검색(`HybridSearch`: 전문 검색 + 코사인 유사도 하한 0.58, RRF k=60, 미설정·조각 없음·실패면 전문 검색),
+  `search_documents`가 하이브리드를 쓰고 문서마다 `match` 표시. 가짜 임베딩 서버로 단위·통합 테스트, Gemini 실측(제목 60건·질의 7개)
+- [ ] 대화 요약·답 피드백, 운영 데이터 임베딩 (유료 등급 또는 사내 임베딩 모델)
 
 ## 원칙
 
 - robots.txt 준수, 식별 가능한 User-Agent, 도메인당 최소 2초 간격
 - 차단 신호(403·429·봇 확인·로그인)는 재시도하지 않고 즉시 중단 → 관리자만 재점검
 - 언론사는 기본 저장 범위를 제목·링크·발행일로 제한 (저작권)
-- robots.txt에서 AI 봇을 막은 사이트는 `ai_restricted`로 표시하고, 챗봇은 그 사이트 문서의 요약을 LLM에 보내지 않는다 (제목·링크만)
+- robots.txt에서 AI 봇을 막은 사이트는 `ai_restricted`로 표시하고, 챗봇은 그 사이트 문서의 요약을 LLM에 보내지 않는다 (제목·링크만).
+  의미 검색 임베딩도 그 사이트는 제목만 외부 임베딩 API에 보낸다

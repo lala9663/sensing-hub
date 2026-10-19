@@ -1323,3 +1323,62 @@ def test_crawled_articles_are_matched_against_keyword_watches(env):
         (watch_id,)).fetchall()
     assert [(h["keyword"], h["title"]) for h in hits] == [("기사 제목 103번", "기사 제목 103번 소식")]
     assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "ACTIVE"
+
+
+def test_embed_pending_fills_vectors_for_titles_and_public_bodies_only(env):
+    """의미 검색 임베딩: 언론 기사는 제목, 공공 문서는 제목 + 제목을 붙인 본문 조각, AI 봇을 막은 사이트는 제목만 보낸다."""
+    from fakeembed import FakeEmbedder, unavailable, vector_for
+    from sensing_worker.embed import _vector_literal, embed_pending
+    from sensing_worker.indexer import index_pending
+    store, runner, settings, sites = env
+    press = site_source(store, "press.example.com", "NEWS")
+    gov = site_source(store, "gov.example.go.kr", "PUBLIC")
+    closed = site_source(store, "closed.example.go.kr", "PUBLIC")
+    store.conn.execute("UPDATE site SET ai_restricted = true WHERE domain = 'closed.example.go.kr'")
+    article = add_doc(store, press, "https://press/1", "반도체 수출 사상 최대", 3)
+    body = "\n\n".join(f"{i}번째 문단: 반도체 지원사업 신청 요건을 안내합니다. " * 8 for i in range(4))
+    notice = add_doc(store, gov, "https://gov/1", "2026년 반도체 지원사업 공고", 2, body=body)
+    hidden = add_doc(store, closed, "https://closed/1", "청년 인력 양성 계획", 1, body="AI 봇을 막은 사이트의 본문입니다. " * 5)
+    index_pending(store, settings, limit=100)
+    total = q(store, "SELECT count(*) AS c FROM chunk")["c"]
+    assert total >= 5
+
+    # 호출이 실패하면 아무것도 쓰지 않는다 (다음에 다시 대상)
+    out = embed_pending(store, FakeEmbedder(error=unavailable()), settings, limit=100)
+    assert out.unavailable and "429" in out.error and out.fetched == total
+    assert q(store, "SELECT count(*) AS c FROM chunk WHERE embed_model IS NOT NULL")["c"] == 0
+
+    fake = FakeEmbedder()
+    out = embed_pending(store, fake, settings, limit=100)
+    assert out.fetched == total and not out.unavailable and len(fake.calls) == 1   # 한 묶음 한 번의 호출
+    sent = fake.calls[0]
+    assert {"반도체 수출 사상 최대", "2026년 반도체 지원사업 공고", "청년 인력 양성 계획"} <= set(sent)
+    assert any(t.startswith("2026년 반도체 지원사업 공고\n") and "요건" in t for t in sent)   # 본문 조각은 제목을 붙여
+    assert not any("AI 봇을 막은" in t for t in sent)
+
+    rows = store.conn.execute("""
+        SELECT document_id, seq, embed_model, embedding IS NOT NULL AS has, embedded_at IS NOT NULL AS stamped
+        FROM chunk ORDER BY document_id, seq""").fetchall()
+    assert {r["embed_model"] for r in rows} == {"fake-embed/1024"} and all(r["stamped"] for r in rows)
+    hidden_rows = [r["has"] for r in rows if r["document_id"] == hidden]
+    assert hidden_rows == [True, False]                    # 제목만 벡터, 본문 조각은 embed_model만 채워 다시 잡지 않는다
+    assert out.embedded == total - 1 and out.skipped == 1
+    # 저장된 벡터는 보낸 글의 벡터다 (pgvector 코사인 거리 0)
+    d = q(store, "SELECT embedding <=> CAST(%s AS vector) AS d FROM chunk WHERE document_id = %s AND seq = 0",
+          _vector_literal(vector_for("반도체 수출 사상 최대")), article)["d"]
+    assert d == pytest.approx(0.0, abs=1e-6)
+    assert embed_pending(store, fake, settings, limit=100).fetched == 0   # 더 할 것이 없다
+
+    # 본문이 바뀌어 다시 색인된 문서는 새 조각만 다시 임베딩한다
+    store.upsert_document(source_id=gov, job_id=None, url="https://gov/1", title="2026년 반도체 지원사업 공고",
+                          author=None, section=None, published_at=None, body="바뀐 본문: 신청 기한이 연장되었습니다.")
+    index_pending(store, settings, limit=100)
+    again = embed_pending(store, fake, settings, limit=100)
+    assert again.fetched == q(store, "SELECT count(*) AS c FROM chunk WHERE document_id = %s", notice)["c"] == 2
+    assert fake.calls[-1] == ["2026년 반도체 지원사업 공고", "2026년 반도체 지원사업 공고\n바뀐 본문: 신청 기한이 연장되었습니다."]
+
+    # 모델을 바꾸면 모든 조각이 다시 대상이다 (다른 모델의 벡터는 비교할 수 없다)
+    other = FakeEmbedder(model="fake-embed-2")
+    total = q(store, "SELECT count(*) AS c FROM chunk")["c"]
+    assert embed_pending(store, other, settings, limit=100).fetched == total
+    assert {r["embed_model"] for r in store.conn.execute("SELECT embed_model FROM chunk").fetchall()} == {"fake-embed-2/1024"}

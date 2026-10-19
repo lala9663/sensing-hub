@@ -53,6 +53,9 @@ class ChatIT {
         r.add("sensing.llm.api-key", () -> "test-key");
         r.add("sensing.llm.timeout-seconds", () -> "10");
         r.add("sensing.llm.retry-delay-ms", () -> "0");
+        // 의미 검색: 주소를 따로 주지 않았으므로 LLM과 같은 가짜 서버·같은 키로 /v1/embeddings를 부른다
+        r.add("sensing.embed.provider", () -> "openai");
+        r.add("sensing.embed.model", () -> "mock-embed");
     }
 
     @AfterAll
@@ -249,6 +252,65 @@ class ChatIT {
         assertThat(LLM.pending()).isZero();
     }
 
+    /** 워커가 임베딩한 제목 조각을 흉내 낸다 (모델 mock-embed, 1024차원). */
+    private void embeddedTitle(long documentId, String title, float[] vector) {
+        StringBuilder literal = new StringBuilder("[");
+        for (int i = 0; i < vector.length; i++) {
+            literal.append(i == 0 ? "" : ",").append(vector[i]);
+        }
+        jdbc.sql("""
+                INSERT INTO chunk (document_id, seq, text, embedding, index_version, embed_model, embedded_at)
+                VALUES (?, 0, ?, CAST(? AS vector), 'fts-kiwi-v1', 'mock-embed/1024', now())
+                """).params(documentId, title, literal.append(']').toString()).update();
+    }
+
+    @Test
+    void searchToolAddsArticlesThatShareMeaningButNotWords() {
+        long press = siteSource("news.example.com", "NEWS", "예시일보", false);
+        long words = document(press, "https://news.example.com/1", "배드민턴협회 감사 결과 발표", "2026-10-16T09:00:00+09:00",
+                null, "[\"사건·사고\"]");
+        embeddedTitle(words, "배드민턴협회 감사 결과 발표", MockLlmServer.vector(5, 1));
+        long meaning = document(press, "https://news.example.com/2", "안세영, 덴마크오픈 우승…시즌 9번째 트로피",
+                "2026-10-15T09:00:00+09:00", null, "[\"기타\"]");
+        embeddedTitle(meaning, "안세영, 덴마크오픈 우승…시즌 9번째 트로피", MockLlmServer.vector(0, 0.9f, 2, 0.43589f));
+        long unrelated = document(press, "https://news.example.com/3", "가을 축제 개막", "2026-10-17T09:00:00+09:00",
+                null, "[\"기타\"]");
+        embeddedTitle(unrelated, "가을 축제 개막", MockLlmServer.vector(0, 0.3f, 3, 0.95394f));
+
+        LLM.then(toolCall("call-s", "search_documents", "{\"query\":\"배드민턴\"}"))
+                .then(body -> {
+                    assertThat(body.path("input").get(0).asText()).isEqualTo("배드민턴");
+                    assertThat(body.path("model").asText()).isEqualTo("mock-embed");
+                    return Reply.ok(MockLlmServer.openAiEmbedding(MockLlmServer.vector(0, 1)));
+                })
+                .then(body -> {
+                    JsonNode r = parse(messages(body, "tool").get(0).path("content").asText());
+                    assertThat(r.path("order").asText()).startsWith("관련도순");
+                    JsonNode docs = r.path("documents");
+                    assertThat(docs).hasSize(2);                 // 유사도 하한(0.58) 아래인 '가을 축제'는 빠진다
+                    assertThat(docs.get(0).path("title").asText()).isEqualTo("배드민턴협회 감사 결과 발표");
+                    assertThat(docs.get(0).path("match").asText()).isEqualTo("낱말");
+                    assertThat(docs.get(1).path("title").asText()).startsWith("안세영");
+                    assertThat(docs.get(1).path("match").asText()).isEqualTo("의미");
+                    assertThat(docs.get(1).has("url")).isFalse();
+                    assertThat(docs.get(1).has("summary")).isFalse();
+                    assertThat(r.path("note").asText()).contains("뜻만 가까운");
+                    return text("배드민턴 소식: 협회 감사 결과 [1], 안세영 덴마크오픈 우승 [2]");
+                });
+        long s = session("viewer");
+        JsonNode answer = send("viewer", s, "배드민턴 소식 있어?").get("assistant");
+
+        assertThat(answer.get("error").asBoolean()).isFalse();
+        assertThat(answer.get("citations")).hasSize(2);
+        assertThat(answer.get("citations").get(1).get("documentId").asLong()).isEqualTo(meaning);
+        assertThat(answer.get("citations").get(1).get("url").asText()).isEqualTo("https://news.example.com/2");
+        List<MockLlmServer.Recorded> requests = LLM.requests();
+        assertThat(requests).extracting(MockLlmServer.Recorded::path)
+                .containsExactly("/v1/chat/completions", "/v1/embeddings", "/v1/chat/completions");
+        assertThat(requests.get(1).header("Authorization")).isEqualTo("Bearer test-key");   // LLM 키를 함께 쓴다
+        assertThat(LLM.pending()).isZero();
+    }
+
     @Test
     void sessionsAreVisibleOnlyToTheirOwner() {
         long s = session("registrar");
@@ -279,6 +341,7 @@ class ChatIT {
         JsonNode status = call("viewer", HttpMethod.GET, "/api/v1/chat/status", null).getBody();
         assertThat(status.get("configured").asBoolean()).isTrue();
         assertThat(status.get("provider").asText()).isEqualTo("openai mock-model");
+        assertThat(status.get("search").asText()).isEqualTo("낱말+의미 (mock-embed/1024)");
     }
 
     @Test

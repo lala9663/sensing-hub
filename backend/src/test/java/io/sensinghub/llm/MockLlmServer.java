@@ -180,6 +180,35 @@ public final class MockLlmServer implements AutoCloseable {
         return root.toString();
     }
 
+    /** OpenAI 호환 /embeddings 응답. Gemini처럼 첫 항목의 index(0)는 빼고 준다. */
+    public static String openAiEmbedding(float[]... vectors) {
+        ObjectNode root = JSON.createObjectNode();
+        root.put("object", "list");
+        ArrayNode data = root.putArray("data");
+        for (int i = 0; i < vectors.length; i++) {
+            ObjectNode item = data.addObject();
+            item.put("object", "embedding");
+            if (i > 0) {
+                item.put("index", i);
+            }
+            ArrayNode values = item.putArray("embedding");
+            for (float v : vectors[i]) {
+                values.add(v);
+            }
+        }
+        root.put("model", "mock-embed");
+        return root.toString();
+    }
+
+    /** 1024차원 벡터: 칸 i에 값 v를 둔다 (나머지 0). {@code vector(0, 0.8f, 1, 0.6f)}처럼 칸·값을 번갈아 준다. */
+    public static float[] vector(Object... indexValuePairs) {
+        float[] v = new float[1024];
+        for (int i = 0; i < indexValuePairs.length; i += 2) {
+            v[(Integer) indexValuePairs[i]] = ((Number) indexValuePairs[i + 1]).floatValue();
+        }
+        return v;
+    }
+
     /** Gemini 무료 등급이 하루 한도를 넘었을 때의 429 본문 (OpenAI 호환 주소는 배열로 감싸 준다). */
     public static final String GEMINI_DAILY_429 = """
             [{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. \

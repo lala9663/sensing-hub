@@ -97,6 +97,26 @@ sensing:
     max-tokens: ${SENSING_LLM_MAX_TOKENS:0}
     # 5xx·529 한 번 재시도 전 대기(ms). 429는 재시도하지 않는다
     retry-delay-ms: 1500
+  embed:
+    # 의미 검색의 질의 임베딩 (EmbeddingConfig). 워커가 문서 조각을 임베딩할 때와 같은 변수·같은 값이어야 한다:
+    # none(기본, 전문 검색만) | openai(OpenAI 호환 /embeddings — Gemini OpenAI 호환 주소 포함).
+    # base-url을 비우면 SENSING_LLM_BASE_URL·SENSING_LLM_API_KEY를 함께 쓴다 (주소를 따로 주면 키도 따로)
+    provider: ${SENSING_EMBED_PROVIDER:none}
+    model: ${SENSING_EMBED_MODEL:}
+    base-url: ${SENSING_EMBED_BASE_URL:}
+    api-key: ${SENSING_EMBED_API_KEY:}
+    dimensions: ${SENSING_EMBED_DIMENSIONS:1024}
+    # 질의 하나의 제한 시간(초). 넘으면 전문 검색만으로 답한다 (워커의 묶음 제한 시간 SENSING_EMBED_TIMEOUT과 별개)
+    timeout-seconds: ${SENSING_EMBED_QUERY_TIMEOUT:10}
+  search:
+    # 하이브리드 검색 (HybridSearch): 전문 검색과 의미 검색에서 각각 이만큼 후보를 뽑아 RRF(1/(k+순위) 합)로 합친다
+    candidates: 50
+    rrf-k: 60
+    # 의미 검색 후보의 코사인 유사도 하한. gemini-embedding-001(1024차원)·기사 제목 기준으로 무관한 기사는 0.56 이하,
+    # 관련 기사는 0.59 이상이었다 (2026-10-19, 제목 60건 × 질의 7개). 모델을 바꾸면 다시 맞춘다
+    min-similarity: ${SENSING_EMBED_MIN_SIMILARITY:0.58}
+    # 질의 임베딩이 실패(429·5xx·시간 초과)하면 이 시간 동안 의미 검색을 건너뛴다
+    embed-cooldown-seconds: 60
   chat:
     # 한 턴에 도구를 부르는 왕복 수 상한. 넘으면 도구 없이 지금까지의 결과로 답하게 한다
     max-tool-rounds: 4

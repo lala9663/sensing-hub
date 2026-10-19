@@ -92,7 +92,8 @@ public class ChatService {
     public record TurnResult(SessionView session, MessageView user, MessageView assistant, String notice) {
     }
 
-    public record Status(boolean configured, String provider, int maxToolRounds) {
+    /** search: 문서 검색 방식 ("낱말+의미 (gemini-embedding-001/1024)" 또는 "낱말"). */
+    public record Status(boolean configured, String provider, int maxToolRounds, String search) {
     }
 
     private final JdbcClient jdbc;
@@ -116,7 +117,7 @@ public class ChatService {
 
     public Status status(CurrentUser user) {
         user.require(Role.VIEWER);
-        return new Status(llm.configured(), llm.describe(), maxToolRounds);
+        return new Status(llm.configured(), llm.describe(), maxToolRounds, tools.searchMode());
     }
 
     // ------------------------------------------------------------------ 세션
