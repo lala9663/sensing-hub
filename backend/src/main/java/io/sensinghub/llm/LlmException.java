@@ -25,15 +25,38 @@ public class LlmException extends RuntimeException {
         BAD_RESPONSE
     }
 
+    /**
+     * 429 응답에서 읽은 한도 ({@link LlmHttp#rateLimit}). scope는 llm_cooldown.reason과 같은 값이다.
+     * @param scope        DAILY(하루 한도, Gemini quotaId에 PerDay) | MINUTE(분당 한도) | RATE_LIMITED(그 밖의 429, retry-after 등)
+     * @param quotaId      제공자가 준 한도 이름 (없으면 null)
+     * @param retrySeconds 제공자가 알려 준 다시 부를 수 있을 때까지의 초 (없으면 null)
+     */
+    public record RateLimit(String scope, String quotaId, Integer retrySeconds) {
+
+        public static final String DAILY = "DAILY";
+        public static final String MINUTE = "MINUTE";
+        public static final String OTHER = "RATE_LIMITED";
+
+        public boolean daily() {
+            return DAILY.equals(scope);
+        }
+    }
+
     private final Kind kind;
     private final Integer httpStatus;
     private final String detail;
+    private final RateLimit rateLimit;
 
-    public LlmException(Kind kind, String userMessage, Integer httpStatus, String detail) {
+    public LlmException(Kind kind, String userMessage, Integer httpStatus, String detail, RateLimit rateLimit) {
         super(userMessage);
         this.kind = kind;
         this.httpStatus = httpStatus;
         this.detail = detail;
+        this.rateLimit = rateLimit;
+    }
+
+    public LlmException(Kind kind, String userMessage, Integer httpStatus, String detail) {
+        this(kind, userMessage, httpStatus, detail, null);
     }
 
     public LlmException(Kind kind, String userMessage) {
@@ -50,5 +73,10 @@ public class LlmException extends RuntimeException {
 
     public String detail() {
         return detail;
+    }
+
+    /** HTTP 429일 때만 있다. */
+    public RateLimit rateLimit() {
+        return rateLimit;
     }
 }

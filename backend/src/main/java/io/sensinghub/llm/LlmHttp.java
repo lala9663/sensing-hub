@@ -9,6 +9,8 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -22,6 +24,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.sensinghub.llm.LlmException.Kind;
+import io.sensinghub.llm.LlmException.RateLimit;
 
 /**
  * LLM 제공자에 JSON을 POST하는 공통 코드 (추가 의존성 없이 java.net.http).
@@ -36,6 +39,8 @@ final class LlmHttp {
     private static final Logger log = LoggerFactory.getLogger(LlmHttp.class);
     /** Gemini 429 본문의 "Please retry in 41.3s" 또는 RetryInfo "retryDelay": "41s" */
     private static final Pattern RETRY_IN = Pattern.compile("(?i)retry in ([0-9]+(?:\\.[0-9]+)?)s|\"retryDelay\"\\s*:\\s*\"([0-9]+)s\"");
+    /** Gemini 429 본문 QuotaFailure.violations[].quotaId */
+    private static final Pattern QUOTA_ID = Pattern.compile("\"quotaId\"\\s*:\\s*\"([^\"]+)\"");
 
     private final HttpClient client;
     private final ObjectMapper json;
@@ -114,14 +119,15 @@ final class LlmHttp {
     static LlmException error(int status, String body, String retryAfter) {
         String detail = head(body);
         if (status == 429) {
-            String lower = body == null ? "" : body.toLowerCase(Locale.ROOT);
-            if (lower.contains("perday") || lower.contains("per day") || lower.contains("daily")) {
+            RateLimit limit = rateLimit(body, retryAfter);
+            if (limit.daily()) {
                 return new LlmException(Kind.RATE_LIMITED, "LLM 하루 사용 한도(무료 등급)를 다 썼습니다. "
-                        + "내일 다시 시도하거나 관리자에게 알려 주세요.", status, detail);
+                        + "내일 다시 시도하거나 관리자에게 알려 주세요.", status, detail, limit);
             }
-            Integer seconds = retrySeconds(body, retryAfter);
+            Integer seconds = limit.retrySeconds();
             return new LlmException(Kind.RATE_LIMITED, "LLM 호출 한도를 잠시 넘었습니다. "
-                    + (seconds != null ? "약 " + seconds + "초 뒤에" : "1분쯤 뒤에") + " 다시 시도해 주세요.", status, detail);
+                    + (seconds != null ? "약 " + seconds + "초 뒤에" : "1분쯤 뒤에") + " 다시 시도해 주세요.", status, detail,
+                    limit);
         }
         if (status == 401 || status == 403) {
             return new LlmException(Kind.AUTH, "LLM API 키가 올바르지 않거나 권한이 없습니다 (HTTP " + status
@@ -137,6 +143,34 @@ final class LlmHttp {
         }
         return new LlmException(Kind.BAD_REQUEST, "LLM이 요청을 받아들이지 않았습니다 (HTTP " + status
                 + "). 질문을 조금 바꿔 다시 시도해 주세요.", status, detail);
+    }
+
+    /**
+     * 429 본문·retry-after → 한도 종류. 워커 llm.parse_rate_limit와 같은 규칙: Gemini는 본문 details에
+     * QuotaFailure.violations[].quotaId("GenerateRequestsPerDayPerProjectPerModel-FreeTier" 등)와 RetryInfo.retryDelay를 준다.
+     * quotaId에 PerDay가 하나라도 있으면 하루 한도, PerMinute면 분당 한도. quotaId가 없으면 본문의 "per day"·"daily"로 가린다.
+     */
+    static RateLimit rateLimit(String body, String retryAfter) {
+        String text = body == null ? "" : body;
+        List<String> ids = new ArrayList<>();
+        Matcher m = QUOTA_ID.matcher(text);
+        while (m.find()) {
+            ids.add(m.group(1));
+        }
+        String daily = ids.stream().filter(q -> q.toLowerCase(Locale.ROOT).contains("perday")).findFirst().orElse(null);
+        String minute = ids.stream().filter(q -> q.toLowerCase(Locale.ROOT).contains("perminute")).findFirst().orElse(null);
+        String lower = text.toLowerCase(Locale.ROOT);
+        Integer seconds = retrySeconds(body, retryAfter);
+        if (daily != null) {
+            return new RateLimit(RateLimit.DAILY, daily, seconds);
+        }
+        if (minute != null) {
+            return new RateLimit(RateLimit.MINUTE, minute, seconds);
+        }
+        if (ids.isEmpty() && (lower.contains("perday") || lower.contains("per day") || lower.contains("daily"))) {
+            return new RateLimit(RateLimit.DAILY, null, seconds);
+        }
+        return new RateLimit(RateLimit.OTHER, ids.isEmpty() ? null : ids.get(0), seconds);
     }
 
     static Integer retrySeconds(String body, String retryAfter) {

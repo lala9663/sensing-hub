@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -30,6 +31,76 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 class LlmUnavailable(Exception):
     """LLM을 쓸 수 없다 (미설정·연결 실패·HTTP 오류·거절). 등록은 휴리스틱으로 계속한다."""
+
+
+# 429 한도 종류 (llm_cooldown.reason과 같은 값)
+DAILY = "DAILY"                 # 하루 한도 (Gemini quotaId ...PerDay...): 쿼터 기준 시간대의 다음 자정까지 쉰다
+MINUTE = "MINUTE"               # 분당 한도 (...PerMinute...): retryDelay만큼 쉰다
+RATE_LIMITED = "RATE_LIMITED"   # 그 밖의 429 (Claude·사내 게이트웨이의 retry-after 등): retry-after만큼 쉰다
+
+
+@dataclass(frozen=True)
+class RateLimit:
+    """429 응답에서 읽은 한도 종류와, 제공자가 알려 준 다시 부를 수 있을 때까지의 초 (없으면 None)."""
+    scope: str
+    quota_id: str | None = None
+    retry_seconds: int | None = None
+
+
+class LlmRateLimited(LlmUnavailable):
+    """HTTP 429: 호출 한도를 넘었다. 다시 보내지 않는다 (무료 등급에서 재시도는 한도만 더 쓴다)."""
+
+    def __init__(self, message: str, limit: RateLimit):
+        super().__init__(message)
+        self.limit = limit
+
+
+class LlmPaused(LlmUnavailable):
+    """부르지 않았다: 모델이 429 뒤 쉬는 중이거나 이 용도의 하루 상한에 닿았다 (llm_budget). pause.until까지 기다린다."""
+
+    def __init__(self, message: str, pause: Any):
+        super().__init__(message)
+        self.pause = pause
+
+
+_QUOTA_ID_RE = re.compile(r'"quotaId"\s*:\s*"([^"]+)"')
+_RETRY_DELAY_RE = re.compile(r'"retryDelay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)s"')
+_RETRY_IN_RE = re.compile(r"(?i)retry in ([0-9]+(?:\.[0-9]+)?)s")
+
+
+def _ceil_seconds(value: str) -> int | None:
+    try:
+        return max(1, math.ceil(float(value)))
+    except ValueError:
+        return None
+
+
+def parse_rate_limit(body: str | None, retry_after: str | None = None) -> RateLimit:
+    """429 응답 본문·retry-after 헤더 → RateLimit. 백엔드 LlmHttp.rateLimit와 같은 규칙이다.
+
+    Gemini(OpenAI 호환 주소)는 본문 details에 QuotaFailure.violations[].quotaId
+    ("GenerateRequestsPerDayPerProjectPerModel-FreeTier" 등)와 RetryInfo.retryDelay("60554s")를 준다. quotaId에 PerDay가
+    하나라도 있으면 하루 한도, PerMinute면 분당 한도다. quotaId가 없으면 본문의 "per day"·"daily"로 하루 한도를 가린다.
+    대기 시간은 retry-after 헤더(초) → retryDelay → "Please retry in 41.3s" 순으로 읽는다.
+    """
+    text = body or ""
+    ids = _QUOTA_ID_RE.findall(text)
+    daily = [q for q in ids if "perday" in q.lower()]
+    minute = [q for q in ids if "perminute" in q.lower()]
+    lower = text.lower()
+    if daily:
+        scope, quota_id = DAILY, daily[0]
+    elif minute:
+        scope, quota_id = MINUTE, minute[0]
+    elif not ids and any(w in lower for w in ("perday", "per day", "daily")):
+        scope, quota_id = DAILY, None
+    else:
+        scope, quota_id = RATE_LIMITED, (ids[0] if ids else None)
+    seconds = _ceil_seconds(retry_after.strip()) if retry_after and retry_after.strip() else None
+    if seconds is None:   # HTTP 날짜 형식의 retry-after는 무시하고 본문을 본다
+        m = _RETRY_DELAY_RE.search(text) or _RETRY_IN_RE.search(text)
+        seconds = _ceil_seconds(m.group(1)) if m else None
+    return RateLimit(scope, quota_id, seconds)
 
 
 class LlmClient(Protocol):
@@ -89,6 +160,11 @@ class AnthropicLlm:
             else:
                 response = self.client.messages.create(**kwargs)
         except _anthropic_errors() as e:
+            if getattr(e, "status_code", None) == 429:   # SDK가 retry-after를 지켜 몇 번 다시 보낸 뒤에도 429
+                response = getattr(e, "response", None)
+                headers = getattr(response, "headers", None) or {}
+                limit = parse_rate_limit(getattr(response, "text", None) or str(e), headers.get("retry-after"))
+                raise LlmRateLimited(f"Claude API 호출 한도 (HTTP 429, {limit.scope}): {e}"[:500], limit) from e
             raise LlmUnavailable(f"Claude API 오류: {type(e).__name__}: {e}"[:500]) from e
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -157,6 +233,10 @@ class OpenAiCompatLlm:
                 log.info("LLM server rejected response_format=%s, falling back: %s", step, response.text[:200])
                 self._format_step += 1
                 continue
+            if response.status_code == 429:
+                limit = parse_rate_limit(response.text, response.headers.get("retry-after"))
+                raise LlmRateLimited(f"LLM 서버 HTTP 429 ({limit.scope} {limit.quota_id or ''}, "
+                                     f"retry {limit.retry_seconds}s): {response.text[:300]}", limit)
             if response.status_code >= 400:
                 raise LlmUnavailable(f"LLM 서버 HTTP {response.status_code}: {response.text[:300]}")
             try:

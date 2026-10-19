@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from .company import build_name_index, match_companies_by_tags, news_signal
 from .config import Settings
 from .db import sha256
-from .llm import Generation, LlmClient, LlmUnavailable, describe, generate_recipe
+from .llm import Generation, LlmClient, LlmPaused, LlmUnavailable, describe, generate_recipe
 
 log = logging.getLogger(__name__)
 
@@ -293,7 +293,8 @@ def enrich_pending(store, llm: LlmClient, settings: Settings, limit: int | None 
             try:
                 results, gen = enrich_batch(llm, to_send, settings)
             except LlmUnavailable as e:
-                log.warning("enrich skipped (LLM unavailable, nothing written): %s", e)
+                if not isinstance(e, LlmPaused):   # 쉬는 중·하루 상한은 MeteredLlm이 쉬기 시작할 때 한 번만 남긴다
+                    log.warning("enrich skipped (LLM unavailable, nothing written): %s", e)
                 outcome.llm_unavailable = True
                 return outcome
             outcome.usage = dict(gen.usage)

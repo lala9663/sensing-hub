@@ -127,6 +127,8 @@ LLM 장애는 경고만 남기고 휴리스틱으로 진행하므로 LLM이 멈�
 | `SENSING_ENRICH_ENABLED` | `true` | 수집 시점 요약·분류(보강). 큐에 작업이 없을 때 LLM이 설정돼 있으면 한 묶음씩 돌린다 (`none`이면 하지 않는다) |
 | `SENSING_ENRICH_BATCH` | `10` | 한 번의 LLM 호출에 묶는 문서 수 |
 | `SENSING_ENRICH_BODY_CHARS` | `4000` | 문서당 LLM에 보여 줄 본문 글자 수 상한 (언론 기사는 본문을 보여 주지 않는다) |
+| `SENSING_ENRICH_DAILY_CALLS` | `300` | 요약·분류의 하루 LLM 호출 수 상한 (워커 여러 대 합산, DB `llm_usage` 기준). 닿으면 그날은 요약을 쉬고 남은 문서는 다음 날 이어서 한다. 기본값은 Gemini Flash-Lite 무료 하루 500번 중 200번을 챗봇·등록 레시피 몫으로 남긴다. `0`이면 상한 없음 — [LLM 무료 한도 나눠 쓰기](#llm-무료-한도-나눠-쓰기-챗봇요약레시피) |
+| `SENSING_LLM_QUOTA_TZ` | `America/Los_Angeles` | 무료 한도의 하루 기준 시간대 (Gemini는 태평양 시간 자정 = 한국 시간 오후 4~5시에 초기화). 백엔드와 같은 값이어야 한다 |
 
 ```bash
 # Claude
@@ -158,6 +160,24 @@ Claude API 키는 `sk-ant-api03-`로 시작하는 Console 키여야 합니다(�
 JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`json_schema`)를 지원하면 힌트로 쓰되, 응답은 항상 우리 쪽에서 JSON을 꺼내
 스키마를 검증하고, 실패하면 오류 메시지를 붙여 한 번만 다시 요청합니다. OpenAI 호환 서버가 `response_format`을 400으로 거부하면
 `json_object` → 없음 순으로 낮춰 다시 보냅니다. 측정 도구(`sensing-discovery-eval`)도 같은 변수를 읽고 결과 표에 레시피 출처를 표시합니다.
+
+### LLM 무료 한도 나눠 쓰기 (챗봇·요약·레시피)
+
+챗봇(백엔드)·자동 요약(워커 enrich)·등록 레시피(워커 recipe)는 같은 모델·같은 키를 쓰고, 무료 한도는 모델별·하루 요청 수입니다.
+2026-10-19 워커 2대가 요약으로 Flash-Lite 하루 500번을 다 써 챗봇이 막혔고, 워커는 한도 초과 뒤에도 루프마다 다시 불러 429를 1,293번
+받았습니다. 그래서 세 용도가 DB의 사용량 장부를 함께 씁니다 (V19, 결정 배경은 [docs/decisions.md](docs/decisions.md)).
+
+- **장부** (`llm_usage`): 쿼터 기준 날짜(`SENSING_LLM_QUOTA_TZ`)·모델·용도(`chat`·`enrich`·`recipe`)별 호출 수·429 수·실패 수·토큰.
+  호출 전에 원자적으로 하나 늘리고, 429로 거절된 요청은 호출 수에서 빼 429 수로 옮깁니다.
+- **요약 하루 상한** (`SENSING_ENRICH_DAILY_CALLS`, 기본 300): 워커 여러 대가 합쳐도 넘지 않게 DB에서 예약합니다. 닿으면 그날은 요약을 쉬고
+  (문서를 잠그지도 않는다, 로그는 쉬기 시작할 때 한 번) 다음 날 남은 문서부터 이어 합니다. 레시피·챗봇은 상한 없이 남은 한도를 씁니다.
+- **429 뒤 쉬기** (`llm_cooldown`): 응답의 `quotaId`·`retryDelay`(Claude 등은 `retry-after` 헤더)를 읽어, 하루 한도(`...PerDay...`)면
+  그 모델을 쿼터 기준 다음 자정과 `retryDelay` 중 늦은 쪽까지, 분당 한도 등은 `retryDelay`(없으면 60초)만큼 "쉬는 중"으로 적습니다.
+  그동안 워커는 요약·레시피 호출을 하지 않고(레시피는 휴리스틱으로 등록), 챗봇은 LLM을 부르지 않고 "LLM 하루 사용 한도(무료 등급)를 오늘 다
+  썼습니다. 한국 시간 16:00쯤 풀리니…"를 바로 답합니다 (다른 LLM 오류처럼 안내 답으로 저장되고 다음 턴에 다시 보내지 않는다).
+- **챗봇 전용 모델** (`SENSING_CHAT_LLM_MODEL`, 백엔드): 한도가 모델별이므로 챗봇만 다른 무료 모델로 돌리면 요약과 한도를 따로 씁니다
+  (비우면 `SENSING_LLM_MODEL`과 같다). 쉬는 중 기록도 모델별이라 요약 모델이 쉬어도 챗봇은 답합니다.
+- **운영 지표**: 관리자 → 운영 지표의 "LLM 사용량 (오늘)" 카드에 쉬는 중인 모델과 풀리는 시각, 요약 상한 대비 호출 수, 모델·용도별 호출·429·토큰이 보입니다.
 
 ### 공개 API 소스와 자격 증명 (M2)
 
@@ -355,18 +375,22 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
   ("2번은 어느 언론사야?")의 번호는 앞 답의 근거를 이어 씁니다. 번호는 답마다 1부터입니다.
 - **한 턴의 도구 왕복은 4번까지**(`sensing.chat.max-tool-rounds`), 넘으면 도구 없이(`tool_choice: none`) 지금까지의 결과로 답하게 합니다.
   LLM에는 지난 6턴(`sensing.chat.history-turns`)을 도구 호출·결과와 함께 다시 보여 줍니다 (Gemini 3의 `thought_signature`도 그대로 돌려준다).
-- **LLM 오류는 대화를 깨지 않습니다**: 429(무료 한도 — 하루 한도인지, 몇 초 뒤 다시 할지 구분)·5xx(한 번 재시도)·시간 초과·키 오류·미설정은 알기 쉬운
+- **LLM 오류는 대화를 깨지 않습니다**: 429(무료 한도 — 하루 한도면 풀리는 한국 시간, 분당 한도면 몇 초 뒤인지 안내하고, 풀릴 때까지는 LLM을
+  부르지 않고 바로 안내 — [LLM 무료 한도 나눠 쓰기](#llm-무료-한도-나눠-쓰기-챗봇요약레시피))·5xx(한 번 재시도)·시간 초과·키 오류·미설정은 알기 쉬운
   문장의 답(주의 색)으로 저장되고, 그 턴은 다음 질문 때 LLM에 다시 보내지 않습니다. 같은 대화에 답을 기다리는 중 또 보내면 409.
 - **API 키는 채팅으로 받지 않습니다**: 키가 필요하면 발급처와 관리자 'API 키' 화면을 안내만 합니다. 채팅에 붙여 넣은 키처럼 보이는 값(`sk-`·`AIza` 접두어,
   16진수 32자 이상, `id:secret`, 32자 이상 영숫자 덩어리)은 저장·LLM 전송 전에 가립니다 (대화가 영구 저장되고 외부 LLM에도 가므로 — docs/decisions.md).
 
 백엔드 환경 변수 — 워커와 같은 이름이라 한 곳에서 관리합니다. 로컬은 `scripts/dev/run-backend.ps1`이 `scripts/dev/worker.local.env`의
-`SENSING_LLM_*`·`ANTHROPIC_*` 값만 읽습니다 (이미 설정된 환경 변수가 우선, 키 값은 찍지 않고 `key=set`만 표시).
+`SENSING_LLM_*`·`SENSING_CHAT_*`·`SENSING_ENRICH_DAILY_CALLS`·`ANTHROPIC_*` 값만 읽습니다 (이미 설정된 환경 변수가 우선, 키 값은 찍지 않고 `key=set`만 표시).
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `SENSING_LLM_PROVIDER` | `none` | `none`(챗봇은 "LLM이 설정되지 않았습니다"로 답) \| `openai`(OpenAI 호환 `chat/completions` + tools: Gemini·vLLM·Ollama) \| `anthropic`(Messages API + tools) |
 | `SENSING_LLM_BASE_URL` / `SENSING_LLM_MODEL` / `SENSING_LLM_API_KEY` | (없음) | `openai`: 주소·모델 필수(없으면 미설정으로 둔다), 키는 `Authorization: Bearer` |
+| `SENSING_CHAT_LLM_MODEL` | (없음) | 챗봇만 쓰는 모델. 비우면 `SENSING_LLM_MODEL`. 무료 한도가 모델별이라 다른 무료 모델을 주면 워커 요약과 한도를 따로 쓴다 |
+| `SENSING_LLM_QUOTA_TZ` | `America/Los_Angeles` | 무료 한도의 하루 기준 시간대 (워커와 같은 값). 하루 한도 429 뒤 쉬는 끝 시각과 장부 날짜에 쓴다 |
+| `SENSING_ENRICH_DAILY_CALLS` | `300` | 워커 요약 상한. 백엔드는 운영 지표에 보이는 데만 쓴다 (오늘 워커 기록이 있으면 워커가 남긴 값) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | (없음) / `https://api.anthropic.com` | `anthropic`: 키 필수, 모델은 `SENSING_LLM_MODEL`(기본 `claude-opus-5-5`) |
 | `SENSING_LLM_TIMEOUT` | `60` | 호출 한 번의 제한 시간(초) |
 | `SENSING_LLM_MAX_TOKENS` | `0` | 답 최대 토큰 (0: `openai`는 서버 기본, `anthropic`은 4096) |
