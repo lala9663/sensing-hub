@@ -400,6 +400,17 @@ class ChatIT {
         JsonNode counts = call("viewer", HttpMethod.GET, "/api/v1/documents/sections?site=korea.kr", null).getBody();
         assertThat(counts.path("연설문").asInt()).isEqualTo(4);
         assertThat(counts.has("스포츠")).isFalse();
+
+        // 사이트만 주면(실측: '브리핑 자료'를 묻고 종류를 빼먹었다) 종류를 거르지 않았다는 것과 다시 찾는 방법을 알려 준다
+        LLM.then(toolCall("k4", "search_documents", "{\"site\":\"korea.kr\",\"limit\":2}"))
+                .then(body -> {
+                    JsonNode r = lastTool(body);
+                    assertThat(r.path("documents")).hasSize(2);
+                    assertThat(r.path("note").asText()).contains("종류를 거르지 않은 최신 문서").contains("section");
+                    return text("최근 문서 2건입니다 [1][2]");
+                });
+        send("viewer", s, "정책브리핑 최근 문서 2개");
+        assertThat(LLM.pending()).isZero();
     }
 
     @Test
