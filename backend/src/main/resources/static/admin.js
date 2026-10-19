@@ -232,6 +232,7 @@
           </dl>
           <div class="row mt">${actions.map(a => `<button type="button" class="small ${a === 'exclude' ? 'danger' : ''}" data-action="${a}">${ACTION_LABELS[a]}</button>`).join('')}</div>
         </div>
+        ${kindsPanel(d)}
         <div class="panel">
           <h2>최근 작업</h2>
           ${d.jobs.length ? `<table>
@@ -284,6 +285,14 @@
         App.notice('주기를 워커의 자동 조정에 다시 맡깁니다.');
         await load();
       }));
+      view.querySelectorAll('[data-kind]').forEach(btn => btn.addEventListener('click', () => App.guard(async () => {
+        const k = d.kinds[Number(btn.dataset.kind)];
+        const enabled = !k.enabled;
+        if (!await App.confirm(`기사 종류 '${k.name || k.signature}'을(를) ${enabled ? '켤' : '끌'}까요? 설정 새 버전으로 남고, 다음 수집부터 적용됩니다.`, enabled ? '켜기' : '끄기')) return;
+        await api('PUT', `/sources/${s.id}/kinds`, { signature: k.signature, enabled });
+        App.notice(`기사 종류 '${k.name || k.signature}' ${enabled ? '켬' : '끔'} — 설정 새 버전을 활성화했습니다.`);
+        await load();
+      })));
       view.querySelectorAll('[data-version]').forEach(div => {
         const act = div.querySelector('.activate');
         if (act) act.addEventListener('click', () => App.guard(async () => {
@@ -299,6 +308,41 @@
     }
 
     await App.guard(load);
+
+    /** 활성 설정의 기사 종류(상세 URL 모양) 목록. 예전 설정(종류 목록 없음)은 대표 패턴 하나만 보이고 켜고 끌 수 없다. */
+    function kindsPanel(d) {
+      if (!d.kinds || !d.kinds.length) return '';
+      const on = d.kinds.filter(k => k.enabled).length;
+      return `<div class="panel">
+          <h2>기사 종류</h2>
+          <p class="muted small">${d.kindsEditable
+            ? `${d.kinds.length}개 중 ${on}개를 수집합니다. 켜진 종류마다 자기 허브에서 새 글을 찾고, 한 번 실행의 기사 상한을 종류별로 나눕니다. 켜고 끄면 설정 새 버전으로 남습니다.`
+            : '예전 설정이라 종류 목록이 없습니다. \'다시 탐색\'을 하면 사이트의 기사 종류를 찾아 새 설정 버전을 만듭니다.'}</p>
+          <table>
+            <thead><tr><th>종류</th><th>상태</th><th>주소 모양</th><th class="right">탐색 때 본 주소</th><th>허브</th><th>메모</th><th></th></tr></thead>
+            <tbody>${d.kinds.map((k, i) => `
+              <tr>
+                <td>${esc(k.name || '(이름 없음)')}${i === 0 ? ' <span class="muted small">대표</span>' : ''}</td>
+                <td class="nowrap">${k.enabled ? '<span class="badge badge-green">켜짐</span>' : '<span class="badge badge-grey">꺼짐</span>'}</td>
+                <td class="small mono" style="word-break:break-all">${esc(k.signature || '')}</td>
+                <td class="right">${k.count === null || k.count === undefined ? '-' : App.fmtNum(k.count)}</td>
+                <td class="small mono" style="word-break:break-all">${(k.hubs || []).map(h => `<span title="${esc(h)}">${esc(trim(hubLabel(h), 40))}</span>`).join('<br>')}</td>
+                <td class="small" style="min-width:12em">${esc(k.note || k.quality || '')}</td>
+                <td class="nowrap">${d.kindsEditable ? `<button type="button" class="small" data-kind="${i}">${k.enabled ? '끄기' : '켜기'}</button>` : ''}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+    }
+
+    /** 허브 주소를 짧게: 사이트맵·피드는 파일 이름, 목록 페이지는 경로+쿼리 (전체 주소는 title로). */
+    function hubLabel(url) {
+      try {
+        const u = new URL(url);
+        const name = u.pathname.split('/').pop();
+        return /\.(xml|rss)$/i.test(name) ? name : (u.pathname + u.search) || url;
+      } catch (e) { return url || ''; }
+    }
 
     function pretty(text) {
       try { return JSON.stringify(JSON.parse(text), null, 2); } catch (e) { return text || ''; }

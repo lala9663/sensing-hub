@@ -1,5 +1,6 @@
 package io.sensinghub.registration;
 
+import java.net.URI;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -10,6 +11,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.auth.CurrentUser;
@@ -29,14 +35,16 @@ public class RegistrationService {
     private final AuditLogger audit;
     private final boolean viewerNeedsApproval;
     private final WatchService watches;
+    private final ObjectMapper json;
 
     public RegistrationService(JdbcClient jdbc, AuditLogger audit,
                                @Value("${sensing.registration.viewer-needs-approval}") boolean viewerNeedsApproval,
-                               WatchService watches) {
+                               WatchService watches, ObjectMapper json) {
         this.jdbc = jdbc;
         this.audit = audit;
         this.viewerNeedsApproval = viewerNeedsApproval;
         this.watches = watches;
+        this.json = json;
     }
 
     public enum Channel { WEB, CHAT }
@@ -64,17 +72,37 @@ public class RegistrationService {
         return m.find() ? m.group() : null;
     }
 
+    /**
+     * 같은 도메인의 사이트 소스가 이미 있으면: 홈(/, /index.do …)이거나 소스가 아직 설정 전이면 지금처럼 중복이다. 이미 설정이 있는
+     * 소스에 다른 목록(또는 기사) 주소를 넣으면 중복으로 거절하지 않고 그 소스에 "이 주소의 기사 종류"를 더하는 ONBOARD 작업을 넣는다
+     * (워커가 종류를 추가하거나 꺼져 있던 종류를 켜고 설정 새 버전을 남긴다). 켜진 종류의 허브인 목록은 여기서 바로 중복으로 알린다.
+     */
     @Transactional
     public Registration register(CurrentUser user, String inputUrl, Channel channel) {
         UrlNormalizer.Normalized url = UrlNormalizer.normalize(inputUrl);
 
         Optional<ExistingSource> existing = findOpenSource(url.domain());
         if (existing.isPresent()) {
-            long id = insertRequest(user, inputUrl, url.domain(), channel, "DUPLICATE",
-                    existing.get().status().equals("ACTIVE")
-                            ? "이미 수집 중인 사이트입니다."
-                            : "이미 등록된 사이트입니다 (상태: " + existing.get().status() + ").",
-                    existing.get().id());
+            ExistingSource source = existing.get();
+            String collected = kindRequestable(source, inputUrl) ? enabledKindWithHub(source, inputUrl) : null;
+            if (!kindRequestable(source, inputUrl) || collected != null) {
+                long id = insertRequest(user, inputUrl, url.domain(), channel, "DUPLICATE",
+                        collected != null
+                                ? "이미 수집 중인 목록입니다 (기사 종류 '" + collected + "', 소스 #" + source.id() + ")."
+                                : source.status().equals("ACTIVE")
+                                ? "이미 수집 중인 사이트입니다."
+                                : "이미 등록된 사이트입니다 (상태: " + source.status() + ").",
+                        source.id());
+                return get(id);
+            }
+            if (viewerNeedsApproval && !user.role().atLeast(Role.REGISTRAR)) {
+                long id = insertRequest(user, inputUrl, url.domain(), channel, "AWAITING_APPROVAL",
+                        "등록 요청이 접수되었습니다. 관리자 승인 후 기존 소스에 이 주소의 기사 종류를 더합니다.", null);
+                audit.log(user.id(), "REGISTRATION_REQUESTED", "registration_request", id, null);
+                return get(id);
+            }
+            long id = insertRequest(user, inputUrl, url.domain(), channel, "RECEIVED", null, null);
+            startKindRequest(id, user, source, inputUrl, channel);
             return get(id);
         }
 
@@ -105,10 +133,6 @@ public class RegistrationService {
             return get(requestId);
         }
         UrlNormalizer.Normalized url = UrlNormalizer.normalize(reg.inputUrl());
-        if (findOpenSource(url.domain()).isPresent()) {
-            updateRequest(requestId, "DUPLICATE", null, "그 사이에 다른 요청으로 등록되었습니다.", null);
-            return get(requestId);
-        }
         CurrentUser requester = jdbc.sql("""
                 SELECT u.id, u.login_id, u.name, u.role FROM registration_request r
                 JOIN app_user u ON u.id = r.user_id WHERE r.id = ?
@@ -117,6 +141,20 @@ public class RegistrationService {
                 .query((rs, n) -> new CurrentUser(rs.getLong(1), rs.getString(2), rs.getString(3),
                         Role.valueOf(rs.getString(4))))
                 .single();
+        Optional<ExistingSource> existing = findOpenSource(url.domain());
+        if (existing.isPresent()) {
+            ExistingSource source = existing.get();
+            String collected = kindRequestable(source, reg.inputUrl()) ? enabledKindWithHub(source, reg.inputUrl()) : null;
+            if (!kindRequestable(source, reg.inputUrl()) || collected != null) {
+                updateRequest(requestId, "DUPLICATE", null, collected != null
+                        ? "이미 수집 중인 목록입니다 (기사 종류 '" + collected + "', 소스 #" + source.id() + ")."
+                        : "그 사이에 다른 요청으로 등록되었습니다.", source.id());
+                return get(requestId);
+            }
+            startKindRequest(requestId, requester, source, reg.inputUrl(), Channel.valueOf(reg.channel()));
+            audit.log(admin.id(), "REGISTRATION_APPROVED", "registration_request", requestId, null);
+            return get(requestId);
+        }
         startOnboarding(requestId, requester, url, Channel.valueOf(reg.channel()));
         audit.log(admin.id(), "REGISTRATION_APPROVED", "registration_request", requestId, null);
         return get(requestId);
@@ -190,7 +228,88 @@ public class RegistrationService {
                 "{\"domain\":\"" + url.domain() + "\",\"channel\":\"" + channel + "\"}");
     }
 
-    private record ExistingSource(long id, String status) {
+    /** config: 활성 설정(JSON 문자열). 아직 등록 중이면 null */
+    private record ExistingSource(long id, String status, String config) {
+    }
+
+    /** 기존 소스에 기사 종류를 더하는 작업이 진행 중 작업에 막혀 기다리는 등록 요청의 단계 (스케줄러가 이어서 작업을 넣는다) */
+    public static final String KIND_WAITING = "KIND_WAITING";
+
+    /** 사이트 홈으로 보는 주소 경로 (/, /index.do, /main.do, /kor/ …). 워커 discovery.SITE_ROOT_PATH와 같다 */
+    static final Pattern SITE_ROOT_PATH = Pattern.compile("^/?((ko|kr|kor|en|eng)/?)?((index|main|home|default)(\\.[a-z]+)?)?/?$",
+            Pattern.CASE_INSENSITIVE);
+    /** 추적·쪽수 파라미터 (워커 discovery.TRACKING_PARAM과 같다): 이것만 붙은 홈 주소는 홈이다 */
+    private static final Pattern TRACKING_PARAM = Pattern.compile(
+            "^(utm_.*|fbclid|gclid|ref|referrer|from|sns|share|page|pageindex|pageno|pagenum)$", Pattern.CASE_INSENSITIVE);
+
+    /** 등록 주소가 사이트 홈인가. 해석할 수 없는 주소는 홈으로 본다 (예전처럼 중복 처리). */
+    public static boolean isSiteRoot(String inputUrl) {
+        URI uri;
+        try {
+            uri = URI.create(absoluteUrl(inputUrl));
+        } catch (IllegalArgumentException e) {
+            return true;
+        }
+        if (uri.getRawQuery() != null) {
+            for (String kv : uri.getRawQuery().split("&")) {
+                String key = kv.split("=", 2)[0];
+                if (!key.isEmpty() && !TRACKING_PARAM.matcher(key).matches()) {
+                    return false;
+                }
+            }
+        }
+        String path = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+        return SITE_ROOT_PATH.matcher(path).matches();
+    }
+
+    /** 워커 jobs.absolute_url과 같은 정규화: 앞뒤 공백·#조각을 떼고 scheme이 없으면 https://를 붙인다. */
+    public static String absoluteUrl(String inputUrl) {
+        String u = inputUrl.strip().split("#", 2)[0];
+        return u.contains("://") ? u : "https://" + u;
+    }
+
+    /** 기존 소스에 기사 종류를 더할 수 있는 요청인가: 홈이 아닌 주소이고, 소스가 설정을 가진 채 수집·일시정지·중단 상태. */
+    private static boolean kindRequestable(ExistingSource source, String inputUrl) {
+        return source.config() != null && List.of("ACTIVE", "PAUSED", "BROKEN").contains(source.status())
+                && !isSiteRoot(inputUrl);
+    }
+
+    /** 이 목록 주소가 이미 켜진 기사 종류의 허브면 그 종류 이름 (이름이 없으면 서명), 아니면 null. */
+    private String enabledKindWithHub(ExistingSource source, String inputUrl) {
+        String url = absoluteUrl(inputUrl);
+        try {
+            for (JsonNode kind : json.readTree(source.config()).path("article_patterns")) {
+                if (!kind.path("enabled").asBoolean(true)) {
+                    continue;
+                }
+                for (JsonNode hub : kind.path("hubs")) {
+                    if (url.equals(hub.asText())) {
+                        return kind.hasNonNull("name") ? kind.get("name").asText() : kind.path("signature").asText();
+                    }
+                }
+            }
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * 기존 소스에 "이 주소의 기사 종류"를 더하는 ONBOARD 작업을 넣는다 (워커가 등록 요청의 주소를 보고 종류를 추가·켜기·중복 판정).
+     * 소스에 대기·실행 중인 작업이 있으면 요청은 {@link #KIND_WAITING}으로 남고, 그 작업이 끝나면 스케줄러가 작업을 넣는다.
+     */
+    private void startKindRequest(long requestId, CurrentUser requester, ExistingSource source, String inputUrl,
+                                  Channel channel) {
+        int inserted = jdbc.sql("""
+                INSERT INTO crawl_job (source_id, job_type, config_version_id, trigger)
+                SELECT id, 'ONBOARD', active_config_version_id, ? FROM source WHERE id = ?
+                ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
+                """).params(channel == Channel.CHAT ? "CHAT" : "REGISTRATION", source.id()).update();
+        updateRequest(requestId, "PROCESSING", inserted > 0 ? "QUEUED" : KIND_WAITING,
+                "기존 소스 #" + source.id() + "에 이 주소의 기사 종류를 더하는 중입니다."
+                        + (inserted > 0 ? "" : " 진행 중인 수집이 끝나면 이어서 합니다."), source.id());
+        ObjectNode detail = json.createObjectNode().put("registrationId", requestId).put("inputUrl", inputUrl.strip());
+        audit.log(requester.id(), "SOURCE_KIND_REQUESTED", "source", source.id(), detail.toString());
     }
 
     private boolean isWatch(long sourceId) {
@@ -201,12 +320,13 @@ public class RegistrationService {
     /** 같은 도메인의 사이트 소스. 키워드 감시(kind WATCH)는 제공자 도메인을 공유하므로 중복 판정에서 뺀다. */
     private Optional<ExistingSource> findOpenSource(String domain) {
         return jdbc.sql("""
-                SELECT s.id, s.status FROM source s JOIN site t ON t.id = s.site_id
+                SELECT s.id, s.status, v.config::text FROM source s JOIN site t ON t.id = s.site_id
+                LEFT JOIN source_config_version v ON v.id = s.active_config_version_id
                 WHERE t.domain = ? AND s.kind = 'SITE' AND s.status <> 'EXCLUDED'
                 ORDER BY s.id LIMIT 1
                 """)
                 .param(domain)
-                .query((rs, n) -> new ExistingSource(rs.getLong(1), rs.getString(2)))
+                .query((rs, n) -> new ExistingSource(rs.getLong(1), rs.getString(2), rs.getString(3)))
                 .optional();
     }
 

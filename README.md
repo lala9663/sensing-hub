@@ -86,7 +86,7 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 다이제스트 | 구독 목록, 생성(채널·대상·시각·필터 체크), 미리보기(HTML), 지금 보내기, 보낸 기록 |
 | 챗봇 | 내 대화 목록(지우기), 질문 입력(Enter 보내기·Shift+Enter 줄바꿈, 예시 질문), "생각 중" 표시, 답의 `[n]` → 근거 목록(원문 링크·이슈 화면), 사용한 도구와 화면 바로 가기. 아래 "챗봇" |
 | 관리자 · 처리 대기 큐 | 종류별 건수, 항목별 사유·메시지·대기 시간과 가능한 조치만(승인 / 반려 사유 / API 키 등록 / 재점검 / 다시 탐색 / 일시정지 / 제외) |
-| 관리자 · 소스 | 상태별 건수 필터, 건강 상태 탭(지연 소스 강조), 소스 상세(작업·오류·설정 버전 활성화·수집 주기 잠금) |
+| 관리자 · 소스 | 상태별 건수 필터, 건강 상태 탭(지연 소스 강조), 소스 상세(기사 종류 목록과 켜고 끄기 — 설정 새 버전, 작업·오류·설정 버전 활성화·수집 주기 잠금) |
 | 관리자 · 운영 지표 | `/ops/overview`를 카드로(소스 상태·큐 적체·워커 부족 경고·24시간 결과·수집량 상위·실패 코드), 30초마다 갱신 |
 | 관리자 · API 키 | 제공자(dart · naver_news · data_go_kr)·키·메모 등록, 다시 진행된 소스 수 표시, 목록(비밀 없음)·삭제 |
 | 관리자 · 케이던시아 연동 | 연결 주소·목업 표시·마지막 동기화 결과(공급사·생성·갱신·보관·그대로)·이벤트 전달 대기/보낸 수 카드, 지금 동기화 / 지금 전달, 동기화 실행 기록, (데모 전용) 케이던시아가 받은 이벤트 |
@@ -96,6 +96,16 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `SENSING_TLS_COMPAT` | `true` | TLS 핸드셰이크가 실패한 호스트를 호환 컨텍스트(`DEFAULT:@SECLEVEL=1`, TLS 1.2 이상, legacy renegotiation 허용, 인증서 검증은 유지)로 한 번 더 시도하고 성공하면 그 호스트는 계속 호환 설정으로 접속한다. RSA 키 교환만 지원하는 공공기관 사이트(예: 용인시)에 필요. 인증서 검증 실패는 재시도하지 않는다 |
+
+### 워커 환경 변수 (기사 종류)
+
+사이트 하나에 상세 주소 모양이 다른 기사 종류가 여럿이면(정책브리핑의 보도자료·정책뉴스·연설문 등) 등록 때 종류마다 품질 검사를 해
+켜고, 수집 때 종류별로 상한을 나눈다 ([docs/how-collection-works.md](docs/how-collection-works.md) 4-1절).
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_MAX_KINDS` | `7` | 등록 때 켜 둘 기사 종류 수 상한 (대표 종류 포함). 넘치는 종류는 꺼진 채 목록에 남아 관리자가 켤 수 있다 |
+| `SENSING_MAX_KIND_CHECKS` | `8` | 대표 종류 말고 품질 검사할 종류 후보 수 상한 (후보 하나에 표본 5건 요청). `0`이면 종류를 늘리지 않는다 |
 
 ### 워커 환경 변수 (LLM 레시피)
 
@@ -353,7 +363,7 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
 
 ```bash
-# 사이트 등록 (기사 주소를 넣어도 도메인으로 등록)
+# 사이트 등록 (기사 주소를 넣어도 도메인으로 등록. 목록 주소를 넣으면 그 목록의 기사 종류만 켜고, 이미 수집 중인 도메인이면 기존 소스에 그 종류를 더한다)
 curl -X POST localhost:8080/api/v1/registrations -H 'X-User: registrar' \
      -H 'Content-Type: application/json' -d '{"url":"https://news.example.com/news/articleView.html?idxno=1"}'
 
@@ -395,6 +405,7 @@ curl localhost:8080/api/v1/sources/1 -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/sources/1/actions/recheck -H 'X-User: admin'   # pause|resume|run|recheck|rediscover|exclude
 curl -X POST localhost:8080/api/v1/sources/1/configs/2/activate -H 'X-User: admin'  # 설정 버전 롤백
 curl -X PUT localhost:8080/api/v1/sources/1 -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"intervalMinutes":120}'   # 사람이 정한 주기는 잠겨(intervalLocked) 워커의 자동 조정이 덮지 않는다
+curl -X PUT localhost:8080/api/v1/sources/1/kinds -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"signature":"/news/policyNewsView.do?newsId={n}","enabled":false}'   # 기사 종류 켜고 끄기 = 설정 새 버전 (상세의 kinds·kindsEditable)
 
 # 관리자: 처리 대기 큐 (승인 대기 → API_KEY → REVIEW → BROKEN → BLOCKED, 오래 기다린 순). kind로 거를 수 있다
 curl localhost:8080/api/v1/review-queue -H 'X-User: admin'
@@ -418,7 +429,7 @@ backend/   Spring Boot 3 (Java 17), Flyway 스키마: src/main/resources/db/migr
 worker/    Python 수집 워커
   src/sensing_worker/
     fetcher.py    수집 하네스 HTTP 계층: 간격·robots·재시도·차단 분류·내부망 차단
-    discovery.py  자동 탐색: RSS → 사이트맵 → 링크 패턴 (CMS 패턴 라이브러리)
+    discovery.py  자동 탐색: RSS → 사이트맵 → 링크 패턴 (CMS 패턴 라이브러리), 사이트 하나의 기사 종류 여러 개
     recipe.py     LLM 레시피: 홈·샘플 페이지 → 허브·서명·셀렉터 JSON → 검증 → 품질 검사
     llm.py        LLM 클라이언트 (Claude · OpenAI 호환 · 없음), JSON 꺼내기·스키마 검증·재요청
     extract.py    기사 추출: og/article/JSON-LD 메타 + 본문 + 첨부 링크 (설정 selectors 우선)
@@ -474,6 +485,10 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 언론사 자동 확장, 운영 지표, 그리고 이 모든 것을 다루는 브라우저 화면. 실측: 표본 10곳 중 9곳 자동 등록(10-19 재측정 10/10),
 주간지 8곳 중 6곳 자동 등록(REVIEW였던 한겨레21·주간한국은 10-19 규칙 보강 뒤 자동 등록), 뉴스스탠드 → 언론사 50곳 자동 등록.
 LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 문서 7,967건 전체를 실패 없이 처리(위 "워커 환경 변수 (LLM 레시피)").
+사이트 하나에 기사 종류(상세 주소 모양) 여러 개(10-19): 정책브리핑은 보도자료만 모이던 것을 다시 탐색하면 종류 19개 중 7개(보도자료·정책뉴스·
+사실은 이렇습니다·부처 브리핑·국민이 말하는 정책·연설문·청와대 브리핑)를 켜고 실행당 상한을 종류별로 나눠 수집한다(상세에 발행일이 없는 부처 브리핑은 사이트맵 lastmod로 날짜를 단다). 관리자 소스 상세에서 종류를 켜고 끈다.
+등록 주소가 목록이면 그 목록의 종류만 켜고, 이미 수집 중인 도메인에 다른 목록 주소를 넣으면 중복 대신 기존 소스에 그 종류를 더하며(설정 새 버전),
+공공기관 게시판은 게시판 파라미터(bbsId 등) 값마다 종류로 나눈다.
 수집 원리는 [docs/how-collection-works.md](docs/how-collection-works.md).
 
 **진행 중 (10-19)** — 각각 별도 브랜치에서 작업하고 끝나면 main에 합친다.
@@ -490,7 +505,8 @@ LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 
 1. M3 마무리: DART 재무 신호(FINANCIAL), 회사별 다이제스트 구독 화면, 실제 케이던시아 API 연결(SDS가 API를 주면 base-url·매핑 교체).
 2. 관리자 확인으로 가는 사이트 줄이기: ~~한겨레21·주간한국~~ 10-19 일반 규칙으로 해결(비표준 발행일 메타·구분자 없는 날짜, 꼬리 날짜 무시,
    본문을 품은 `<header>` 보존, `[부고]` 단신 표본 제외 — `docs/how-collection-works.md` 4절). 남은 것: 규칙이 못 잡는 다음 사례가
-   나오면 LLM 레시피로 붙이는 실측(Gemini 무료 키로 가능).
+   나오면 LLM 레시피로 붙이는 실측(Gemini 무료 키로 가능). 운영 정책브리핑 소스(id 1)는 관리자 '다시 탐색'으로 기사 종류 설정을 받아야 하고,
+   부처 브리핑(`policyBriefingView`)은 상세에 발행일이 없지만 10-19부터 사이트맵 lastmod를 마지막 날짜 힌트로 써서 켜진다. 켜는 종류 상한 기본값도 6→7로 올려 청와대 브리핑까지 켠다.
 3. M4 동적·첨부: Playwright 동적 수집, HWP/PDF 첨부 텍스트 추출(공공기관 보도자료 본문), 원문 삭제 감지, (합의 시) 회사 계정 로그인 수집.
 4. M5 검색·챗봇: 대화 요약(`chat_session.summary`)·답 피드백(`chat_feedback`), 운영 데이터 임베딩(무료 등급은 분당 100개·하루 한도라 유료 등급 또는
    사내 임베딩 모델 결정 필요), 화면 문서 검색에도 하이브리드를 쓸지 (전문 검색 색인과 이슈 묶기, 챗봇 1단계, 2단계 의미 검색은 2026-10-19 완료).

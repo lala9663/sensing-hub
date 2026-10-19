@@ -23,6 +23,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.credential.ApiCredentialService;
+import io.sensinghub.registration.RegistrationService;
 import io.sensinghub.scheduler.CrawlScheduler;
 import io.sensinghub.watch.WatchService;
 
@@ -523,6 +524,166 @@ class RegistrationFlowIT {
         // 같은 도메인을 다시 등록하면 중복으로 안내
         ResponseEntity<String> dup = post("viewer", "/api/v1/registrations", "{\"url\":\"daily.hankooki.com\"}");
         assertThat(dup.getBody()).contains("\"status\":\"DUPLICATE\"");
+    }
+
+    /** 워커가 등록·다시 탐색으로 만든 설정 버전을 흉내 낸다. */
+    private void workerConfig(long sourceId, int version, String config) {
+        jdbc.sql("UPDATE source_config_version SET status = 'RETIRED' WHERE source_id = ? AND status = 'ACTIVE'")
+                .param(sourceId).update();
+        long configId = jdbc.sql("""
+                INSERT INTO source_config_version (source_id, version, config, status, change_note)
+                VALUES (?, ?, CAST(? AS jsonb), 'ACTIVE', '자동 탐색으로 생성') RETURNING id
+                """).params(sourceId, version, config).query(Long.class).single();
+        jdbc.sql("UPDATE source SET active_config_version_id = ?, status = 'ACTIVE', method = 'SITEMAP' WHERE id = ?")
+                .params(configId, sourceId).update();
+    }
+
+    private static String kind(String name, String path, boolean enabled, String note) {
+        return "{\"name\":\"" + name + "\",\"signature\":\"" + path + "?newsId={n}\",\"path\":\"^" + path.replace(".", "\\\\.")
+                + "$\",\"query_keys\":[\"newsId\"],\"id_keys\":[\"newsId\"],\"hubs\":[\"https://www.korea.kr/sitemap_x.xml\"],"
+                + "\"enabled\":" + enabled + ",\"count\":100,\"quality\":" + (enabled ? "\"샘플 5건 중 5건 통과\"" : "null")
+                + ",\"note\":" + (note == null ? "null" : "\"" + note + "\"") + "}";
+    }
+
+    @Test
+    void adminSeesArticleKindsAndTogglesThemAsNewConfigVersions() {
+        post("registrar", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr\"}");
+        long sourceId = jdbc.sql("SELECT id FROM source").query(Long.class).single();
+        String press = "/briefing/pressReleaseView.do?newsId={n}";
+        String legacy = "{\"method\":\"SITEMAP\",\"hubs\":[\"https://www.korea.kr/sitemapindex.xml\"],"
+                + "\"article_pattern\":{\"signature\":\"" + press + "\",\"path\":\"^/briefing/pressReleaseView\\\\.do$\"}}";
+        workerConfig(sourceId, 1, legacy);
+
+        // 예전 설정(종류 목록 없음): 대표 패턴 하나를 보여 주고 켜고 끌 수는 없다 ('다시 탐색' 안내)
+        JsonNode d = get("admin", "/api/v1/sources/" + sourceId);
+        assertThat(d.get("kindsEditable").asBoolean()).isFalse();
+        assertThat(d.get("kinds")).hasSize(1);
+        assertThat(d.get("kinds").get(0).get("signature").asText()).isEqualTo(press);
+        assertThat(d.get("kinds").get(0).get("note").asText()).contains("다시 탐색");
+        assertThat(put("admin", "/api/v1/sources/" + sourceId + "/kinds", "{\"signature\":\"" + press + "\",\"enabled\":false}")
+                .getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        // 다시 탐색이 만든 설정 (워커): 종류 3개, 카툰은 기본 꺼짐
+        workerConfig(sourceId, 2, "{\"method\":\"SITEMAP\",\"hubs\":[\"https://www.korea.kr/sitemapindex.xml\"],"
+                + "\"article_pattern\":{\"signature\":\"" + press + "\"},\"article_patterns\":["
+                + kind("보도자료", "/briefing/pressReleaseView.do", true, null) + ","
+                + kind("정책뉴스", "/news/policyNewsView.do", true, null) + ","
+                + kind("cartoon", "/multi/cartoonView.do", false, "기사가 아닌 종류로 보여 기본으로 끕니다.") + "]}");
+        d = get("admin", "/api/v1/sources/" + sourceId);
+        assertThat(d.get("kindsEditable").asBoolean()).isTrue();
+        assertThat(d.get("kinds")).hasSize(3);
+        assertThat(d.get("kinds").get(1).get("name").asText()).isEqualTo("정책뉴스");
+        assertThat(d.get("kinds").get(1).get("hubs").get(0).asText()).endsWith("/sitemap_x.xml");
+        assertThat(d.get("kinds").get(2).get("enabled").asBoolean()).isFalse();
+        assertThat(d.get("kinds").get(2).get("count").asInt()).isEqualTo(100);
+
+        String policy = "/news/policyNewsView.do?newsId={n}";
+        String cartoon = "/multi/cartoonView.do?newsId={n}";
+        String kindsPath = "/api/v1/sources/" + sourceId + "/kinds";
+        assertThat(put("registrar", kindsPath, "{\"signature\":\"" + policy + "\",\"enabled\":false}").getStatusCode())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(put("admin", kindsPath, "{\"signature\":\"/nope?x={n}\",\"enabled\":false}").getStatusCode())
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(put("admin", kindsPath, "{\"enabled\":false}").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+
+        // 끄기 → 설정 v3 (v2는 RETIRED)
+        ResponseEntity<String> off = put("admin", kindsPath, "{\"signature\":\"" + policy + "\",\"enabled\":false}");
+        assertThat(off.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(off.getBody()).contains("\"configVersion\":3").contains("관리자가 끔");
+        assertThat(jdbc.sql("SELECT string_agg(version || ':' || status, ',' ORDER BY version) FROM source_config_version "
+                + "WHERE source_id = ?").param(sourceId).query(String.class).single()).isEqualTo("1:RETIRED,2:RETIRED,3:ACTIVE");
+        assertThat(jdbc.sql("SELECT change_note || '|' || (config->'article_patterns'->1->>'enabled') "
+                + "FROM source_config_version WHERE source_id = ? AND version = 3")
+                .param(sourceId).query(String.class).single()).isEqualTo("기사 종류 '정책뉴스' 끔 (관리자)|false");
+        // 같은 상태로 다시 보내면 새 버전을 만들지 않는다
+        put("admin", kindsPath, "{\"signature\":\"" + policy + "\",\"enabled\":false}");
+        assertThat(jdbc.sql("SELECT max(version) FROM source_config_version WHERE source_id = ?").param(sourceId)
+                .query(Integer.class).single()).isEqualTo(3);
+        // 마지막 켜진 종류는 끌 수 없다
+        assertThat(put("admin", kindsPath, "{\"signature\":\"" + press + "\",\"enabled\":false}").getStatusCode())
+                .isEqualTo(HttpStatus.CONFLICT);
+        // 기본 꺼짐 종류를 켜면 v4, 자동 이유는 auto_note로
+        ResponseEntity<String> on = put("admin", kindsPath, "{\"signature\":\"" + cartoon + "\",\"enabled\":true}");
+        assertThat(on.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(jdbc.sql("SELECT (config->'article_patterns'->2->>'enabled') || '|' || (config->'article_patterns'->2->>'note')"
+                + " || '|' || (config->'article_patterns'->2->>'auto_note') FROM source_config_version WHERE source_id = ? "
+                + "AND version = 4").param(sourceId).query(String.class).single())
+                .isEqualTo("true|관리자가 켬|기사가 아닌 종류로 보여 기본으로 끕니다.");
+        assertThat(jdbc.sql("SELECT string_agg(action, ',' ORDER BY id) FROM audit_log WHERE target_id = ?").param(sourceId)
+                .query(String.class).single()).contains("SOURCE_KIND_DISABLED").contains("SOURCE_KIND_ENABLED");
+        // 롤백은 기존 설정 버전 활성화로
+        assertThat(post("admin", "/api/v1/sources/" + sourceId + "/configs/2/activate", "").getBody())
+                .contains("\"configVersion\":2");
+        assertThat(get("admin", "/api/v1/sources/" + sourceId).get("kinds").get(1).get("enabled").asBoolean()).isTrue();
+    }
+
+    @Test
+    void listUrlForCollectedSiteBecomesKindRequestInsteadOfDuplicate() {
+        post("registrar", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr\"}");
+        long sourceId = jdbc.sql("SELECT id FROM source").query(Long.class).single();
+        // 아직 등록 중(설정 없음)이면 다른 목록 주소도 지금처럼 중복이다
+        assertThat(post("registrar", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr/news/policyNewsList.do\"}")
+                .getBody()).contains("\"status\":\"DUPLICATE\"");
+        // 워커가 등록을 끝냈다고 친다: 보도자료(허브에 목록 주소) 켜짐, 정책뉴스 꺼짐
+        jdbc.sql("UPDATE crawl_job SET status = 'SUCCESS' WHERE source_id = ?").param(sourceId).update();
+        jdbc.sql("UPDATE registration_request SET status = 'COMPLETED' WHERE source_id = ? AND status = 'PROCESSING'")
+                .param(sourceId).update();
+        workerConfig(sourceId, 1, "{\"method\":\"SITEMAP\",\"hubs\":[\"https://www.korea.kr/sitemap_brief.xml\"],"
+                + "\"article_pattern\":{\"signature\":\"/briefing/pressReleaseView.do?newsId={n}\"},\"article_patterns\":["
+                + kind("보도자료", "/briefing/pressReleaseView.do", true, null).replace("https://www.korea.kr/sitemap_x.xml",
+                        "https://www.korea.kr/sitemap_brief.xml\",\"https://www.korea.kr/briefing/pressReleaseList.do") + ","
+                + kind("정책뉴스", "/news/policyNewsView.do", false, "종류가 많아 상위 6개만 켭니다") + "]}");
+
+        // 홈은 그대로 중복, 켜진 종류의 허브인 목록도 바로 중복으로 알린다
+        assertThat(post("registrar", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr/main.do\"}").getBody())
+                .contains("\"status\":\"DUPLICATE\"").contains("이미 수집 중인 사이트입니다.");
+        assertThat(post("registrar", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr/briefing/pressReleaseList.do\"}")
+                .getBody()).contains("\"status\":\"DUPLICATE\"").contains("이미 수집 중인 목록입니다 (기사 종류 '보도자료', 소스 #" + sourceId);
+
+        // 다른 목록 주소 → 기존 소스에 기사 종류를 더하는 ONBOARD 작업 (워커가 종류를 켜거나 추가하고 결과를 요청에 적는다)
+        ResponseEntity<String> res = post("registrar", "/api/v1/registrations",
+                "{\"url\":\"https://www.korea.kr/news/policyNewsList.do\"}");
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(res.getBody()).contains("\"status\":\"PROCESSING\"").contains("\"sourceId\":" + sourceId)
+                .contains("기존 소스 #" + sourceId + "에 이 주소의 기사 종류를 더하는 중입니다.");
+        assertThat(jdbc.sql("SELECT job_type || '|' || trigger || '|' || status FROM crawl_job WHERE source_id = ? "
+                + "ORDER BY id DESC LIMIT 1").param(sourceId).query(String.class).single()).isEqualTo("ONBOARD|REGISTRATION|QUEUED");
+        assertThat(jdbc.sql("SELECT count(*) FROM source").query(Long.class).single()).isEqualTo(1L);   // 새 소스는 없다
+
+        // 그 사이 작업이 돌고 있으면 기다렸다가 스케줄러가 이어서 넣는다
+        jdbc.sql("UPDATE crawl_job SET status = 'RUNNING' WHERE source_id = ? AND status = 'QUEUED'").param(sourceId).update();
+        assertThat(post("registrar", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr/briefing/speechList.do\"}")
+                .getBody()).contains("진행 중인 수집이 끝나면 이어서 합니다.");
+        assertThat(jdbc.sql("SELECT step FROM registration_request ORDER BY id DESC LIMIT 1").query(String.class).single())
+                .isEqualTo(RegistrationService.KIND_WAITING);
+        CrawlScheduler scheduler = new CrawlScheduler(jdbc);
+        assertThat(scheduler.enqueueWaitingKindRequests()).isZero();
+        jdbc.sql("UPDATE crawl_job SET status = 'SUCCESS' WHERE source_id = ?").param(sourceId).update();
+        assertThat(scheduler.enqueueWaitingKindRequests()).isEqualTo(1);
+        assertThat(jdbc.sql("SELECT step FROM registration_request ORDER BY id DESC LIMIT 1").query(String.class).single())
+                .isEqualTo("QUEUED");
+        assertThat(scheduler.enqueueWaitingKindRequests()).isZero();
+
+        // VIEWER 요청은 승인 뒤 같은 길로 간다
+        jdbc.sql("UPDATE crawl_job SET status = 'SUCCESS' WHERE source_id = ?").param(sourceId).update();
+        String waiting = post("viewer", "/api/v1/registrations", "{\"url\":\"https://www.korea.kr/briefing/actuallyList.do\"}").getBody();
+        assertThat(waiting).contains("\"status\":\"AWAITING_APPROVAL\"");
+        long requestId = jdbc.sql("SELECT max(id) FROM registration_request").query(Long.class).single();
+        assertThat(post("admin", "/api/v1/registrations/" + requestId + "/approve", "").getBody())
+                .contains("\"status\":\"PROCESSING\"").contains("\"sourceId\":" + sourceId);
+        assertThat(jdbc.sql("SELECT string_agg(action, ',' ORDER BY id) FROM audit_log").query(String.class).single())
+                .contains("SOURCE_KIND_REQUESTED");
+    }
+
+    @Test
+    void siteRootRuleMatchesTheWorker() {
+        assertThat(RegistrationService.isSiteRoot("https://www.korea.kr/")).isTrue();
+        assertThat(RegistrationService.isSiteRoot("korea.kr")).isTrue();
+        assertThat(RegistrationService.isSiteRoot("https://x.go.kr/kor/main.do")).isTrue();
+        assertThat(RegistrationService.isSiteRoot("https://x.kr/index.html?utm_source=news")).isTrue();
+        assertThat(RegistrationService.isSiteRoot("https://www.korea.kr/news/policyNewsList.do")).isFalse();
+        assertThat(RegistrationService.isSiteRoot("https://x.go.kr/?bbsId=B01")).isFalse();
+        assertThat(RegistrationService.absoluteUrl(" www.korea.kr/news/a.do#top ")).isEqualTo("https://www.korea.kr/news/a.do");
     }
 
     @Test

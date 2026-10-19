@@ -1,6 +1,7 @@
 package io.sensinghub.source;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -8,21 +9,29 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
 import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
 
-/** 관리자 화면: 소스 목록·상세·운영 조치. */
+/** 관리자 화면: 소스 목록·상세·운영 조치·기사 종류 켜고 끄기. */
 @Service
 public class SourceService {
 
     private final JdbcClient jdbc;
     private final AuditLogger audit;
+    private final ObjectMapper json;
 
-    public SourceService(JdbcClient jdbc, AuditLogger audit) {
+    public SourceService(JdbcClient jdbc, AuditLogger audit, ObjectMapper json) {
         this.jdbc = jdbc;
         this.audit = audit;
+        this.json = json;
     }
 
     /**
@@ -51,8 +60,20 @@ public class SourceService {
                             OffsetDateTime createdAt) {
     }
 
+    /**
+     * 활성 설정의 기사 종류(상세 URL 모양) 하나. 워커가 등록·다시 탐색 때 설정 article_patterns에 적는다.
+     * count: 탐색 때 보인 서로 다른 주소 수, quality: 품질 검사 설명, note: 꺼진 이유나 관리자 변경.
+     */
+    public record KindRow(String name, String signature, List<String> hubs, boolean enabled, Integer count,
+                          String quality, String note) {
+    }
+
+    /**
+     * kinds: 활성 설정의 기사 종류. 종류 목록이 없는 예전 설정이면 article_pattern 하나를 이름 없이 보여 주고
+     * kindsEditable = false (켜고 끄려면 '다시 탐색'으로 종류를 잡는다).
+     */
     public record SourceDetail(SourceSummary source, List<JobRow> jobs, List<ErrorRow> recentErrors,
-                               List<ConfigRow> configs) {
+                               List<ConfigRow> configs, List<KindRow> kinds, boolean kindsEditable) {
     }
 
     private static final String SUMMARY_SQL = """
@@ -108,7 +129,124 @@ public class SourceService {
                 FROM source_config_version WHERE source_id = ? ORDER BY version DESC
                 """).param(id).query((rs, n) -> new ConfigRow(rs.getLong(1), rs.getInt(2), rs.getString(3),
                         rs.getString(4), rs.getString(5), rs.getObject(6, OffsetDateTime.class))).list();
-        return new SourceDetail(summary, jobs, errors, configs);
+        JsonNode active = configs.stream().filter(c -> "ACTIVE".equals(c.status())).findFirst()
+                .map(c -> readJson(c.config())).orElse(null);
+        return new SourceDetail(summary, jobs, errors, configs, kindsOf(active), kindArray(active) != null);
+    }
+
+    /** 설정의 기사 종류. article_patterns가 없는 예전 설정(또는 키워드 감시·API 설정)은 article_pattern 하나 또는 빈 목록. */
+    static List<KindRow> kindsOf(JsonNode config) {
+        if (config == null) {
+            return List.of();
+        }
+        ArrayNode kinds = kindArray(config);
+        if (kinds != null) {
+            List<KindRow> rows = new ArrayList<>();
+            for (JsonNode k : kinds) {
+                rows.add(new KindRow(text(k, "name"), signatureOf(k), strings(k.path("hubs")),
+                        k.path("enabled").asBoolean(true), k.hasNonNull("count") ? k.get("count").asInt() : null,
+                        text(k, "quality"), text(k, "note")));
+            }
+            return rows;
+        }
+        JsonNode single = config.path("article_pattern");
+        if (!single.isObject()) {
+            return List.of();
+        }
+        return List.of(new KindRow(null, signatureOf(single), strings(config.path("hubs")), true, null, null,
+                "예전 설정이라 종류 목록이 없습니다. '다시 탐색'을 하면 사이트의 기사 종류를 찾아 새 설정 버전을 만듭니다."));
+    }
+
+    private static ArrayNode kindArray(JsonNode config) {
+        JsonNode kinds = config == null ? null : config.get("article_patterns");
+        return kinds instanceof ArrayNode array && !array.isEmpty() ? array : null;
+    }
+
+    private static String signatureOf(JsonNode pattern) {
+        return pattern.hasNonNull("signature") ? pattern.get("signature").asText() : text(pattern, "path");
+    }
+
+    private static String text(JsonNode node, String field) {
+        return node.hasNonNull(field) ? node.get(field).asText() : null;
+    }
+
+    private static List<String> strings(JsonNode array) {
+        List<String> out = new ArrayList<>();
+        array.forEach(n -> out.add(n.asText()));
+        return out;
+    }
+
+    private JsonNode readJson(String text) {
+        try {
+            return text == null ? null : json.readTree(text);
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 기사 종류 켜고 끄기 (ADMIN). 활성 설정을 복사해 그 종류의 enabled만 바꾼 새 설정 버전을 활성화한다 (이전 버전은 RETIRED,
+     * 롤백은 설정 버전 활성화로). 워커는 다음 수집부터 켜진 종류만 모은다. 종류는 서명(signature)으로 고른다.
+     * 처음 자동으로 정해진 이유(note)는 auto_note로 옮기고 note에 관리자 변경을 적는다. 켜진 종류가 하나도 없게는 못 한다.
+     */
+    @Transactional
+    public SourceDetail setKindEnabled(CurrentUser user, long id, String signature, boolean enabled) {
+        user.require(Role.ADMIN);
+        List<Map<String, Object>> rows = jdbc.sql("""
+                SELECT s.kind, v.config::text AS config FROM source s
+                LEFT JOIN source_config_version v ON v.id = s.active_config_version_id
+                WHERE s.id = ? FOR UPDATE OF s
+                """).param(id).query().listOfRows();
+        if (rows.isEmpty()) {
+            throw ApiException.notFound("소스");
+        }
+        Map<String, Object> row = rows.get(0);
+        JsonNode config = readJson((String) row.get("config"));
+        ArrayNode kinds = kindArray(config);
+        if (!"SITE".equals(row.get("kind")) || kinds == null) {
+            throw ApiException.conflict("이 소스의 설정에는 기사 종류 목록이 없습니다. '다시 탐색'을 하면 기사 종류를 찾습니다.");
+        }
+        ObjectNode target = null;
+        int enabledCount = 0;
+        for (JsonNode k : kinds) {
+            if (k.path("enabled").asBoolean(true)) {
+                enabledCount++;
+            }
+            if (signature.equals(signatureOf(k))) {
+                target = (ObjectNode) k;
+            }
+        }
+        if (target == null) {
+            throw ApiException.notFound("기사 종류");
+        }
+        if (target.path("enabled").asBoolean(true) == enabled) {
+            return detail(user, id);
+        }
+        if (!enabled && enabledCount <= 1) {
+            throw ApiException.conflict("켜진 기사 종류가 하나는 있어야 합니다.");
+        }
+        if (!target.has("auto_note")) {
+            target.put("auto_note", text(target, "note"));
+        }
+        target.put("enabled", enabled);
+        target.put("note", enabled ? "관리자가 켬" : "관리자가 끔");
+        String name = target.hasNonNull("name") ? target.get("name").asText() : signature;
+        int version = jdbc.sql("SELECT COALESCE(MAX(version), 0) + 1 FROM source_config_version WHERE source_id = ?")
+                .param(id).query(Integer.class).single();
+        jdbc.sql("UPDATE source_config_version SET status = 'RETIRED' WHERE source_id = ? AND status = 'ACTIVE'")
+                .param(id).update();
+        long configId = jdbc.sql("""
+                INSERT INTO source_config_version (source_id, version, config, status, change_note, created_by)
+                VALUES (?, ?, CAST(? AS jsonb), 'ACTIVE', ?, ?) RETURNING id
+                """).params(id, version, config.toString(),
+                        "기사 종류 '" + name + "' " + (enabled ? "켬" : "끔") + " (관리자)", user.id())
+                .query(Long.class).single();
+        jdbc.sql("UPDATE source SET active_config_version_id = ?, updated_at = now() WHERE id = ?")
+                .params(configId, id).update();
+        ObjectNode detail = json.createObjectNode().put("signature", signature).put("name", name)
+                .put("enabled", enabled).put("version", version);
+        audit.log(user.id(), enabled ? "SOURCE_KIND_ENABLED" : "SOURCE_KIND_DISABLED", "source", id, detail.toString());
+        return detail(user, id);
     }
 
     public enum Action { PAUSE, RESUME, RUN, RECHECK, REDISCOVER, EXCLUDE }
