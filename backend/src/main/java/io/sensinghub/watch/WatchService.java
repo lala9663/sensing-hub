@@ -21,6 +21,7 @@ import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
+import io.sensinghub.registration.RegistrationService;
 
 /**
  * 키워드 감시 (M2). 현업은 사이트가 아니라 키워드(자사·경쟁사·이슈) 단위로 보도를 본다.
@@ -77,7 +78,15 @@ public class WatchService {
 
     @Transactional
     public WatchView create(CurrentUser user, String name, List<String> keywords, List<String> exclude) {
-        return create(user, name, keywords, exclude, DEFAULT_INTERVAL_MINUTES, "키워드 감시 생성");
+        return create(user, name, keywords, exclude, RegistrationService.Channel.WEB);
+    }
+
+    /** 화면(WEB)과 챗봇(CHAT)이 같은 규칙으로 만든다. 채널은 등록 요청(registration_request.channel)에 남는다. */
+    @Transactional
+    public WatchView create(CurrentUser user, String name, List<String> keywords, List<String> exclude,
+                            RegistrationService.Channel channel) {
+        return create(user, name, keywords, exclude, DEFAULT_INTERVAL_MINUTES,
+                channel == RegistrationService.Channel.CHAT ? "키워드 감시 생성 (챗봇)" : "키워드 감시 생성", channel);
     }
 
     /**
@@ -86,7 +95,8 @@ public class WatchService {
      */
     @Transactional
     public WatchView createForCompany(CurrentUser user, String companyName, List<String> keywords, int intervalMinutes) {
-        return create(user, COMPANY_PREFIX + companyName, keywords, List.of(), intervalMinutes, "회사 감시 생성");
+        return create(user, COMPANY_PREFIX + companyName, keywords, List.of(), intervalMinutes, "회사 감시 생성",
+                RegistrationService.Channel.WEB);
     }
 
     /** 회사 이름·별칭이 바뀌면 그 감시의 이름과 키워드를 새 설정 버전으로 갱신한다 (소유자 검사 없음: 회사 API가 권한을 검사한다). */
@@ -119,7 +129,7 @@ public class WatchService {
     }
 
     private WatchView create(CurrentUser user, String name, List<String> keywords, List<String> exclude,
-                             int intervalMinutes, String note) {
+                             int intervalMinutes, String note, RegistrationService.Channel channel) {
         String watchName = cleanName(name);
         List<String> terms = cleanTerms(keywords, "keywords");
         List<String> excluded = cleanTerms(exclude, "exclude");
@@ -151,9 +161,9 @@ public class WatchService {
         long requestId = jdbc.sql("""
                 INSERT INTO registration_request (user_id, input_url, normalized_domain, channel, status, step,
                                                   result_message, source_id)
-                VALUES (?, ?, ?, 'WEB', ?, ?, ?, ?) RETURNING id
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
                 """)
-                .params(user.id(), "watch:" + watchName, DOMAIN,
+                .params(user.id(), "watch:" + watchName, DOMAIN, channel.name(),
                         needsApproval ? "AWAITING_APPROVAL" : "RECEIVED", null,
                         needsApproval ? "키워드 감시 요청이 접수되었습니다. 관리자 승인 후 자동으로 진행됩니다." : null,
                         sourceId)
