@@ -14,10 +14,11 @@ flowchart LR
     B -->|작업 등록·조회| DB[(PostgreSQL 16<br/>+ pgvector)]
     W[Python worker<br/>수집 하네스] -->|FOR UPDATE SKIP LOCKED| DB
     W -->|robots·간격·차단 시 중단| S[등록된 외부 사이트]
-    B -.->|M3| L[LLM·임베딩 API]
+    B -->|챗봇 도구 호출| L[LLM API<br/>OpenAI 호환·Claude]
+    W -->|요약·분류·레시피| L
 ```
 
-- **backend (Java)**: 시스템 본체. 등록 API, 관리자 API, 스케줄러, 권한, (M3) 챗봇.
+- **backend (Java)**: 시스템 본체. 등록 API, 관리자 API, 스케줄러, 권한, 챗봇(도구 호출형, M5 1단계).
 - **worker (Python)**: 교체 가능한 작업자. 사전 점검, 자동 탐색, 기사 추출, (M2) 첨부 변환, (M3) 임베딩.
 - 둘은 DB 작업 큐(`crawl_job`)로만 연결됩니다. 메시지 브로커는 쓰지 않습니다.
 
@@ -83,6 +84,7 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 거래처 | 회사 목록(사업자번호·신호 수·HIGH·최근 신호·감시 상태), 등록, CSV 붙여넣기 import, 회사 상세(최근 신호·연결 문서), 전체 신호(종류·심각도·기간) |
 | 키워드 감시 | 목록, 생성, 키워드·제외어 수정(설정 새 버전) |
 | 다이제스트 | 구독 목록, 생성(채널·대상·시각·필터 체크), 미리보기(HTML), 지금 보내기, 보낸 기록 |
+| 챗봇 | 내 대화 목록(지우기), 질문 입력(Enter 보내기·Shift+Enter 줄바꿈, 예시 질문), "생각 중" 표시, 답의 `[n]` → 근거 목록(원문 링크·이슈 화면), 사용한 도구와 화면 바로 가기. 아래 "챗봇" |
 | 관리자 · 처리 대기 큐 | 종류별 건수, 항목별 사유·메시지·대기 시간과 가능한 조치만(승인 / 반려 사유 / API 키 등록 / 재점검 / 다시 탐색 / 일시정지 / 제외) |
 | 관리자 · 소스 | 상태별 건수 필터, 건강 상태 탭(지연 소스 강조), 소스 상세(작업·오류·설정 버전 활성화·수집 주기 잠금) |
 | 관리자 · 운영 지표 | `/ops/overview`를 카드로(소스 상태·큐 적체·워커 부족 경고·24시간 결과·수집량 상위·실패 코드), 30초마다 갱신 |
@@ -243,6 +245,55 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 서비스 활용신청 필요, DART `dart`) 그 점검 소스는 다른 API 소스처럼 관리자 큐 `API_KEY`에서 기다립니다. 다이제스트는 기간 안의 회사 신호를 맨 앞
 "거래처 신호" 절로 넣고(HIGH 먼저), 신호가 있으면 문서가 0건이어도 보냅니다. 삭제는 보관(ARCHIVED)이며 그 감시는 제외됩니다.
 
+### 챗봇 (M5 1단계, 2026-10-19)
+
+화면 "챗봇"(`#/chat`)에서 물어보거나 요청하면 LLM이 말을 **도구 호출**로 바꾸고, 조회·등록·권한·중복 판정은 화면과 같은 서비스가 합니다
+(LLM은 결과를 말로 풀 뿐). 답의 `[1]` 같은 번호는 아래 근거 목록의 원문 링크(이슈는 이슈 화면)로 이어집니다. 대화·도구 호출·도구 결과·근거는
+모두 DB(`chat_session`·`chat_message`·`chat_citation`, V14)에 남고, 대화는 **만든 사람만** 봅니다 (관리자도 남의 대화는 404).
+의미 검색(임베딩)은 2단계입니다.
+
+| 도구 | 하는 일 | 부르는 코드 |
+| --- | --- | --- |
+| `search_documents` | 전문 검색(낱말 모두 포함, 조사 무시)·기간(`days`·`since`)·토픽·감시로 문서 찾기, 최대 20건 | `DocumentService.list` |
+| `list_issues` | 최근 주요 이슈 (언론사 많은 순, 기본 최근 3일·2곳 이상) | `IssueService.list` |
+| `list_watches` | 내 키워드 감시 (관리자는 전체) | `WatchService.list` |
+| `create_watch` | 키워드 감시 만들기 — 화면과 같은 규칙 (VIEWER는 승인 대기), 등록 요청 채널 `CHAT` | `WatchService.create(..., Channel.CHAT)` |
+| `register_source` | 사이트 주소 등록 — 중복·권한 판정, ONBOARD 작업 trigger `CHAT` | `RegistrationService.register(..., Channel.CHAT)` |
+| `get_source_status` | 등록·감시 요청 진행 상태와 소스 상태. API 키 대기면 발급 안내(등록 메시지)와 관리자 'API 키' 화면 링크 | `RegistrationService` + 소스 상태 |
+
+- **사실은 도구 결과에서만**: 시스템 프롬프트가 도구 결과에 없는 기사·숫자·상태를 지어내지 말고, 등록·수집 상태는 결과 문장 그대로 전하게 합니다.
+- **언론 기사는 제목·링크로만**: 언론 기사와 AI 봇을 막은 사이트(`ai_restricted`)의 문서는 제목·분류만 LLM에 보내고, 기사 내용을 요약·추측하지 않게 합니다.
+  공공기관·기타 문서는 저장된 요약(300자까지)을 보냅니다. URL은 LLM에 보내지 않고 화면이 번호에 붙입니다 (LLM이 주소를 지어낼 수 없다).
+- **근거**: 답이 쓴 `[n]`만 `chat_citation`에 제목·링크 스냅숏으로 남깁니다 (번호를 안 쓰면 그 턴 도구 결과를 근거로). 도구 없이 답한 후속 질문
+  ("2번은 어느 언론사야?")의 번호는 앞 답의 근거를 이어 씁니다. 번호는 답마다 1부터입니다.
+- **한 턴의 도구 왕복은 4번까지**(`sensing.chat.max-tool-rounds`), 넘으면 도구 없이(`tool_choice: none`) 지금까지의 결과로 답하게 합니다.
+  LLM에는 지난 6턴(`sensing.chat.history-turns`)을 도구 호출·결과와 함께 다시 보여 줍니다 (Gemini 3의 `thought_signature`도 그대로 돌려준다).
+- **LLM 오류는 대화를 깨지 않습니다**: 429(무료 한도 — 하루 한도인지, 몇 초 뒤 다시 할지 구분)·5xx(한 번 재시도)·시간 초과·키 오류·미설정은 알기 쉬운
+  문장의 답(주의 색)으로 저장되고, 그 턴은 다음 질문 때 LLM에 다시 보내지 않습니다. 같은 대화에 답을 기다리는 중 또 보내면 409.
+- **API 키는 채팅으로 받지 않습니다**: 키가 필요하면 발급처와 관리자 'API 키' 화면을 안내만 합니다. 채팅에 붙여 넣은 키처럼 보이는 값(`sk-`·`AIza` 접두어,
+  16진수 32자 이상, `id:secret`, 32자 이상 영숫자 덩어리)은 저장·LLM 전송 전에 가립니다 (대화가 영구 저장되고 외부 LLM에도 가므로 — docs/decisions.md).
+
+백엔드 환경 변수 — 워커와 같은 이름이라 한 곳에서 관리합니다. 로컬은 `scripts/dev/run-backend.ps1`이 `scripts/dev/worker.local.env`의
+`SENSING_LLM_*`·`ANTHROPIC_*` 값만 읽습니다 (이미 설정된 환경 변수가 우선, 키 값은 찍지 않고 `key=set`만 표시).
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_LLM_PROVIDER` | `none` | `none`(챗봇은 "LLM이 설정되지 않았습니다"로 답) \| `openai`(OpenAI 호환 `chat/completions` + tools: Gemini·vLLM·Ollama) \| `anthropic`(Messages API + tools) |
+| `SENSING_LLM_BASE_URL` / `SENSING_LLM_MODEL` / `SENSING_LLM_API_KEY` | (없음) | `openai`: 주소·모델 필수(없으면 미설정으로 둔다), 키는 `Authorization: Bearer` |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | (없음) / `https://api.anthropic.com` | `anthropic`: 키 필수, 모델은 `SENSING_LLM_MODEL`(기본 `claude-opus-5-5`) |
+| `SENSING_LLM_TIMEOUT` | `60` | 호출 한 번의 제한 시간(초) |
+| `SENSING_LLM_MAX_TOKENS` | `0` | 답 최대 토큰 (0: `openai`는 서버 기본, `anthropic`은 4096) |
+
+추가 의존성 없이 `java.net.http`로 부릅니다 (`io.sensinghub.llm`). 화면은 `GET /api/v1/chat/status`로 설정 여부와 모델을 보여 줍니다.
+
+**실측 (2026-10-19, Gemini `gemini-3.5-flash-lite` 무료 등급, 운영 DB를 복사한 sensing_test, LLM 호출 17번)** — "오늘 많이 보도된 이슈"(이슈 10개, 제목과
+언론사 수·기사 수 근거), "최근 3일 반도체 기사"(10건, 제목·언론사·날짜·분류), "1번 기사 내용 요약해 줘"(→ 저작권 원칙상 제목·언론사·날짜·분류만
+안내, 내용은 추측하지 않음), "2번은 어느 언론사?"(도구 없이 앞 답 근거로), "dart.fss.or.kr 수집해 줘"(등록 접수 문장 그대로), 진행 상태, 감시 목록,
+붙여 넣은 DART 키(가린 뒤 'API 키' 화면 안내)가 모두 기대대로 동작했습니다. 한 턴(LLM 호출 1~2번)의 입력은 약 2천~8천 토큰(도구 정의·지난 대화·검색
+결과 포함)이고, 서버에서 답까지 1~3초였습니다. Gemini는 도구 호출마다 `extra_content.google.thought_signature`를 붙였고(Google 안내상 Gemini 3는
+이것을 돌려주지 않으면 도구 결과를 담은 요청을 거절한다), `ToolCall.providerData`로 보관해 돌려준 후속 턴이 모두 성공했습니다. 처음엔 도구 이름
+("`get_source_status` 도구로 확인")을 말하거나 등록 답에 엉뚱한 `[1]`을 붙여 프롬프트·도구 안내문을 보강했습니다.
+
 ### API 맛보기
 
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
@@ -278,6 +329,12 @@ curl -X POST localhost:8080/api/v1/companies -H 'X-User: registrar' -H 'Content-
 curl localhost:8080/api/v1/companies -H 'X-User: viewer'            # GET /api/v1/companies/1 (최근 신호·문서 20건, 종류별 최근 1건 latestByKind), PUT /api/v1/companies/1, DELETE 는 보관. POST /api/v1/companies/import 는 JSON 배열 또는 CSV(name,aliases(;구분),biz_no,...) upsert
 curl 'localhost:8080/api/v1/company-signals?since=2026-10-15&severity=HIGH' -H 'X-User: viewer'   # kind=BIZ_STATUS|NEWS|... · GET /api/v1/companies/1/signals?since=
 
+# 챗봇 (VIEWER 이상, 대화는 만든 사람만): 설정 여부 · 대화 만들기 · 질문(답이 올 때까지 기다린다, LLM 오류는 error=true인 답) · 대화 불러오기 · 목록 · 지우기
+curl localhost:8080/api/v1/chat/status -H 'X-User: viewer'          # {"configured":true,"provider":"openai gemini-3.5-flash-lite","maxToolRounds":4}
+curl -X POST localhost:8080/api/v1/chat/sessions -H 'X-User: viewer' -H 'Content-Type: application/json' -d '{}'
+curl -X POST localhost:8080/api/v1/chat/sessions/1/messages -H 'X-User: viewer' -H 'Content-Type: application/json' -d '{"content":"오늘 많이 보도된 이슈 알려 줘"}'
+curl localhost:8080/api/v1/chat/sessions/1 -H 'X-User: viewer'      # 질문과 답, 답마다 citations(refNo·title·url·sourceLabel)·tools. GET /api/v1/chat/sessions 목록, DELETE /api/v1/chat/sessions/1
+
 # 관리자: 소스 목록·상세·조치
 curl localhost:8080/api/v1/sources -H 'X-User: admin'
 curl localhost:8080/api/v1/sources/1 -H 'X-User: admin'
@@ -301,6 +358,8 @@ curl localhost:8080/api/v1/api-credentials -H 'X-User: admin'   # DELETE /api/v1
 
 ```
 backend/   Spring Boot 3 (Java 17), Flyway 스키마: src/main/resources/db/migration
+  io/sensinghub/llm/   LLM 클라이언트 (OpenAI 호환 · Claude · 미설정), 오류 분류 (챗봇용)
+  io/sensinghub/chat/  챗봇: 도구(ChatTools), 대화·도구 루프·근거(ChatService), 시스템 프롬프트, 키 가리기
 worker/    Python 수집 워커
   src/sensing_worker/
     fetcher.py    수집 하네스 HTTP 계층: 간격·robots·재시도·차단 분류·내부망 차단
@@ -328,6 +387,9 @@ cd backend && SENSING_IT_DB_URL=jdbc:postgresql://localhost:5432/sensing_it ./gr
 ```
 
 GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector DB와 함께 검증합니다.
+챗봇·LLM 테스트는 가짜 LLM HTTP 서버(`MockLlmServer`)만 부르므로 CI에서 실제 LLM 호출이 없습니다.
+통합 테스트는 클래스마다 Spring 컨텍스트(연결 풀)를 캐시하므로 테스트에서는 풀을 4개로 줄입니다(`backend/src/test/resources/config/application.properties`) —
+기본 10개면 IT 9개만으로 PostgreSQL 기본 한도(100)에 닿고, 같은 DB 서버에 로컬 백엔드·워커가 붙어 있으면 "too many clients"로 실패합니다.
 
 ## 진행 현황과 다음 단계
 
@@ -338,7 +400,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 | M2 외부 API·키워드 감시 | API 카탈로그·자격 증명 저장소·API 수집기(뉴스 검색·DART·공공데이터포털), 키워드 감시, 수집 시점 요약·분류, 일간 다이제스트 알림, 최소 화면(등록·내 요청·관리자 큐) | 완료 (2026-10-18, 최소 화면 포함) |
 | M3 회사 레이어·공급사 리스크 소스 | 회사(거래처) 마스터와 별칭 매칭, 문서→회사 연결, 리스크 신호 분류(재무·제재·사고·경영 변동), 공공 API 커넥터(국세청 사업자 상태, 조달청 부정당업자, DART 기업개황·재무), 회사별 다이제스트, 케이던시아 연동(마스터 동기화·이벤트 전달 — 목업으로 형태 완료, 실제 API는 SDS 확인 뒤) | 거의 완료 — 남은 것: DART 재무(FINANCIAL), 회사별 다이제스트 화면, 실제 케이던시아 API(SDS 확인 뒤) |
 | M4 동적·첨부 | Playwright 동적 수집, 첨부 다운로드·HWP/PDF 텍스트 추출, 원문 삭제(GONE) 감지, (합의 시) 회사 계정 로그인 세션 | 다음 |
-| M5 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 모달·tool calling(`register_source`·`get_source_status`·`submit_api_key`), 대화 저장 | 진행 중 — 된 것: 전문 검색 색인(Kiwi·tsvector)과 이슈(중복 보도) 묶기·화면. 남은 것: 임베딩·하이브리드 검색, 챗봇 |
+| M5 검색·챗봇 | 인덱싱 작업(청크·Kiwi·임베딩), 하이브리드 검색, 중복 보도 묶기, 챗봇 tool calling(`search_documents`·`list_issues`·`list_watches`·`create_watch`·`register_source`·`get_source_status`), 대화 저장 | 진행 중 — 된 것: 전문 검색 색인(Kiwi·tsvector)과 이슈 묶기·화면, 챗봇 1단계(도구 호출·대화 저장·근거 링크·화면, 2026-10-19). 남은 것: 임베딩·하이브리드 검색(챗봇 2단계) |
 | M6 관리자·운영 | 레시피 수정·미리보기, 설정 백필, 감사 로그 화면, 운영 지표 | |
 
 로드맵은 현업 요청서(대외협력·커뮤니케이션 대상 외부정보 센싱)에 맞춰 2026-10-16에 다시 짰다. 요건 대응표와
@@ -372,7 +434,8 @@ LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 
    본문을 품은 `<header>` 보존, `[부고]` 단신 표본 제외 — `docs/how-collection-works.md` 4절). 남은 것: 규칙이 못 잡는 다음 사례가
    나오면 LLM 레시피로 붙이는 실측(Gemini 무료 키로 가능).
 3. M4 동적·첨부: Playwright 동적 수집, HWP/PDF 첨부 텍스트 추출(공공기관 보도자료 본문), 원문 삭제 감지, (합의 시) 회사 계정 로그인 수집.
-4. M5 검색·챗봇: 임베딩·하이브리드 검색(챗봇 2단계). 챗봇 1단계는 위 "진행 중" (전문 검색 색인과 이슈 묶기는 2026-10-19 완료).
+4. M5 검색·챗봇 2단계: 임베딩·하이브리드 검색으로 `search_documents` 교체, 대화 요약(`chat_session.summary`)·답 피드백(`chat_feedback`) (전문 검색 색인과
+   이슈 묶기, 챗봇 1단계 — 도구 호출·대화 저장·근거 링크·화면 — 는 2026-10-19 완료).
 5. M6 관리자·운영: 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면. (워커 하트비트 기반 지표는 10-19 완료: `worker_heartbeat`,
    운영 지표의 워커 수 = 최근 2분 안 신호, 워커 목록)
 6. 작은 것: 네이버 API 쿼터 추적, Teams 웹훅 형식, favicon.
@@ -464,11 +527,15 @@ M5에서 한 일:
   색인 낱말 접두 일치(모든 낱말, 조사 뗌, 색인 전 문서는 부분 일치), `GET /api/v1/issues`(언론사 수 → 기사 수 순, `since`·`min_docs`·`min_sources`·`q`)와
   상세, 화면 "이슈"(기간·언론사 수 칩, 검색, 펼쳐 보는 소속 기사)와 문서 화면의 "이슈 #id (N건)" 링크. 이미 쌓인 문서는 `sensing-index-backfill`로 한 번에.
   기준값은 운영 DB 제목 2,998건(53개 언론사)으로 보정했다 → 언론사 2곳 이상 이슈 287개, 3곳 이상 122개, 5곳 이상 47개 ([docs/decisions.md](docs/decisions.md))
-- [ ] 임베딩(`chunk.embedding`)·하이브리드 검색, 챗봇(도구 호출)·대화 저장
+- [x] 챗봇 1단계 (2026-10-19): 백엔드 LLM 클라이언트(`io.sensinghub.llm`: OpenAI 호환 `chat/completions` + tools, Claude Messages API + tools,
+  `java.net.http`, 워커와 같은 `SENSING_LLM_*`·`ANTHROPIC_*`, 429·5xx·시간 초과를 사용자 문장으로), 챗봇 서비스·API(`/api/v1/chat/sessions`, 한 턴 도구 왕복 4번,
+  모든 단계 `chat_message` 저장, 답의 `[n]` → `chat_citation`, 세션 소유자만), 도구 6개(문서 검색·이슈·감시 조회/생성·사이트 등록·진행 상태 — 화면과 같은 서비스),
+  API 키는 채팅으로 받지 않고 붙여 넣은 키는 가림, 화면 "챗봇"(대화 목록·생각 중·근거 링크, 좁은 화면). 가짜 LLM 서버로 도구 루프·권한·저장·인용·429 통합 테스트
+- [ ] 임베딩(`chunk.embedding`)·하이브리드 검색 (챗봇 2단계), 대화 요약·피드백
 
 ## 원칙
 
 - robots.txt 준수, 식별 가능한 User-Agent, 도메인당 최소 2초 간격
 - 차단 신호(403·429·봇 확인·로그인)는 재시도하지 않고 즉시 중단 → 관리자만 재점검
 - 언론사는 기본 저장 범위를 제목·링크·발행일로 제한 (저작권)
-- robots.txt에서 AI 봇을 막은 사이트는 `ai_restricted`로 표시해 챗봇 답변 근거에서 제외할 수 있게 함
+- robots.txt에서 AI 봇을 막은 사이트는 `ai_restricted`로 표시하고, 챗봇은 그 사이트 문서의 요약을 LLM에 보내지 않는다 (제목·링크만)
