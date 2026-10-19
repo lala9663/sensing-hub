@@ -22,3 +22,6 @@ worker/data/
 
 # Claude Code 세션 워크트리 (launch.json은 커밋한다)
 .claude/worktrees/
+
+# 워커 로컬 전용 키 파일 (scripts/dev/worker.local.env.example 참고)
+scripts/dev/*.local.env
