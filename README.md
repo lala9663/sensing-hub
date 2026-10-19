@@ -82,13 +82,13 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 문서 | 기간(오늘·3일·7일)·토픽 칩(건수), 검색어(전문 검색)·소스 필터, 목록(제목·출처·발행·토픽·요약·이슈 링크), 펼쳐 보는 본문 일부·첨부 |
 | 이슈 | 같은 사건을 다룬 기사 묶음. 기간·언론사 수(2곳+/3곳+/5곳+) 칩, 검색, 카드(대표 제목·언론사 N곳·기사 M건·기간·핵심 낱말), 펼쳐 보는 소속 기사 |
 | 거래처 | 회사 목록(사업자번호·신호 수·HIGH·최근 신호·감시 상태), 등록, CSV 붙여넣기 import, 회사 상세(최근 신호·연결 문서), 전체 신호(종류·심각도·기간) |
-| 키워드 감시 | 목록, 생성, 키워드·제외어 수정(설정 새 버전) |
+| 키워드 감시 | 목록, 생성, 키워드·제외어 수정(설정 새 버전), 감시 행의 "네이버 실시간"(네이버 키가 있을 때, 표시 전용·출처 "NAVER 검색 결과") |
 | 다이제스트 | 구독 목록, 생성(채널·대상·시각·필터 체크), 미리보기(HTML), 지금 보내기, 보낸 기록 |
 | 챗봇 | **어느 화면에서나 오른쪽 아래 챗봇 버튼** → 화면 위 대화창(화면을 옮겨도 대화 유지, 새 대화·대화 목록·크게 보기·새 창으로). 메뉴 "챗봇"은 대화 목록이 왼쪽에 있는 전체 화면. 질문 입력(Enter 보내기·Shift+Enter 줄바꿈, 예시 질문), "생각 중" 표시, 답의 `[n]` → 근거 목록(원문 링크·이슈 화면), 사용한 도구와 화면 바로 가기. 아래 "챗봇" |
 | 관리자 · 처리 대기 큐 | 종류별 건수, 항목별 사유·메시지·대기 시간과 가능한 조치만(승인 / 반려 사유 / API 키 등록 / 재점검 / 다시 탐색 / 일시정지 / 제외) |
 | 관리자 · 소스 | 상태별 건수 필터, 건강 상태 탭(지연 소스 강조), 소스 상세(기사 종류 목록과 켜고 끄기 — 설정 새 버전, 작업·오류·설정 버전 활성화·수집 주기 잠금) |
 | 관리자 · 운영 지표 | `/ops/overview`를 카드로(소스 상태·큐 적체·워커 부족 경고·24시간 결과·수집량 상위·실패 코드), 30초마다 갱신 |
-| 관리자 · API 키 | 제공자(dart · naver_news · data_go_kr)·키·메모 등록, 다시 진행된 소스 수 표시, 목록(비밀 없음)·삭제 |
+| 관리자 · API 키 | 제공자(dart · naver_news · data_go_kr)·키·메모 등록(naver_news는 NAVER API HUB Client ID·Client Secret 두 칸과 콘솔 경로 안내), 다시 진행된 소스 수 표시, 목록(비밀 없음)·삭제, naver_news 시험 호출 |
 | 관리자 · 케이던시아 연동 | 연결 주소·목업 표시·마지막 동기화 결과(공급사·생성·갱신·보관·그대로)·이벤트 전달 대기/보낸 수 카드, 지금 동기화 / 지금 전달, 동기화 실행 기록, (데모 전용) 케이던시아가 받은 이벤트 |
 
 ### 워커 환경 변수 (접속)
@@ -170,6 +170,9 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 | `SENSING_SECRET_KEY` | (없음) | 백엔드·워커 공통. API 키를 암호화·복호화하는 대칭키(`pgp_sym_encrypt`). 비우면 백엔드 자격 증명 API는 503, 워커는 API 소스를 관리자 큐로 보낸다 |
 | `SENSING_MAX_API_ITEMS` | `500` | 워커. API 소스 실행 1회당 받을 항목 수 상한 |
 | `SENSING_NAVER_DAILY_LIMIT` | `20000` | 워커. 네이버 검색 API 일 호출 상한(공식 25,000). 지금은 호출 수를 로그에 남기는 기준이고 정확한 쿼터 추적은 후속 |
+| `SENSING_NAVER_MODE` | `display` | 백엔드·워커 공통(같은 값). 네이버 뉴스 검색 사용 방식: `display` 표시 전용(결과를 저장·요약·챗봇·다이제스트에 쓰지 않고 감시 화면에서 실시간으로 보여 주기만), `store` 저장·분석(**법무 확인 뒤에만**, 감시에 네이버 주기 수집을 붙여 `document`에 저장), `off` 쓰지 않음. 모르는 값은 `display` |
+| `SENSING_NAVER_API` | `hub` | 백엔드·워커 공통. `hub` = NAVER API HUB(`https://naverapihub.apigw.ntruss.com/search/v1/news`, 헤더 `X-NCP-APIGW-API-KEY-ID`/`X-NCP-APIGW-API-KEY`), `developers` = 예전 개발자센터(`openapi.naver.com/v1/search/news.json`, 2027-06-30 지원 종료) |
+| `SENSING_NAVER_SEARCH_URL` | (없음) | 백엔드·워커. 검색 주소만 바꾼다(테스트·사내 프록시). 헤더는 `SENSING_NAVER_API`를 따른다 |
 
 ### 키워드 감시 (M2)
 
@@ -178,14 +181,42 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 (다이제스트가 이 표를 읽습니다). 이것이 기본 동작인 **수집 기사 대조 모드**이고, 감시는 만들자마자 `ACTIVE`(화면 "수집 기사 대조 중")가 되지만
 스스로 수집하지 않으므로 `next_run_at`이 비어 있어 스케줄러가 작업을 넣지 않고, 관리자 키 큐에도 쌓이지 않습니다. 새로 수집되는 기사부터 대조하며,
 이미 쌓인 기사는 `python -m sensing_worker.backfill_watch --days 30`으로 한 번 대조할 수 있습니다. 커버리지는 등록 언론사 수가 정합니다.
-네이버 뉴스 검색 API는 2026-07-31부터 신규 발급이 중단돼 보통 키가 없습니다. 키(INVALID가 아닌 `naver_news`)가 있으면 감시를 만들 때 네이버 검색도
-함께 붙여(화면 "네이버 검색 함께") 60분(회사 감시 360분)마다 받아 옵니다. 키를 나중에 넣으면 대조 모드 감시에 네이버 검색을 붙이고(`attachedWatches`),
-키를 지우면 다시 대조 모드로 되돌립니다. 감시 하나는 `source` 한 행(`kind = WATCH`, `watch_name`)이고 키워드는 설정 버전
+감시 하나는 `source` 한 행(`kind = WATCH`, `watch_name`)이고 키워드는 설정 버전
 config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"exclude":[...]}`, `naver`가 없으면 V13 이전 감시로 네이버 모드)에
 두므로, 키워드 수정은 설정 새 버전 활성화이고 롤백·일시정지·제외 같은 소스 조치를 그대로 씁니다. V13 마이그레이션이 키 없이 멈춰 있던
 감시(REVIEW `API_KEY_REQUIRED`/`API_KEY_INVALID`)를 대조 모드로 옮겼습니다. 네이버 뉴스 웹은 robots.txt가 전체 차단이라 크롤링하지 않으며,
-`news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다. 네이버 키가 있다면 `client_id:client_secret`
-한 문자열로 `/api/v1/api-credentials`에 넣고(provider `naver_news`), 언론 기사이므로 제목·링크·발행일만 저장합니다.
+`news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다.
+
+### 네이버 뉴스 검색 — NAVER API HUB, 기본 표시 전용
+
+네이버 개발자센터 검색 API는 2026-07-31 신규 발급이 끝나(기존 키 2027-06-30 지원 종료) 네이버클라우드 **NAVER API HUB**로 연결합니다
+(`GET https://naverapihub.apigw.ntruss.com/search/v1/news?query=..&display=..&start=..&sort=date&format=json`, 헤더 `X-NCP-APIGW-API-KEY-ID`(Client ID)·
+`X-NCP-APIGW-API-KEY`(Client Secret), HTTPS만). 2026-09-07 시행 개정 약관이 검색 결과의 AI 입력·학습, 복사·저장·캐싱, 제3자 제공, 광고 수익화를
+금지하므로 기본 사용 방식은 **표시 전용**(`SENSING_NAVER_MODE=display`)입니다.
+
+- 표시 전용(기본): 키워드 감시 화면의 감시 행에서 **"네이버 실시간"** 을 누르면 백엔드가 그 감시 키워드(칩으로 바꿔 가며)로 네이버 최신 뉴스(날짜순 20건,
+  "더 보기")를 대신 불러와 **제목·언론사·시각·원문/네이버 링크**만 보여 줍니다(출처 표기 "NAVER 검색 결과", 요약 문구는 보여 주지 않음, 감시 제외어가
+  제목에 있으면 숨김). 결과는 `document`·`document_watch`·임베딩·요약·다이제스트·챗봇 어디에도 넣지 않고, 서버 메모리 캐시도 두지 않으며
+  응답은 `Cache-Control: no-store`입니다. DB에 쓰는 것은 키 상태(`api_credential.status`)뿐입니다. 키를 넣어도 감시에 저장 수집을 붙이지 않고
+  (`attachedWatches` 0), 워커도 네이버 모드 감시를 수집하지 않습니다(이중 차단). 키가 없거나 INVALID이거나 모드가 `off`면 이 보기는 화면에서 숨겨집니다.
+  API: `GET /api/v1/naver/status`, `GET /api/v1/watches/{id}/naver-news?keyword=&start=&display=`(내 감시, ADMIN은 전체),
+  `POST /api/v1/api-credentials/naver_news/verify`(관리자 시험 호출, 검색어 "뉴스" 1건).
+- 저장·분석(`store`, **법무 확인 뒤에만**): 예전 동작입니다. 쓸 수 있는 키가 있으면 감시를 만들 때 네이버 검색도 함께 붙여(화면 "네이버 검색 함께")
+  60분(회사 감시 360분)마다 검색어별 최신 기사 제목·링크·발행일을 `document`에 저장합니다. 키를 나중에 넣으면 대조 모드 감시에 네이버 검색을
+  붙이고(`attachedWatches`), 키를 지우면 다시 대조 모드로 되돌립니다. 백엔드와 워커에 같은 값을 줘야 합니다.
+- 오류는 알기 쉬운 문장으로 바꿉니다: 401·403 → 키 문제(키를 INVALID로 표시, "Client ID·Client Secret, Application에 '검색' 선택 확인"),
+  429 → 하루 허용량 초과, 400 `SE01`~`SE04`·`SE06`/404 `SE05` → 요청·주소 오류(어느 값이 틀렸는지), 500 `SE99` → 네이버 서버 오류.
+  한도: 검색 묶음 하루 25,000회(월 775,000회 표기도 있음), 키당 50 RPS, 현재 한시 무료(종량제, 유료 전환은 사전 공지).
+
+**키를 넣고 확인하는 순서** (키 값은 채팅·파일·커밋에 붙이지 않고 관리자 화면에만 넣습니다)
+
+1. 네이버클라우드 콘솔 → Services → Application Service → **NAVER API HUB** → 이용 신청 → **Application 등록**에서 API 선택에 **검색**을 고르고
+   저장한 뒤, 인증 정보의 **Client ID**·**Client Secret**을 확인합니다 (결제 수단 등록 필요).
+2. sensing-hub 관리자 화면 → **API 키** → 제공자 `naver_news — 네이버 뉴스 검색 (NAVER API HUB)` → Client ID·Client Secret 두 칸에 넣고 저장합니다
+   (서버에는 `Client ID:Client Secret` 한 문자열로 암호화 저장).
+3. 저장하면 화면이 바로 **시험 호출**을 합니다. 상태가 `VALID`면 성공, `INVALID`면 "마지막 오류"의 안내(Client ID·Secret, Application의 검색 선택)를
+   확인합니다. 등록된 키 목록의 **시험 호출** 버튼으로 다시 확인할 수 있습니다.
+4. **키워드 감시** 화면에서 감시 행의 **네이버 실시간**을 눌러 최신 뉴스가 보이는지 확인합니다. 감시의 "문서" 수는 늘지 않아야 정상입니다(표시 전용).
 
 ### 수집 시점 요약·분류 (M2)
 
@@ -240,7 +271,7 @@ config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"
 ### 회사(거래처) 마스터와 공급사 리스크 신호 (M3)
 
 현업이 구매 SaaS 케이던시아를 함께 쓰므로, 문서 중심 위에 **회사 중심**("어느 거래처에 무슨 일")을 한 층 얹습니다. 회사(`company`: 이름·별칭·
-사업자등록번호·DART 고유번호·외부 ID·태그)를 등록하면 ① 이름+별칭을 키워드로 한 키워드 감시(`회사:<이름>`, 수집 기사 대조. 네이버 키가 있으면 네이버 검색 360분)가 생겨 걸린 기사를
+사업자등록번호·DART 고유번호·외부 ID·태그)를 등록하면 ① 이름+별칭을 키워드로 한 키워드 감시(`회사:<이름>`, 수집 기사 대조. 네이버 저장·분석 모드(store)에서 키가 있으면 네이버 검색 360분)가 생겨 걸린 기사를
 `document_company`(WATCH)로 연결하고, ② 보강 태그(고유명사)가 회사 이름·별칭과 **정확히**(대소문자·공백 무시) 일치하면 TAG로 연결하며
 (부분 일치·유사도 매칭은 오탐 때문에 하지 않습니다), ③ 연결된 기사의 토픽이 사건·사고·인사·조직이면 `company_signal`(NEWS, MEDIUM)을 남깁니다.
 ④ 첫 회사를 만들 때 **점검 소스**(`source.kind = CHECK`, 설정의 `check`가 점검 종류) 네 개가 생겨 모든 회사를 주기적으로 외부 API로 확인합니다.
@@ -416,9 +447,12 @@ curl -X POST localhost:8080/api/v1/registrations/bulk -H 'X-User: registrar' -H 
 curl localhost:8080/api/v1/registrations/batches/<batchId> -H 'X-User: registrar'   # 몇 분 뒤: 묶음의 completed·review·rejected·byStatus·byStep
 curl localhost:8080/api/v1/ops/overview -H 'X-User: admin'   # 관리자 운영 지표: 소스 상태별·처리 대기 큐·작업 큐 적체·24시간 결과·수집량·실패 코드·처리량(demandRatio>1이면 워커 부족). /ops/sources/health 는 조용히 멈춘 소스 순
 
-# 키워드 감시 등록 (수집 기사 대조. 네이버 키가 있으면 네이버 검색도 60분 주기로. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
+# 키워드 감시 등록 (수집 기사 대조. SENSING_NAVER_MODE=store이고 네이버 키가 있으면 네이버 검색도 60분 주기로. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
 curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
 curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
+# 네이버 뉴스 실시간 (표시 전용: 저장하지 않음, Cache-Control no-store) · 사용 방식·키 상태
+curl 'localhost:8080/api/v1/watches/1/naver-news?keyword=%EB%A9%94%ED%83%80%EB%84%B7&display=20&start=1' -H 'X-User: registrar'
+curl localhost:8080/api/v1/naver/status -H 'X-User: registrar'
 
 # 수집 문서 (요약·분류·감시 검색어 포함, 발행일 내림차순). since는 수집 시각 기준, topic·keyword·source_id로 거르고 limit 기본 50·최대 200
 curl 'localhost:8080/api/v1/documents?since=2026-10-15T00:00:00Z&topic=정책·규제&keyword=메타넷' -H 'X-User: viewer'
@@ -466,7 +500,8 @@ curl -X POST localhost:8080/api/v1/sources/1/backfills/1/cancel -H 'X-User: regi
 
 # 관리자: 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"dart","secret":"<발급받은 키>","label":"공시 API"}'
-curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"naver_news","secret":"<client_id>:<client_secret>","label":"네이버 검색"}'
+curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"naver_news","secret":"<Client ID>:<Client Secret>","label":"NAVER API HUB"}'
+curl -X POST localhost:8080/api/v1/api-credentials/naver_news/verify -H 'X-User: admin'   # 네이버 키 시험 호출 (검색 1건, 상태 VALID/INVALID)
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"data_go_kr","secret":"<공공데이터포털 서비스키>","label":"공공데이터포털"}'
 curl localhost:8080/api/v1/api-credentials -H 'X-User: admin'   # DELETE /api/v1/api-credentials/dart
 ```
@@ -533,7 +568,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 
 ### 어디까지 왔고 무엇이 남았나 (2026-10-19)
 
-**된 것** — URL 하나(또는 수백 개 일괄)로 사이트가 자동 등록되고 주기 수집된다. 공개 API(DART·공공데이터포털, 네이버 뉴스는 키가 있을 때)와 키워드 감시(기본은 수집 기사 대조),
+**된 것** — URL 하나(또는 수백 개 일괄)로 사이트가 자동 등록되고 주기 수집된다. 공개 API(DART·공공데이터포털, 네이버 뉴스는 NAVER API HUB 키가 있을 때 감시 화면 실시간 표시 전용)와 키워드 감시(기본은 수집 기사 대조),
 수집 시점 요약·분류, 일간 다이제스트, 거래처 마스터와 위험 신호(국세청·DART 공시·조달청), 케이던시아 연동(목업), 링크 모음 페이지의
 언론사 자동 확장, 운영 지표, 그리고 이 모든 것을 다루는 브라우저 화면. 실측: 표본 10곳 중 9곳 자동 등록(10-19 재측정 10/10),
 주간지 8곳 중 6곳 자동 등록(REVIEW였던 한겨레21·주간한국은 10-19 규칙 보강 뒤 자동 등록), 뉴스스탠드 → 언론사 50곳 자동 등록.
@@ -605,6 +640,10 @@ M2에서 한 일:
 - [x] 키워드 감시의 기본을 수집 기사 대조로 (2026-10-19, V13): 네이버 검색 API 신규 발급 중단으로 키가 없으면 감시를 만들 때 ONBOARD 없이
   바로 ACTIVE(`next_run_at` NULL, config `"naver": false`)로 두고 워커가 수집 기사마다 대조한다. 키가 있으면 네이버 검색도 함께, 키를 나중에 넣거나
   지우면 감시 모드를 따라 바꾼다. V13이 키 대기(REVIEW `API_KEY_*`)로 멈춘 감시를 대조 모드로 옮겨 관리자 키 큐에서 뺐다
+- [x] 네이버 뉴스 검색을 NAVER API HUB로 옮기고 기본을 표시 전용으로 (2026-10-19): 주소·헤더(`SENSING_NAVER_API` hub|developers),
+  401·403·429·SE 오류 코드를 알기 쉬운 문장으로, `SENSING_NAVER_MODE`(display 기본 | store | off). 표시 전용은 감시 화면 "네이버 실시간"에서
+  백엔드가 실시간으로 불러와 제목·언론사·시각·링크만 보여 주고 DB·LLM·챗봇·다이제스트에 넣지 않는다(워커도 수집하지 않는다). 관리자 화면
+  Client ID·Secret 입력과 시험 호출(`POST /api/v1/api-credentials/naver_news/verify`)
 - [x] 수집 시점 요약·분류: 워커 보강 단계(`enrich.py`, 큐가 비었을 때 묶음 10건을 LLM 한 번에, `SENSING_ENRICH_*`)가
   `document_enrichment`(V6)에 토픽·태그·요약을 두고, `GET /api/v1/documents`(since·topic·keyword·source_id 필터, 상세, 토픽별 건수)로
   읽는다. 언론 기사는 제목만 분류하고 요약을 저장하지 않으며, LLM 장애·검증 실패는 수집에 번지지 않는다

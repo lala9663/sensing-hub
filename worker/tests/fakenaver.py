@@ -1,4 +1,9 @@
-"""테스트용 가짜 네이버 뉴스 검색 API (httpx.MockTransport 핸들러). 실제 openapi.naver.com에는 요청하지 않는다."""
+"""테스트용 가짜 네이버 뉴스 검색 API (httpx.MockTransport 핸들러). 실제 네이버(API HUB·개발자센터)에는 요청하지 않는다.
+
+기본은 NAVER API HUB 형식이다: https://naverapihub.apigw.ntruss.com/search/v1/news, 헤더 X-NCP-APIGW-API-KEY-ID /
+X-NCP-APIGW-API-KEY, 인증 실패는 API Gateway 오류 본문({"error": {"errorCode": "200", "message", "details"}}).
+api="developers"면 예전 개발자센터(openapi.naver.com/v1/search/news.json, X-Naver-Client-Id/Secret, errorCode 024).
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,11 @@ GOOD_ID = "naverid0123abcd"
 GOOD_SECRET = "naversecretXYZ789"
 GOOD_KEY = f"{GOOD_ID}:{GOOD_SECRET}"
 KST = timezone(timedelta(hours=9))
+
+APIS = {
+    "hub": ("naverapihub.apigw.ntruss.com", "/search/v1/news", "X-NCP-APIGW-API-KEY-ID", "X-NCP-APIGW-API-KEY"),
+    "developers": ("openapi.naver.com", "/v1/search/news.json", "X-Naver-Client-Id", "X-Naver-Client-Secret"),
+}
 
 
 def article(keyword: str, i: int, *, pub: datetime | None = None, title: str | None = None,
@@ -33,19 +43,21 @@ def articles(keyword: str, n: int = 3) -> list[dict]:
 
 
 def naver_handler(by_keyword: dict[str, list[dict]] | None = None, *, http_status: int | None = None,
-                  error_code: str | None = None, per_page: int = 100):
-    """헤더의 client_id/secret이 GOOD_*이면 정상 목록, 아니면 401(errorCode 024). 모르는 검색어는 0건.
-    http_status/error_code로 장애(429 한도 초과, 500 등)를 흉내 낸다.
-    handler.calls에 (query, display, start)를, handler.headers에 받은 인증 헤더를 모은다."""
+                  error_code: str | None = None, per_page: int = 100, api: str = "hub"):
+    """헤더의 client_id/secret이 GOOD_*이면 정상 목록, 아니면 401. 모르는 검색어는 0건. 다른 호스트·경로·헤더 이름은 404.
+    http_status/error_code로 장애(429 한도 초과, 400 SE02, 500 SE99 등)를 흉내 낸다.
+    handler.calls에 (query, display, start)를, handler.headers에 받은 인증 헤더를, handler.requests에 요청 전체를 모은다."""
     rows_by_keyword = by_keyword if by_keyword is not None else {"테스트": articles("테스트", 1)}
+    host, path, id_header, secret_header = APIS[api]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host != "openapi.naver.com" or request.url.path != "/v1/search/news.json":
-            return httpx.Response(404, text="not found")
+        handler.requests.append(request)
+        if request.url.scheme != "https" or request.url.host != host or request.url.path != path:
+            return httpx.Response(404, json={"errorMessage": "Invalid search api", "errorCode": "SE05"})
         params = dict(request.url.params)
         handler.calls.append((params.get("query"), int(params.get("display", "10")), int(params.get("start", "1"))))
-        client_id = request.headers.get("X-Naver-Client-Id", "")
-        client_secret = request.headers.get("X-Naver-Client-Secret", "")
+        client_id = request.headers.get(id_header, "")
+        client_secret = request.headers.get(secret_header, "")
         handler.headers.append((client_id, client_secret))
         if "query" in str(request.url) and (client_id in str(request.url) or client_secret in str(request.url)):
             return httpx.Response(400, json={"errorMessage": "key must not be in query", "errorCode": "SE01"})
@@ -53,6 +65,10 @@ def naver_handler(by_keyword: dict[str, list[dict]] | None = None, *, http_statu
             return httpx.Response(http_status, json={"errorMessage": f"상태 {http_status}", "errorCode": error_code or "SE99"})
         if client_id != GOOD_ID or client_secret != GOOD_SECRET:
             # 실제 API는 받은 값을 되돌려 주지 않지만, 커넥터가 응답 본문도 가리는지 보려고 일부러 넣는다
+            if api == "hub":
+                return httpx.Response(401, json={"error": {
+                    "errorCode": "200", "message": "Authentication Failed",
+                    "details": f"Invalid authentication information. (id={client_id}, secret={client_secret})"}})
             return httpx.Response(401, json={"errorMessage": f"Authentication failed. (id={client_id}, secret={client_secret})",
                                              "errorCode": "024"})
         if error_code is not None:
@@ -68,4 +84,5 @@ def naver_handler(by_keyword: dict[str, list[dict]] | None = None, *, http_statu
 
     handler.calls = []
     handler.headers = []
+    handler.requests = []
     return handler

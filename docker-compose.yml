@@ -36,6 +36,9 @@ services:
       SENSING_MAIL_FROM: ${SENSING_MAIL_FROM:-}
       SENSING_MAIL_AUTH: ${SENSING_MAIL_AUTH:-true}
       SENSING_MAIL_STARTTLS: ${SENSING_MAIL_STARTTLS:-true}
+      # 네이버 뉴스 검색: display(기본, 표시 전용) | store(저장·분석, 법무 확인 뒤) | off. 워커와 같은 값 — README 참고
+      SENSING_NAVER_MODE: ${SENSING_NAVER_MODE:-display}
+      SENSING_NAVER_API: ${SENSING_NAVER_API:-hub}
       JAVA_OPTS: "-Xmx1g"
     ports:
       - "8080:8080"
@@ -49,6 +52,9 @@ services:
       SENSING_DB_DSN: postgresql://sensing:sensing@db:5432/sensing
       SENSING_MIN_INTERVAL: "2"
       SENSING_SECRET_KEY: ${SENSING_SECRET_KEY:-sensing-dev-secret}
+      # 네이버 뉴스 검색 사용 방식·주소 (백엔드와 같은 값). display에서는 워커가 네이버 결과를 수집·저장하지 않는다
+      SENSING_NAVER_MODE: ${SENSING_NAVER_MODE:-display}
+      SENSING_NAVER_API: ${SENSING_NAVER_API:-hub}
       # 등록 시 LLM 레시피 생성 (비우면 휴리스틱 탐색만). none | anthropic | openai — README 워커 환경 변수 참고
       SENSING_LLM_PROVIDER: ${SENSING_LLM_PROVIDER:-}
       SENSING_LLM_MODEL: ${SENSING_LLM_MODEL:-}

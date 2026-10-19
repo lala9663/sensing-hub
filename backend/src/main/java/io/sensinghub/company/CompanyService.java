@@ -689,10 +689,15 @@ public class CompanyService {
         return new CompanyView(rs.getLong("id"), rs.getString("name"), strings(rs.getString("aliases")), rs.getString("biz_no"),
                 rs.getString("corp_code"), rs.getString("external_id"), strings(rs.getString("tags")), rs.getString("status"),
                 rs.getObject("watch_source_id", Long.class), rs.getString("watch_status"), rs.getString("watch_status_reason"),
-                rs.getObject("watch_naver", Boolean.class),
+                naverFlag(rs.getObject("watch_naver", Boolean.class)),
                 object(rs.getString("last_biz_status")), rs.getLong("signal_count"), rs.getLong("high_signal_count"), last,
                 rs.getLong("document_count"), rs.getString("created_by"), rs.getObject("created_at", OffsetDateTime.class),
                 rs.getObject("updated_at", OffsetDateTime.class));
+    }
+
+    /** 회사 감시의 네이버 저장 수집 표시: 설정이 네이버 모드여도 사용 방식이 store가 아니면(표시 전용) false. */
+    private Boolean naverFlag(Boolean configured) {
+        return configured == null ? null : configured && watches.naverStoreMode();
     }
 
     private SignalView mapSignal(ResultSet rs, int n) throws SQLException {

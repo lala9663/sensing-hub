@@ -3,7 +3,49 @@
 /** 관리자: 처리 대기 큐, 소스 목록·건강 상태·상세, API 키. */
 (() => {
   const { api, esc, badge, html } = App;
-  const PROVIDERS = [['dart', 'dart — DART 공시'], ['naver_news', 'naver_news — 네이버 뉴스 검색 (client_id:client_secret)'], ['data_go_kr', 'data_go_kr — 공공데이터포털']];
+  const PROVIDERS = [['dart', 'dart — DART 공시'], ['naver_news', 'naver_news — 네이버 뉴스 검색 (NAVER API HUB)'], ['data_go_kr', 'data_go_kr — 공공데이터포털']];
+  // 네이버 키 발급 안내 (NAVER API HUB, 2026-10 기준 콘솔 경로)
+  const NAVER_HELP = '발급: 네이버클라우드 콘솔 → Services → Application Service → NAVER API HUB → 이용 신청 → Application 등록'
+    + '(API 선택에서 "검색") → 인증 정보의 Client ID·Client Secret. 기본은 표시 전용입니다: 검색 결과를 저장·요약하지 않고 '
+    + '키워드 감시 화면의 "네이버 실시간"에서만 보여 줍니다.';
+
+  /** 제공자별 키 입력 칸. 네이버는 Client ID·Client Secret 두 칸을 받아 "id:secret" 한 문자열로 보낸다. */
+  function secretFieldsHtml(provider) {
+    if (provider === 'naver_news') {
+      return `<label class="field"><span>Client ID</span><input type="text" name="client_id" class="wide" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>Client Secret</span><input type="password" name="client_secret" class="wide" autocomplete="off"></label>`;
+    }
+    return '<label class="field"><span>키 (비밀)</span><input type="password" name="secret" class="wide" autocomplete="off"></label>';
+  }
+
+  function providerHelp(provider) {
+    return provider === 'naver_news' ? NAVER_HELP : '';
+  }
+
+  function readSecret(root, provider) {
+    if (provider === 'naver_news') {
+      const id = root.querySelector('[name=client_id]').value.trim();
+      const secret = root.querySelector('[name=client_secret]').value.trim();
+      if (!id || !secret) throw new Error('Client ID와 Client Secret을 모두 넣어 주세요.');
+      if (id.includes(':')) throw new Error('Client ID에는 ":"가 들어갈 수 없습니다.');
+      return `${id}:${secret}`;
+    }
+    const secret = root.querySelector('[name=secret]').value.trim();
+    if (!secret) throw new Error('키를 넣어 주세요.');
+    return secret;
+  }
+
+  /** 키 저장 결과 한 줄 (HTML). */
+  function saveSummary(result) {
+    return `${esc(result.credential.provider)} 키 저장 ${badge(result.credential.status)} — 기다리던 소스 <b>${result.resumedSources}</b>개를 다시 진행합니다.`
+      + (result.attachedWatches ? ` 키워드 감시 <b>${result.attachedWatches}</b>개에 네이버 검색을 함께 붙입니다.` : '')
+      + (result.note ? ` ${esc(result.note)}` : '');
+  }
+
+  /** 네이버 키 시험 호출 (백엔드가 검색 1건을 불러 상태를 VALID/INVALID로 남긴다). */
+  function verifyNaver() {
+    return api('POST', '/api-credentials/naver_news/verify');
+  }
 
   const ACTION_LABELS = {
     approve: '승인', reject: '반려', set_api_key: 'API 키 등록', recheck: '재점검', rediscover: '다시 탐색',
@@ -18,23 +60,34 @@
     const body = html(`
       <div>
         <label class="field"><span>제공자</span><select name="provider" class="wide">${PROVIDERS.map(([v, l]) => `<option value="${v}" ${v === provider ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-        <label class="field"><span>키 (비밀)</span><input type="password" name="secret" class="wide" autocomplete="off" required></label>
+        <div class="secret-fields"></div>
         <label class="field"><span>메모</span><input type="text" name="label" class="wide" placeholder="예: 공시 API, 2026-10 발급"></label>
+        <p class="muted small provider-help"></p>
         <p class="muted small">키는 암호화해 저장하며 어떤 응답에도 다시 보이지 않습니다. 이 키를 기다리던 소스는 자동으로 다시 진행됩니다.</p>
       </div>`);
+    const select = body.querySelector('[name=provider]');
     if (provider && !PROVIDERS.some(([v]) => v === provider)) {
-      body.querySelector('[name=provider]').insertAdjacentHTML('afterbegin', `<option value="${esc(provider)}" selected>${esc(provider)}</option>`);
+      select.insertAdjacentHTML('afterbegin', `<option value="${esc(provider)}" selected>${esc(provider)}</option>`);
     }
+    const renderFields = () => {
+      body.querySelector('.secret-fields').innerHTML = secretFieldsHtml(select.value);
+      body.querySelector('.provider-help').textContent = providerHelp(select.value);
+    };
+    select.addEventListener('change', renderFields);
+    renderFields();
     return App.modal({
       title: 'API 키 등록', body, okLabel: '저장',
-      onOk: b => {
-        const secret = b.querySelector('[name=secret]').value.trim();
-        if (!secret) throw new Error('키를 넣어 주세요.');
-        return api('POST', '/api-credentials', {
-          provider: b.querySelector('[name=provider]').value,
-          secret,
+      onOk: async b => {
+        const chosen = b.querySelector('[name=provider]').value;
+        const result = await api('POST', '/api-credentials', {
+          provider: chosen,
+          secret: readSecret(b, chosen),
           label: b.querySelector('[name=label]').value.trim() || null,
         });
+        if (chosen === 'naver_news') {
+          try { result.verify = await verifyNaver(); } catch (e) { result.verify = { message: e.message }; }
+        }
+        return result;
       },
     });
   }
@@ -107,7 +160,7 @@
           } else if (a === 'set_api_key') {
             const result = await apiKeyModal(it.provider);
             if (!result) return;
-            App.notice(`${result.credential.provider} 키 저장 — 기다리던 소스 ${result.resumedSources}개를 다시 진행합니다.${result.attachedWatches ? ` 키워드 감시 ${result.attachedWatches}개에 네이버 검색을 함께 붙입니다.` : ''}`);
+            App.notice(`${result.credential.provider} 키 저장 — 기다리던 소스 ${result.resumedSources}개를 다시 진행합니다.${result.attachedWatches ? ` 키워드 감시 ${result.attachedWatches}개에 네이버 검색을 함께 붙입니다.` : ''}${result.verify ? ` 시험 호출: ${result.verify.message}` : ''}`);
           } else {
             const s = await sourceAction(it.sourceId, a);
             if (!s) return;
@@ -490,13 +543,14 @@
       <h1>API 키</h1>
       <div class="panel">
         <h2>키 등록</h2>
-        <p class="muted small">키 발급은 사람이 합니다. 저장하면 암호화되어 보관되고, 이 키를 기다리던 소스(관리자 큐 API 키 필요)는 자동으로 다시 진행됩니다. 검증(시험 호출)은 워커가 하고 결과를 상태에 남깁니다.</p>
+        <p class="muted small">키 발급은 사람이 합니다. 저장하면 암호화되어 보관되고, 이 키를 기다리던 소스(관리자 큐 API 키 필요)는 자동으로 다시 진행됩니다. 검증(시험 호출)은 워커가 하고 결과를 상태에 남깁니다 (네이버는 저장 직후 백엔드가 시험 호출합니다).</p>
         <form id="form" class="form-grid">
           <label class="field"><span>제공자</span><select name="provider" class="wide">${PROVIDERS.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
-          <label class="field"><span>키 (비밀)</span><input type="password" name="secret" class="wide" autocomplete="off" required></label>
+          <div class="secret-fields" style="display:contents"></div>
           <label class="field"><span>메모</span><input type="text" name="label" class="wide" placeholder="예: 공시 API, 2026-10 발급"></label>
           <div class="field" style="align-self:end"><button type="submit" class="primary">저장</button></div>
         </form>
+        <p class="muted small" id="provider-help"></p>
         <div id="save-result" class="mt"></div>
       </div>
       <div class="panel">
@@ -515,10 +569,16 @@
               <td class="mono"><b>${esc(c.provider)}</b></td><td>${esc(c.label || '')}</td><td>${badge(c.status)}</td>
               <td class="nowrap">${App.fmtTime(c.lastVerifiedAt)}</td><td class="small" style="color:var(--red)">${esc(c.lastError || '')}</td>
               <td class="nowrap">${App.fmtTime(c.updatedAt)}</td>
-              <td class="actions"><button type="button" class="small danger remove">삭제</button></td>
+              <td class="actions">${c.provider === 'naver_news' ? '<button type="button" class="small verify" title="검색 1건을 불러 키를 확인합니다">시험 호출</button> ' : ''}<button type="button" class="small danger remove">삭제</button></td>
             </tr>`).join('')}
           </tbody>
         </table>` : '<div class="empty">등록된 키가 없습니다.</div>';
+      el.querySelectorAll('.verify').forEach(b => b.addEventListener('click', () => App.guard(async () => {
+        const v = await verifyNaver();
+        view.querySelector('#save-result').innerHTML =
+          `<div class="notice">naver_news 시험 호출 ${badge(v.status)} — ${esc(v.message)}</div>`;
+        await load();
+      })));
       el.querySelectorAll('.remove').forEach(b => b.addEventListener('click', () => App.guard(async () => {
         const provider = b.closest('tr').dataset.provider;
         if (!await App.confirm(`${provider} 키를 삭제할까요? 이 제공자의 소스는 다음 실행에서 API 키 필요로 멈춥니다.`, '삭제')) return;
@@ -528,18 +588,34 @@
     }
 
     const form = view.querySelector('#form');
+    const renderFields = () => {
+      form.querySelector('.secret-fields').innerHTML = secretFieldsHtml(form.provider.value);
+      view.querySelector('#provider-help').textContent = providerHelp(form.provider.value);
+    };
+    form.provider.addEventListener('change', renderFields);
+    renderFields();
     form.addEventListener('submit', e => {
       e.preventDefault();
       App.guard(async () => {
+        const provider = form.provider.value;
         const result = await api('POST', '/api-credentials', {
-          provider: form.provider.value,
-          secret: form.secret.value.trim(),
+          provider,
+          secret: readSecret(form, provider),
           label: form.label.value.trim() || null,
         });
-        view.querySelector('#save-result').innerHTML =
-          `<div class="notice">${esc(result.credential.provider)} 키 저장 ${badge(result.credential.status)} — 기다리던 소스 <b>${result.resumedSources}</b>개를 다시 진행합니다.${result.attachedWatches ? ` 키워드 감시 <b>${result.attachedWatches}</b>개에 네이버 검색을 함께 붙입니다.` : ''}</div>`;
-        form.secret.value = '';
+        let html = saveSummary(result);
+        renderFields();          // 비밀 칸을 비운다
         form.label.value = '';
+        if (provider === 'naver_news') {
+          // 표시 전용에서는 워커가 키를 확인하지 않으므로 저장 직후 백엔드가 시험 호출한다
+          try {
+            const v = await verifyNaver();
+            html += `<br>시험 호출 ${badge(v.status)} — ${esc(v.message)}`;
+          } catch (err) {
+            html += `<br>시험 호출 실패 — ${esc(err.message)}`;
+          }
+        }
+        view.querySelector('#save-result').innerHTML = `<div class="notice">${html}</div>`;
         await load();
       });
     });

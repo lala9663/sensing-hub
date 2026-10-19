@@ -208,6 +208,18 @@ a.tag:hover { text-decoration: underline; }
 }
 .error-banner span { flex: 1; word-break: break-all; }
 
+/* 키워드 감시: 네이버 뉴스 실시간 (표시 전용) */
+.naver-row > td { background: #f8fafc; }
+.naver-live { padding: 4px 4px 8px; }
+.naver-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.naver-head .chips { flex: 1; margin: 4px 0; }
+.naver-source { font-size: 11px; font-weight: 600; color: #03a94d; border: 1px solid #03a94d; border-radius: 3px; padding: 0 5px; white-space: nowrap; }
+.naver-items { list-style: none; margin: 4px 0; padding: 0; }
+.naver-items li { padding: 4px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.naver-items li > a { font-weight: 600; margin-right: 6px; }
+.naver-error { color: var(--red); }
+button.naver.active { background: var(--blue-bg); }
+
 .doc-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
 .doc-item .title { font-size: 14px; font-weight: 600; }
 .doc-item .title .ext { font-size: 11px; font-weight: normal; color: var(--muted); margin-left: 4px; white-space: nowrap; }

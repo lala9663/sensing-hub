@@ -60,6 +60,17 @@ class Settings:
     max_api_items_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_API_ITEMS", "500")))
     # 네이버 검색 API 일 호출 한도(공식 25,000)보다 낮게 잡은 우리 쪽 상한. 지금은 호출 수를 로그에 남기는 데만 쓴다
     naver_daily_limit: int = field(default_factory=lambda: int(os.getenv("SENSING_NAVER_DAILY_LIMIT", "20000")))
+    # 네이버 뉴스 검색 사용 방식 (백엔드 sensing.naver.mode와 같은 값이어야 한다):
+    #   display(기본) — 표시 전용. 개정 약관(2026-09-07, 저장·캐싱·AI 입력 금지)에 맞춰 워커는 네이버 결과를 수집·저장하지 않는다
+    #                   (감시 화면에서 백엔드가 실시간으로 불러와 보여 주기만 한다)
+    #   store        — 저장·분석. 법무 확인 뒤에만 켠다. 네이버 모드 감시(config naver true)를 주기 수집해 document에 저장한다
+    #   off          — 네이버를 쓰지 않는다
+    naver_mode: str = field(default_factory=lambda: os.getenv("SENSING_NAVER_MODE", "display").strip().lower())
+    # 네이버 검색 API 주소: hub(기본, NAVER API HUB naverapihub.apigw.ntruss.com) | developers(예전 개발자센터
+    # openapi.naver.com, 2027-06-30 지원 종료). 헤더 이름도 이에 따라 바뀐다
+    naver_api: str = field(default_factory=lambda: os.getenv("SENSING_NAVER_API", "hub").strip().lower())
+    # 검색 주소를 통째로 바꾼다 (테스트·프록시용). 비우면 naver_api의 공식 주소
+    naver_search_url: str = field(default_factory=lambda: os.getenv("SENSING_NAVER_SEARCH_URL", "").strip())
     # 등록 시 LLM이 수집 레시피(허브·기사 패턴·셀렉터)를 만들게 할지. none(기본) | anthropic | openai(OpenAI 호환 API)
     llm_provider: str = field(default_factory=lambda: os.getenv("SENSING_LLM_PROVIDER", "none"))
     llm_model: str = field(default_factory=lambda: os.getenv("SENSING_LLM_MODEL", "claude-opus-5-5"))

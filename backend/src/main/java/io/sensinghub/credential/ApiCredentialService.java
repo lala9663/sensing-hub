@@ -14,6 +14,7 @@ import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
+import io.sensinghub.naver.NaverSettings;
 import io.sensinghub.watch.WatchService;
 
 /**
@@ -23,8 +24,10 @@ import io.sensinghub.watch.WatchService;
  *       {@code SENSING_SECRET_KEY})이며 워커가 같은 키로 푼다. 비어 있으면 이 API는 503이다.</li>
  *   <li>키를 넣으면 그 제공자의 키를 기다리던 소스(REVIEW · API_KEY_REQUIRED/API_KEY_INVALID)에 ONBOARD 작업을
  *       넣어 자동으로 다시 진행시킨다. 검증(시험 호출)은 워커가 하고 결과를 status/last_error에 남긴다.</li>
- *   <li>네이버 뉴스 검색 키(naver_news)를 넣으면 수집 기사 대조 모드 키워드 감시에도 네이버 검색을 붙이고
- *       ({@link WatchService#attachNaver}), 지우면 네이버 모드 감시를 대조 모드로 되돌린다({@link WatchService#detachNaver}).</li>
+ *   <li>네이버 뉴스 검색 키(naver_news, NAVER API HUB "Client ID:Client Secret")는 형식을 확인한다. 기본 표시 전용에서는
+ *       감시에 아무것도 붙이지 않고(시험 호출은 {@code POST /api-credentials/naver_news/verify}, io.sensinghub.naver),
+ *       저장·분석(store)이면 수집 기사 대조 모드 키워드 감시에도 네이버 검색을 붙인다({@link WatchService#attachNaver}).
+ *       지우면 네이버 모드 감시를 대조 모드로 되돌린다({@link WatchService#detachNaver}).</li>
  *   <li>비밀은 응답·감사 로그·오류 메시지 어디에도 내지 않는다.</li>
  * </ul>
  * 화면·챗봇({@code submit_api_key})이 같은 메서드를 쓴다.
@@ -38,22 +41,25 @@ public class ApiCredentialService {
 
     /**
      * @param resumedSources  이 키를 기다리던 소스 중 ONBOARD 작업을 새로 넣은 수
-     * @param attachedWatches 네이버 키일 때 네이버 검색을 새로 붙인 수집 기사 대조 모드 감시 수 (그 밖의 제공자는 0)
+     * @param attachedWatches 네이버 키일 때 네이버 검색을 새로 붙인 수집 기사 대조 모드 감시 수 (그 밖의 제공자·표시 전용은 0)
+     * @param note            제공자별 안내 (네이버: 사용 방식에 따라 무엇을 하는지), 없으면 null
      */
-    public record SaveResult(CredentialView credential, int resumedSources, int attachedWatches) {
+    public record SaveResult(CredentialView credential, int resumedSources, int attachedWatches, String note) {
     }
 
     private final JdbcClient jdbc;
     private final AuditLogger audit;
     private final String secretKey;
     private final WatchService watches;
+    private final NaverSettings naver;
 
     public ApiCredentialService(JdbcClient jdbc, AuditLogger audit, @Value("${sensing.secret-key:}") String secretKey,
-                                WatchService watches) {
+                                WatchService watches, NaverSettings naver) {
         this.jdbc = jdbc;
         this.audit = audit;
         this.secretKey = secretKey == null ? "" : secretKey;
         this.watches = watches;
+        this.naver = naver;
     }
 
     @Transactional
@@ -62,6 +68,9 @@ public class ApiCredentialService {
         requireSecretKey();
         String id = normalize(provider);
         String name = label == null || label.isBlank() ? null : label.strip();
+        if (WatchService.PROVIDER.equals(id)) {
+            requireNaverFormat(secret);
+        }
         jdbc.sql("""
                 INSERT INTO api_credential (provider, label, secret_enc, status, created_by)
                 VALUES (?, ?, pgp_sym_encrypt(?, ?), 'UNVERIFIED', ?)
@@ -96,11 +105,31 @@ public class ApiCredentialService {
                     .update();
         }
         // 네이버 키면 수집 기사 대조 모드로 돌던 키워드 감시에도 네이버 검색을 붙인다 (대조는 그대로 계속된다).
-        // 위의 재개는 REVIEW 소스만, 이것은 ACTIVE·PAUSED 대조 모드 감시만 고르므로 겹치지 않는다
+        // 위의 재개는 REVIEW 소스만, 이것은 ACTIVE·PAUSED 대조 모드 감시만 고르므로 겹치지 않는다.
+        // 기본 표시 전용(display)에서는 붙이지 않는다 (attachNaver가 0) — 결과는 감시 화면의 실시간 보기로만 본다
         int attached = WatchService.PROVIDER.equals(id) ? watches.attachNaver(admin) : 0;
         audit.log(admin.id(), "API_CREDENTIAL_SAVED", "api_credential", null,
                 "{\"provider\":\"" + id + "\",\"resumedSources\":" + resumed + ",\"attachedWatches\":" + attached + "}");
-        return new SaveResult(get(id), resumed, attached);
+        return new SaveResult(get(id), resumed, attached, WatchService.PROVIDER.equals(id) ? naverNote() : null);
+    }
+
+    /** 네이버 키는 "Client ID:Client Secret" 한 문자열이다 (화면은 두 칸을 ':'로 이어 보낸다). */
+    private static void requireNaverFormat(String secret) {
+        String s = secret == null ? "" : secret.strip();
+        int colon = s.indexOf(':');
+        if (colon <= 0 || s.substring(colon + 1).isBlank() || s.substring(0, colon).isBlank()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST",
+                    "네이버 키는 Client ID와 Client Secret을 ':'로 이은 한 문자열입니다 (Client ID:Client Secret).");
+        }
+    }
+
+    private String naverNote() {
+        return switch (naver.mode()) {
+            case DISPLAY -> "네이버는 표시 전용입니다: 검색 결과를 저장·요약하지 않고 키워드 감시 화면의 '네이버 뉴스 실시간'에서만 "
+                    + "보여 줍니다. '시험 호출'로 키를 확인하세요.";
+            case STORE -> "네이버 저장·분석 모드(store): 키워드 감시에 네이버 검색 수집을 붙입니다. 키는 워커가 첫 수집 때 확인합니다.";
+            case OFF -> "네이버 사용이 꺼져 있어(SENSING_NAVER_MODE=off) 키는 저장만 합니다.";
+        };
     }
 
     public List<CredentialView> list(CurrentUser admin) {

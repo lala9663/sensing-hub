@@ -30,10 +30,13 @@ import io.sensinghub.watch.WatchService;
 /**
  * 실제 PostgreSQL(+pgvector)로 등록 → 작업 생성 → 스케줄러 흐름을 확인한다.
  * 빈 DB를 가리키는 SENSING_IT_DB_URL 환경 변수가 있을 때만 실행된다.
+ * 네이버 키를 넣으면 감시에 네이버 검색 수집을 붙이는 흐름은 저장·분석 모드(store, 법무 확인 뒤 켜는 설정)의 동작이라
+ * 이 클래스는 store로 띄운다. 기본 표시 전용(display)은 NaverNewsIT가 본다.
  */
 @EnabledIfEnvironmentVariable(named = "SENSING_IT_DB_URL", matches = "jdbc:postgresql:.+")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"sensing.scheduler.enabled=false", "sensing.digest.enabled=false"})
+        properties = {"sensing.scheduler.enabled=false", "sensing.digest.enabled=false", "sensing.naver.mode=store",
+                "sensing.naver.search-url=http://127.0.0.1:9/naver-not-called"})
 class RegistrationFlowIT {
 
     static final String SECRET_KEY = "it-secret-key";
@@ -482,7 +485,8 @@ class RegistrationFlowIT {
 
     @Test
     void credentialApiRefusesToWorkWithoutSecretKey() {
-        ApiCredentialService unconfigured = new ApiCredentialService(jdbc, audit, "", ctx.getBean(WatchService.class));
+        ApiCredentialService unconfigured = new ApiCredentialService(jdbc, audit, "", ctx.getBean(WatchService.class),
+                ctx.getBean(io.sensinghub.naver.NaverSettings.class));
         io.sensinghub.auth.CurrentUser admin = new io.sensinghub.auth.CurrentUser(1, "admin", "운영 관리자",
                 io.sensinghub.auth.Role.ADMIN);
         ApiException e = org.junit.jupiter.api.Assertions.assertThrows(ApiException.class,

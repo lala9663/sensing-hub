@@ -36,13 +36,15 @@ PROVIDERS: tuple[Provider, ...] = (
     Provider(
         id="naver_news",
         name="네이버 뉴스 검색",
-        domains=("news.naver.com", "n.news.naver.com", "openapi.naver.com"),
-        signup_url="https://developers.naver.com/apps/#/register",
+        domains=("news.naver.com", "n.news.naver.com", "openapi.naver.com", "naverapihub.apigw.ntruss.com"),
+        signup_url="https://console.ncloud.com",
         needs_key=True,
-        description="네이버 뉴스는 robots.txt가 전체 차단이라 크롤링하지 않고 검색 API(news.json)로 키워드별 보도를 받는다. "
-                    "언론 기사이므로 제목·링크·발행일만 저장한다. 키는 client_id:client_secret 한 문자열.",
-        key_required_message="네이버 뉴스는 크롤링이 금지돼 검색 API로 받습니다. 관리자가 네이버 API 키(client_id:client_secret)를 "
-                             "등록하면 진행됩니다. 발급: https://developers.naver.com/apps/#/register",
+        description="네이버 뉴스는 robots.txt가 전체 차단이라 크롤링하지 않고 NAVER API HUB 뉴스 검색(search/v1/news)으로 "
+                    "키워드별 보도를 본다. 개정 약관(저장·AI 입력 금지)에 맞춰 기본은 표시 전용(감시 화면 실시간 조회)이고, "
+                    "저장·분석(SENSING_NAVER_MODE=store)일 때만 제목·링크·발행일을 저장한다. 키는 Client ID:Client Secret 한 문자열.",
+        key_required_message="네이버 뉴스는 크롤링이 금지돼 검색 API로 봅니다. 관리자가 NAVER API HUB 키(Client ID:Client Secret)를 "
+                             "등록하면 진행됩니다. 발급: 네이버클라우드 콘솔 Services → Application Service → NAVER API HUB → "
+                             "Application 등록(검색 선택)",
         keyword_based=True,
     ),
     Provider(

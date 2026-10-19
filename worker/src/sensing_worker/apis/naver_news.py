@@ -1,14 +1,24 @@
-"""네이버 뉴스 검색 API 커넥터 (키워드 감시의 첫 소스).
+"""네이버 뉴스 검색 API 커넥터 (키워드 감시의 네이버 소스 — 저장·분석 모드 전용).
 
 - 네이버 뉴스 웹(news.naver.com)은 robots.txt가 전체 차단이라 크롤링하지 않는다. 검색 API로 키워드별 보도를 받는다.
-    GET https://openapi.naver.com/v1/search/news.json?query=<검색어>&display=100&start=1&sort=date
-    헤더 X-Naver-Client-Id / X-Naver-Client-Secret. 일 호출 한도 25,000 (Settings.naver_daily_limit로 우리 쪽 상한).
+- 주소는 Settings.naver_api로 고른다 (기본 hub):
+    hub        GET https://naverapihub.apigw.ntruss.com/search/v1/news?query=..&display=100&start=1&sort=date&format=json
+               헤더 X-NCP-APIGW-API-KEY-ID(Client ID) / X-NCP-APIGW-API-KEY(Client Secret). NAVER API HUB(네이버클라우드).
+               HTTPS만 된다(HTTP는 403). 검색 묶음 하루 25,000회·월 775,000회, 키당 50 RPS (2026-10 기준, 한시 무료).
+    developers GET https://openapi.naver.com/v1/search/news.json — 예전 개발자센터. 헤더 X-Naver-Client-Id / X-Naver-Client-Secret.
+               2026-07-31 신규 발급 종료, 2027-06-30 지원 종료. 기존 키를 가진 경우에만 쓴다.
+  Settings.naver_search_url이 있으면 주소만 그것으로 바꾼다 (헤더는 naver_api를 따른다).
+- 개정 약관(2026-09-07 시행)은 검색 결과의 저장·캐싱·AI 입력을 금지한다. 그래서 기본(Settings.naver_mode = display)에서는
+  워커가 이 커넥터로 수집하지 않고(jobs.naver_enabled), 감시 화면에서 백엔드가 실시간으로 불러와 보여 주기만 한다
+  (backend io.sensinghub.naver). 이 커넥터의 fetch는 법무 확인 뒤 naver_mode = store로 켰을 때만 쓴다.
 - 자격 증명(api_credential.secret)은 "client_id:client_secret" 한 문자열이다. 여기서 ':'로 나눈다.
   두 값 모두 로그·오류 메시지·증거 어디에도 남기지 않는다 (_mask).
-- 응답 items[]: title(HTML 태그 <b>·엔티티 포함), originallink(언론사 원문), link(네이버 링크), description, pubDate(RFC 1123).
+- 응답 items[]: title(HTML 태그 <b>·엔티티 포함), originallink(언론사 원문), link(네이버 링크, 없으면 원문), description, pubDate(RFC 1123).
   ApiItem은 url=originallink(비면 link), title=태그 제거·엔티티 복원, published_at=UTC, body=None (언론 기사: 제목·링크만),
   keyword=걸린 검색어. exclude 목록의 단어가 제목에 있으면 버린다.
-- 오류: HTTP 401/403(본문 errorCode 024 등) → API_KEY_INVALID, 429(한도 초과) → API_ERROR(재시도), 그 밖 → API_ERROR.
+- 오류 (describe_error): 401/403 → API_KEY_INVALID, 429(하루 허용량 초과) → API_ERROR(재시도), 400 SE01~SE04·SE06 / 404 SE05 /
+  300(API 없음) → API_ERROR(재시도 안 함), 5xx(SE99) → API_ERROR(재시도). 오류 본문은 두 형식이 있다:
+  검색 API {"errorCode": "SE02", "errorMessage": "..."}, API Gateway {"error": {"errorCode": "200", "message": "...", "details": "..."}}.
 """
 
 from __future__ import annotations
@@ -17,6 +27,7 @@ import html
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
@@ -27,12 +38,52 @@ from .base import ApiItem, mask_secret
 
 log = logging.getLogger(__name__)
 
-SEARCH_URL = "https://openapi.naver.com/v1/search/news.json"
+HUB_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
+DEVELOPERS_URL = "https://openapi.naver.com/v1/search/news.json"
 PAGE_SIZE = 100      # display 최대값
 MAX_PAGES = 3        # 검색어당 최대 페이지 (300건). 주기가 60분이라 그 사이 보도가 이보다 많으면 since로 어차피 끊긴다
 MAX_START = 1000     # start 최대값 (API 제한)
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    api: str
+    url: str
+    id_header: str
+    secret_header: str
+    extra_params: tuple[tuple[str, str], ...] = ()
+
+
+ENDPOINTS: dict[str, Endpoint] = {
+    "hub": Endpoint("hub", HUB_URL, "X-NCP-APIGW-API-KEY-ID", "X-NCP-APIGW-API-KEY", (("format", "json"),)),
+    "developers": Endpoint("developers", DEVELOPERS_URL, "X-Naver-Client-Id", "X-Naver-Client-Secret"),
+}
+
+# 검색 API 오류 코드 (NAVER API HUB 뉴스 검색 문서, 2026-10-19 확인)
+SE_MESSAGES: dict[str, str] = {
+    "SE01": "검색 요청 형식이 잘못됐습니다 (주소의 https·필수 변수 query 확인)",
+    "SE02": "display 값이 허용 범위(1~100)를 벗어났습니다",
+    "SE03": "start 값이 허용 범위(1~1000)를 벗어났습니다",
+    "SE04": "sort 값이 잘못됐습니다 (sim 또는 date)",
+    "SE05": "존재하지 않는 검색 API 주소입니다 (SENSING_NAVER_API·SENSING_NAVER_SEARCH_URL 확인)",
+    "SE06": "검색어 인코딩이 잘못됐습니다 (UTF-8)",
+    "SE99": "네이버 검색 서버 내부 오류입니다",
+}
+
+
+def endpoint_for(settings) -> Endpoint:
+    """Settings.naver_api·naver_search_url에 맞는 주소와 헤더 이름. 모르는 값이면 hub."""
+    api = str(getattr(settings, "naver_api", "hub") or "hub").strip().lower()
+    endpoint = ENDPOINTS.get(api)
+    if endpoint is None:
+        log.warning("SENSING_NAVER_API=%r is not hub|developers; using hub", api)
+        endpoint = ENDPOINTS["hub"]
+    override = str(getattr(settings, "naver_search_url", "") or "").strip()
+    if override:
+        endpoint = Endpoint(endpoint.api, override, endpoint.id_header, endpoint.secret_header, endpoint.extra_params)
+    return endpoint
 
 
 def split_secret(secret: str) -> tuple[str, str]:
@@ -41,9 +92,49 @@ def split_secret(secret: str) -> tuple[str, str]:
     client_id, sep, client_secret = text.partition(":")
     if not sep or not client_id.strip() or not client_secret.strip():
         raise CrawlFailure(Code.API_KEY_INVALID,
-                           f"{MESSAGES[Code.API_KEY_INVALID]} (네이버 키는 client_id:client_secret 형식이어야 합니다.)",
+                           f"{MESSAGES[Code.API_KEY_INVALID]} (네이버 키는 Client ID:Client Secret 형식이어야 합니다.)",
                            stage="PROBE")
     return client_id.strip(), client_secret.strip()
+
+
+def error_of(data: dict) -> tuple[str, str]:
+    """오류 본문 → (코드, 메시지). 검색 API 형식과 API Gateway 형식을 모두 읽는다. 없으면 ("", "")."""
+    if not isinstance(data, dict):
+        return "", ""
+    if data.get("errorCode") or data.get("errorMessage"):
+        return str(data.get("errorCode") or "").strip(), str(data.get("errorMessage") or "").strip()
+    gateway = data.get("error")
+    if isinstance(gateway, dict):
+        message = str(gateway.get("message") or "").strip()
+        details = str(gateway.get("details") or "").strip()
+        return str(gateway.get("errorCode") or "").strip(), f"{message}: {details}" if message and details else message or details
+    return "", ""
+
+
+def describe_error(status: int, code: str, message: str) -> tuple[Code, str, bool] | None:
+    """HTTP 상태·오류 코드 → (분류, 사람이 읽을 문장, 재시도 여부). 정상(200, 코드 없음)이면 None."""
+    detail = f"{code}: {message}" if code and message else code or message or f"HTTP {status}"
+    if status == 401:
+        return (Code.API_KEY_INVALID,
+                f"{MESSAGES[Code.API_KEY_INVALID]} (네이버 검색 인증 실패 — Client ID·Client Secret이 맞는지, "
+                f"API HUB Application에 '검색'이 선택돼 있는지 확인하세요. {detail})", False)
+    if status == 403:
+        return (Code.API_KEY_INVALID,
+                f"{MESSAGES[Code.API_KEY_INVALID]} (네이버 검색 호출이 허용되지 않았습니다 — Application의 검색 API 권한과 "
+                f"https 주소를 확인하세요. {detail})", False)
+    if status == 429:
+        return (Code.API_ERROR, f"네이버 검색 API 호출 한도(하루 허용량)를 넘었습니다 ({detail}). 다음 주기에 다시 시도합니다.",
+                True)
+    friendly = SE_MESSAGES.get(code)
+    if status in (300, 404):
+        return (Code.API_ERROR, f"네이버 검색 API 주소가 잘못됐습니다 — {friendly or 'API 없음'} ({detail})", False)
+    if status >= 500:
+        return (Code.API_ERROR, f"네이버 검색 API 서버 오류 — {friendly or '잠시 후 다시 시도합니다'} ({detail})", True)
+    if status != 200:
+        return (Code.API_ERROR, f"네이버 검색 API 요청 오류 — {friendly or '잘못된 요청'} ({detail})", False)
+    if code:
+        return (Code.API_ERROR, f"네이버 검색 API 오류 — {friendly or message or code} ({detail})", True)
+    return None
 
 
 def clean_title(raw: str | None) -> str | None:
@@ -73,6 +164,7 @@ class NaverNewsConnector:
 
     def __init__(self, fetcher: PoliteFetcher):
         self.f = fetcher
+        self.endpoint = endpoint_for(getattr(fetcher, "s", None))
         self.calls = 0   # 이 커넥터 객체가 보낸 API 호출 수 (일 한도 감시용 로그)
 
     def default_config(self) -> dict:
@@ -125,14 +217,16 @@ class NaverNewsConnector:
                 if start > min(_int(data.get("total"), MAX_START), MAX_START):
                     break
         used = self.calls - calls_before
-        log.info("naver news search: keywords=%s calls=%s items=%s (connector total %s, daily limit %s)",
-                 len(keywords), used, len(items), self.calls, getattr(self.f.s, "naver_daily_limit", None))
+        log.info("naver news search (%s): keywords=%s calls=%s items=%s (connector total %s, daily limit %s)",
+                 self.endpoint.api, len(keywords), used, len(items), self.calls,
+                 getattr(self.f.s, "naver_daily_limit", None))
         return items
 
     # ------------------------------------------------------------------
     def _call(self, client_id: str, client_secret: str, *, query: str, display: int, start: int) -> dict:
-        url = SEARCH_URL + "?" + urlencode({"query": query, "display": display, "start": start, "sort": "date"})
-        headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+        params = [("query", query), ("display", display), ("start", start), ("sort", "date"), *self.endpoint.extra_params]
+        url = self.endpoint.url + "?" + urlencode(params)
+        headers = {self.endpoint.id_header: client_id, self.endpoint.secret_header: client_secret}
         mask = lambda text: _mask(text, client_id, client_secret)   # noqa: E731
         self.calls += 1
         try:
@@ -148,22 +242,12 @@ class NaverNewsConnector:
                 data = parsed
         except ValueError:
             pass
-        error_code = str(data.get("errorCode") or "").strip()
-        error_message = mask(str(data.get("errorMessage") or "").strip())
-        detail = f"{error_code}: {error_message}" if error_code else f"HTTP {page.status}"
-
-        if page.status in (401, 403):
-            raise CrawlFailure(Code.API_KEY_INVALID, f"{MESSAGES[Code.API_KEY_INVALID]} (네이버 {detail})", url=url,
-                               http_status=page.status, stage="LIST")
-        if page.status == 429:
-            raise CrawlFailure(Code.API_ERROR, f"네이버 검색 API 호출 한도를 넘었습니다 ({detail}). 다음 주기에 다시 시도합니다.",
-                               url=url, http_status=429, retryable=True, stage="LIST", evidence=evidence)
-        if page.status != 200:
-            raise CrawlFailure(Code.API_ERROR, f"네이버 검색 API 오류 ({detail})", url=url, http_status=page.status,
-                               retryable=page.status >= 500, stage="LIST", evidence=evidence)
-        if error_code:
-            raise CrawlFailure(Code.API_ERROR, f"네이버 검색 API 오류 ({detail})", url=url, http_status=200,
-                               retryable=True, stage="LIST", evidence=evidence)
+        error_code, error_message = error_of(data)
+        problem = describe_error(page.status, error_code, mask(error_message) or "")
+        if problem is not None:
+            code, text, retryable = problem
+            raise CrawlFailure(code, text, url=url, http_status=page.status, retryable=retryable, stage="LIST",
+                               evidence=None if code == Code.API_KEY_INVALID else evidence)
         if not data or "items" not in data:
             raise CrawlFailure(Code.API_ERROR, "네이버 검색 API 응답이 예상한 JSON이 아닙니다.", url=url, http_status=200,
                                retryable=True, stage="LIST", evidence=evidence)
