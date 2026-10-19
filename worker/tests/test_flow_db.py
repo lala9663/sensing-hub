@@ -1128,3 +1128,18 @@ def test_non_portal_discovery_failure_still_goes_to_review(env, monkeypatch):
     src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", source_id)
     assert src["status"] == "REVIEW" and src["status_reason"] == "DISCOVERY_FAILED"
     assert q(store, "SELECT status FROM registration_request")["status"] == "REVIEW"
+
+
+def test_crawled_articles_are_matched_against_keyword_watches(env):
+    """네이버 키가 없어 REVIEW에 멈춘 감시라도, 우리가 긁어 온 기사에 키워드가 있으면 document_watch로 기록된다."""
+    store, runner, settings, sites = env
+    watch_id = register_watch(store, "자사 보도", ["기사 제목 103번", "없는말"], user_id=2)
+    site = Site(news_site_routes(range(101, 106))); sites.append(site)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) in ("SUCCESS", "FAILED")   # 감시 ONBOARD(키 없음 → REVIEW) 또는 사이트
+    assert process_one(store, runner, settings) in ("SUCCESS", "FAILED")
+    hits = store.conn.execute(
+        "SELECT w.keyword, d.title FROM document_watch w JOIN document d ON d.id = w.document_id WHERE w.source_id = %s",
+        (watch_id,)).fetchall()
+    assert [(h["keyword"], h["title"]) for h in hits] == [("기사 제목 103번", "기사 제목 103번 소식")]
+    assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "ACTIVE"

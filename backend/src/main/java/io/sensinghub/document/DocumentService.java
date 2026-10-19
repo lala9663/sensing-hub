@@ -75,7 +75,7 @@ public class DocumentService {
             """;
 
     public List<DocumentRow> list(CurrentUser user, String since, Long sourceId, String topic, String keyword,
-                                  Integer limit) {
+                                  String q, Integer limit) {
         user.require(Role.VIEWER);
         StringBuilder sql = new StringBuilder(ROW_SQL).append(" WHERE 1 = 1");
         List<Object> params = new ArrayList<>();
@@ -95,6 +95,14 @@ public class DocumentService {
         if (keyword != null && !keyword.isBlank()) {
             sql.append(" AND EXISTS (SELECT 1 FROM document_watch w WHERE w.document_id = d.id AND w.keyword = ?)");
             params.add(keyword.trim());
+        }
+        if (q != null && !q.isBlank()) {
+            // 제목·본문·요약 텍스트 검색 (부분 일치, 대소문자 무시). 전문 검색 인덱스(M5) 전의 단순 검색이다
+            String like = "%" + q.trim().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%";
+            sql.append(" AND (d.title ILIKE ? OR d.body_text ILIKE ? OR e.summary ILIKE ?)");
+            params.add(like);
+            params.add(like);
+            params.add(like);
         }
         sql.append(" ORDER BY d.published_at DESC NULLS LAST, d.id DESC LIMIT ?");
         params.add(clampLimit(limit));

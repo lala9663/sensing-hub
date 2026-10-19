@@ -35,8 +35,9 @@ public class DocumentController {
                                   @RequestParam(name = "source_id", required = false) Long sourceId,
                                   @RequestParam(required = false) String topic,
                                   @RequestParam(required = false) String keyword,
+                                  @RequestParam(required = false) String q,
                                   @RequestParam(required = false) Integer limit) {
-        return service.list(user, since, sourceId, topic, keyword, limit);
+        return service.list(user, since, sourceId, topic, keyword, q, limit);
     }
 
     /** 토픽별 건수 (since는 수집 시각 기준). */

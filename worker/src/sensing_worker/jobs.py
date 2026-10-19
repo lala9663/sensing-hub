@@ -23,6 +23,7 @@ from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
 from . import portal
 from .policy import defaults_for, guess_site_type, next_interval, passes_quality
 from .recipe import propose_recipe
+from .watchmatch import WatchKeywords, from_configs, match_keywords
 
 LLM_STEP_MESSAGE = "사이트 구조를 분석해 수집 방법을 만드는 중입니다."
 CHECK_INTERVAL_MINUTES = 1440   # 회사 단위 점검의 기본 주기 (하루 1회)
@@ -41,6 +42,7 @@ class CrawlStats:
     errors: int = 0
     field_missing: int = 0
     anomalies: int = 0
+    watch_hits: int = 0     # 긁어 온 문서가 키워드 감시에 걸린 수 (watchmatch)
 
 
 class JobRunner:
@@ -52,6 +54,7 @@ class JobRunner:
         self.evidence = evidence or EvidenceStore(settings.evidence_dir, settings.evidence_retention_days)
         # 등록 시 수집 레시피를 쓰는 LLM. 설정이 없으면 NoLlm → 휴리스틱 탐색만 한다
         self.llm = llm if llm is not None else make_llm(settings)
+        self._watch_cache: list[WatchKeywords] | None = None   # 작업 하나 동안의 키워드 감시 목록
 
     def _record(self, job: Job, failure: CrawlFailure) -> None:
         """실패를 기록한다. 응답 본문이 붙어 있으면 증거 파일로 남기고 경로를 함께 적는다."""
@@ -59,6 +62,7 @@ class JobRunner:
 
     def run(self, job: Job) -> str:
         source = self.db.load_source(job.source_id)
+        self._watch_cache = None   # 감시 키워드는 작업마다 다시 읽는다 (그 사이 감시가 바뀌었을 수 있다)
         try:
             if job.job_type == "ONBOARD":
                 return self._onboard(job, source)
@@ -380,6 +384,9 @@ class JobRunner:
                 stats.new += 1
             elif result == "UPDATED":
                 stats.updated += 1
+            if result in ("NEW", "UPDATED"):
+                # 긁어 온 기사도 키워드 감시에 대조한다 (본문은 저장 범위와 무관하게 대조에만 쓴다)
+                stats.watch_hits += self._match_watches(doc_id, art.title, art.body)
             if config.get("collect_attachments"):
                 for att_url, name in art.attachments:
                     self.db.add_attachment(doc_id, att_url, name)
@@ -435,9 +442,28 @@ class JobRunner:
                 self.db.add_watch_hit(doc_id, job.source_id, item.keyword)
                 if company_id is not None:
                     self.db.add_document_company(doc_id, company_id, "WATCH")
+            elif result in ("NEW", "UPDATED"):
+                # 감시가 아닌 API 소스(DART 공시 등)의 문서도 키워드 감시에 대조한다
+                stats.watch_hits += self._match_watches(doc_id, item.title, item.body)
             for att_url, name in item.attachments:
                 self.db.add_attachment(doc_id, att_url, name)
         return stats
+
+    # ------------------------------------------------------------------ 키워드 감시 대조 (수집 문서)
+    def _match_watches(self, doc_id: int, title: str | None, body: str | None) -> int:
+        """새로 저장한 문서를 모든 키워드 감시와 대조해 document_watch(와 회사 연결)로 남긴다. 걸린 감시 수를 돌려준다.
+
+        감시 목록은 작업 하나 동안만 캐시한다 (run()이 작업마다 비운다).
+        """
+        if self._watch_cache is None:
+            self._watch_cache = from_configs(self.db.load_watch_keywords())
+        hits = match_keywords(title, body, self._watch_cache)
+        for watch_id, keyword in hits:
+            self.db.add_watch_hit(doc_id, watch_id, keyword)
+            company_id = self.db.company_of_watch(watch_id)
+            if company_id is not None:
+                self.db.add_document_company(doc_id, company_id, "WATCH")
+        return len(hits)
 
     # ------------------------------------------------------------------ CHECK (회사 단위 점검, M3)
     def _check_job(self, job: Job, source: dict) -> str:

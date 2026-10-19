@@ -1996,3 +1996,19 @@ def test_portal_message_and_batch_id():
     assert portal_batch_id(7) == "portal:7"
     assert portal_message(12, "portal:7") == "링크 모음 페이지입니다. 이 페이지가 가리키는 언론사 12곳을 대신 등록했습니다. [묶음 portal:7]"
     assert portal_message(2, "portal:7", duplicates=1, over_cap=3).endswith("(이미 등록된 1곳 제외, 상한을 넘은 3곳 제외) [묶음 portal:7]")
+
+
+def test_watch_keywords_match_crawled_documents():
+    """긁어 온 기사도 키워드 감시에 대조한다: 대소문자·공백 무시, 제외어는 제목 기준, 감시당 처음 걸린 검색어 하나."""
+    from sensing_worker.watchmatch import from_configs, match_keywords
+    watches = from_configs([
+        {"id": 10, "config": {"keywords": ["메타넷", "메타넷글로벌"], "exclude": ["채용"]}},
+        {"id": 11, "config": {"keywords": ["반도체"], "exclude": []}},
+        {"id": 12, "config": {"keywords": [], "exclude": []}},            # 키워드 없는 감시는 뺀다
+    ])
+    assert [w.source_id for w in watches] == [10, 11]
+    assert match_keywords("메타넷글로벌, 반도체 공장 투자", None, watches) == [(10, "메타넷"), (11, "반도체")]
+    assert match_keywords("Metanet 신규 채용", "메타넷이 뽑는다", watches) == []           # 제외어가 제목에
+    assert match_keywords("경제 소식", "본문에 반도체 수출이 늘었다", watches) == [(11, "반도체")]   # 본문도 본다
+    assert match_keywords("메타 넷 소식", None, watches) == []                           # 띄어쓰기가 다르면 다른 말
+    assert match_keywords(None, None, watches) == []

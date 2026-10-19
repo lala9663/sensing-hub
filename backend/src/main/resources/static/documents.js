@@ -7,6 +7,7 @@ App.route('/documents', async (view, params, query) => {
   const filter = {
     period: query.get('period') || '7d',
     topic: query.get('topic') || '',
+    q: query.get('q') || '',
     keyword: query.get('keyword') || '',
     sourceId: query.get('source_id') || '',
   };
@@ -24,6 +25,7 @@ App.route('/documents', async (view, params, query) => {
         <div class="chips" id="topic-chips" style="margin:0"></div>
       </div>
       <form id="filter-form" class="row mt">
+        <input type="search" name="q" placeholder="제목·본문 검색 (예: 반도체)" value="${esc(filter.q)}" style="min-width:220px">
         <input type="text" name="keyword" placeholder="감시 검색어 (정확히 일치)" value="${esc(filter.keyword)}">
         <input type="number" name="sourceId" placeholder="소스 ID" value="${esc(filter.sourceId)}" style="width:110px;min-width:0">
         <button type="submit">적용</button>
@@ -68,7 +70,7 @@ App.route('/documents', async (view, params, query) => {
 
   async function loadList() {
     const list = await api('GET', '/documents' + App.qs({
-      since: since(), topic: filter.topic, keyword: filter.keyword, source_id: filter.sourceId, limit: 100,
+      since: since(), topic: filter.topic, q: filter.q, keyword: filter.keyword, source_id: filter.sourceId, limit: 100,
     }));
     const el = view.querySelector('#list');
     if (!list.length) {
@@ -120,11 +122,13 @@ App.route('/documents', async (view, params, query) => {
   const form = view.querySelector('#filter-form');
   form.addEventListener('submit', e => {
     e.preventDefault();
+    filter.q = form.q.value.trim();
     filter.keyword = form.keyword.value.trim();
     filter.sourceId = form.sourceId.value.trim();
     App.guard(loadList);
   });
   view.querySelector('#clear').addEventListener('click', () => {
+    filter.q = '';
     filter.keyword = '';
     filter.sourceId = '';
     filter.topic = '';

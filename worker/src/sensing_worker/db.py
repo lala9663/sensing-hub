@@ -350,6 +350,19 @@ class Store:
             ON CONFLICT (document_id, source_id) DO NOTHING
             """, (document_id, source_id, (keyword or "")[:200] or None))
 
+    def load_watch_keywords(self) -> list[dict]:
+        """수집 문서에 대조할 키워드 감시: 제외되지 않은 WATCH 소스의 id와 활성 설정(config: keywords·exclude).
+
+        키가 없어 REVIEW에 멈춘 감시도 포함한다 — 네이버에서 못 받아도 우리가 긁어 온 기사에서는 걸릴 수 있다.
+        """
+        return self.conn.execute(
+            """
+            SELECT s.id, v.config FROM source s
+            JOIN source_config_version v ON v.id = s.active_config_version_id
+            WHERE s.kind = 'WATCH' AND s.status <> 'EXCLUDED'
+            ORDER BY s.id
+            """).fetchall()
+
     # ------------------------------------------------------------------ 회사 (M3)
     def company_of_watch(self, source_id: int) -> int | None:
         """이 키워드 감시가 어느 회사의 감시(company.watch_source_id)인지. 아니면 None."""
