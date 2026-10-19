@@ -143,12 +143,19 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 
 ### 키워드 감시 (M2)
 
-현업(대외협력·커뮤니케이션)은 사이트가 아니라 키워드(자사·경쟁사·이슈) 단위로 보도를 봅니다. 키워드 묶음을 등록하면 네이버 뉴스 검색 API로
-60분마다 받아 문서로 저장하고, 어느 감시의 어느 검색어에 걸렸는지 `document_watch`에 남깁니다 (다이제스트가 이 표를 읽습니다).
-감시 하나는 `source` 한 행(`kind = WATCH`, `watch_name`)이고 키워드는 설정 버전 config(`{"method":"API","provider":"naver_news","keywords":[...],"exclude":[...]}`)에
-두므로, 키워드 수정은 설정 새 버전 활성화이고 롤백·일시정지·제외 같은 소스 조치를 그대로 씁니다. 네이버 뉴스 웹은 robots.txt가 전체 차단이라
-크롤링하지 않으며, `news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다.
-네이버 키는 `client_id:client_secret` 한 문자열로 `/api/v1/api-credentials`에 넣고(provider `naver_news`), 언론 기사이므로 제목·링크·발행일만 저장합니다.
+현업(대외협력·커뮤니케이션)은 사이트가 아니라 키워드(자사·경쟁사·이슈) 단위로 보도를 봅니다. 키워드 묶음을 등록하면 워커가 **등록된 언론사에서
+수집한 기사**마다 모든 감시의 키워드를 대조해(제목·본문, 제외어는 제목 기준) 어느 감시의 어느 검색어에 걸렸는지 `document_watch`에 남깁니다
+(다이제스트가 이 표를 읽습니다). 이것이 기본 동작인 **수집 기사 대조 모드**이고, 감시는 만들자마자 `ACTIVE`(화면 "수집 기사 대조 중")가 되지만
+스스로 수집하지 않으므로 `next_run_at`이 비어 있어 스케줄러가 작업을 넣지 않고, 관리자 키 큐에도 쌓이지 않습니다. 새로 수집되는 기사부터 대조하며,
+이미 쌓인 기사는 `python -m sensing_worker.backfill_watch --days 30`으로 한 번 대조할 수 있습니다. 커버리지는 등록 언론사 수가 정합니다.
+네이버 뉴스 검색 API는 2026-07-31부터 신규 발급이 중단돼 보통 키가 없습니다. 키(INVALID가 아닌 `naver_news`)가 있으면 감시를 만들 때 네이버 검색도
+함께 붙여(화면 "네이버 검색 함께") 60분(회사 감시 360분)마다 받아 옵니다. 키를 나중에 넣으면 대조 모드 감시에 네이버 검색을 붙이고(`attachedWatches`),
+키를 지우면 다시 대조 모드로 되돌립니다. 감시 하나는 `source` 한 행(`kind = WATCH`, `watch_name`)이고 키워드는 설정 버전
+config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"exclude":[...]}`, `naver`가 없으면 V13 이전 감시로 네이버 모드)에
+두므로, 키워드 수정은 설정 새 버전 활성화이고 롤백·일시정지·제외 같은 소스 조치를 그대로 씁니다. V13 마이그레이션이 키 없이 멈춰 있던
+감시(REVIEW `API_KEY_REQUIRED`/`API_KEY_INVALID`)를 대조 모드로 옮겼습니다. 네이버 뉴스 웹은 robots.txt가 전체 차단이라 크롤링하지 않으며,
+`news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다. 네이버 키가 있다면 `client_id:client_secret`
+한 문자열로 `/api/v1/api-credentials`에 넣고(provider `naver_news`), 언론 기사이므로 제목·링크·발행일만 저장합니다.
 
 ### 수집 시점 요약·분류 (M2)
 
@@ -203,7 +210,7 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 ### 회사(거래처) 마스터와 공급사 리스크 신호 (M3)
 
 현업이 구매 SaaS 케이던시아를 함께 쓰므로, 문서 중심 위에 **회사 중심**("어느 거래처에 무슨 일")을 한 층 얹습니다. 회사(`company`: 이름·별칭·
-사업자등록번호·DART 고유번호·외부 ID·태그)를 등록하면 ① 이름+별칭을 키워드로 한 네이버 뉴스 감시(`회사:<이름>`, 360분)가 생겨 걸린 기사를
+사업자등록번호·DART 고유번호·외부 ID·태그)를 등록하면 ① 이름+별칭을 키워드로 한 키워드 감시(`회사:<이름>`, 수집 기사 대조. 네이버 키가 있으면 네이버 검색 360분)가 생겨 걸린 기사를
 `document_company`(WATCH)로 연결하고, ② 보강 태그(고유명사)가 회사 이름·별칭과 **정확히**(대소문자·공백 무시) 일치하면 TAG로 연결하며
 (부분 일치·유사도 매칭은 오탐 때문에 하지 않습니다), ③ 연결된 기사의 토픽이 사건·사고·인사·조직이면 `company_signal`(NEWS, MEDIUM)을 남깁니다.
 ④ 첫 회사를 만들 때 **점검 소스**(`source.kind = CHECK`, 설정의 `check`가 점검 종류) 네 개가 생겨 모든 회사를 주기적으로 외부 API로 확인합니다.
@@ -235,7 +242,7 @@ curl -X POST localhost:8080/api/v1/registrations/bulk -H 'X-User: registrar' -H 
 curl localhost:8080/api/v1/registrations/batches/<batchId> -H 'X-User: registrar'   # 몇 분 뒤: 묶음의 completed·review·rejected·byStatus·byStep
 curl localhost:8080/api/v1/ops/overview -H 'X-User: admin'   # 관리자 운영 지표: 소스 상태별·처리 대기 큐·작업 큐 적체·24시간 결과·수집량·실패 코드·처리량(demandRatio>1이면 워커 부족). /ops/sources/health 는 조용히 멈춘 소스 순
 
-# 키워드 감시 등록 (네이버 뉴스 검색 API, 60분 주기. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
+# 키워드 감시 등록 (수집 기사 대조. 네이버 키가 있으면 네이버 검색도 60분 주기로. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
 curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
 curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
 
@@ -325,7 +332,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 
 ### 어디까지 왔고 무엇이 남았나 (2026-10-18)
 
-**된 것** — URL 하나(또는 수백 개 일괄)로 사이트가 자동 등록되고 주기 수집된다. 공개 API(DART·네이버 뉴스·공공데이터포털)와 키워드 감시,
+**된 것** — URL 하나(또는 수백 개 일괄)로 사이트가 자동 등록되고 주기 수집된다. 공개 API(DART·공공데이터포털, 네이버 뉴스는 키가 있을 때)와 키워드 감시(기본은 수집 기사 대조),
 수집 시점 요약·분류, 일간 다이제스트, 거래처 마스터와 위험 신호(국세청·DART 공시·조달청), 케이던시아 연동(목업), 링크 모음 페이지의
 언론사 자동 확장, 운영 지표, 그리고 이 모든 것을 다루는 브라우저 화면. 실측: 표본 10곳 중 9곳 자동 등록(10-19 재측정 10/10),
 주간지 8곳 중 6곳 자동 등록(REVIEW였던 한겨레21·주간한국은 10-19 규칙 보강 뒤 자동 등록), 뉴스스탠드 → 언론사 50곳 자동 등록.
@@ -373,6 +380,9 @@ M2에서 한 일:
   `PUT`으로 키워드 수정 = 설정 새 버전, 네이버 뉴스 검색 커넥터(`apis/naver_news.py`: 검색어별 `sort=date` 최대 3페이지, 제목 태그 제거,
   제목·링크·발행일만), `document_watch`에 감시·검색어 기록 (같은 기사가 여러 감시에 걸려도 문서는 하나). news.naver.com을 사이트로
   등록하면 `KEYWORDS_REQUIRED`로 안내
+- [x] 키워드 감시의 기본을 수집 기사 대조로 (2026-10-19, V13): 네이버 검색 API 신규 발급 중단으로 키가 없으면 감시를 만들 때 ONBOARD 없이
+  바로 ACTIVE(`next_run_at` NULL, config `"naver": false`)로 두고 워커가 수집 기사마다 대조한다. 키가 있으면 네이버 검색도 함께, 키를 나중에 넣거나
+  지우면 감시 모드를 따라 바꾼다. V13이 키 대기(REVIEW `API_KEY_*`)로 멈춘 감시를 대조 모드로 옮겨 관리자 키 큐에서 뺐다
 - [x] 수집 시점 요약·분류: 워커 보강 단계(`enrich.py`, 큐가 비었을 때 묶음 10건을 LLM 한 번에, `SENSING_ENRICH_*`)가
   `document_enrichment`(V6)에 토픽·태그·요약을 두고, `GET /api/v1/documents`(since·topic·keyword·source_id 필터, 상세, 토픽별 건수)로
   읽는다. 언론 기사는 제목만 분류하고 요약을 저장하지 않으며, LLM 장애·검증 실패는 수집에 번지지 않는다

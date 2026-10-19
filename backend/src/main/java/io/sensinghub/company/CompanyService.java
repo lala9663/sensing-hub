@@ -29,9 +29,9 @@ import io.sensinghub.watch.WatchService;
 /**
  * 회사(거래처) 마스터 (M3). 문서 중심 위에 "어느 회사에 무슨 일"을 한 층 얹는다.
  * <ul>
- *   <li>회사를 만들면 이름+별칭을 키워드로 한 네이버 뉴스 감시({@link WatchService#createForCompany}, "회사:&lt;이름&gt;", 360분)를
+ *   <li>회사를 만들면 이름+별칭을 키워드로 한 키워드 감시({@link WatchService#createForCompany}, "회사:&lt;이름&gt;", 360분)를
  *       만들어 {@code company.watch_source_id}에 둔다. 걸린 기사는 워커가 {@code document_company}(WATCH)로 연결하고,
- *       보강 토픽이 사건·사고·인사·조직이면 {@code company_signal}(NEWS)을 남긴다. 네이버 키가 없으면 감시는 API_KEY_REQUIRED 큐에 간다.</li>
+ *       보강 토픽이 사건·사고·인사·조직이면 {@code company_signal}(NEWS)을 남긴다. 감시는 기본으로 수집 기사 대조 모드이고, 네이버 뉴스 검색 키가 있으면 네이버 검색도 함께 쓴다({@link WatchService}).</li>
  *   <li>처음 회사를 만들 때 점검 소스({@code source.kind = CHECK}, {@link #CHECK_KINDS}) 네 개를 없을 때만 만든다: 국세청 사업자등록 상태
  *       (nts_status, api.odcloud.kr, 하루 1회), DART 고유번호 매핑(dart_corp_map, opendart.fss.or.kr, 주 1회), DART 회사별 공시
  *       (dart_disclosure, opendart.fss.or.kr, 6시간), 조달청 부정당업자(g2b_debarment, apis.data.go.kr, 하루 1회).
@@ -82,7 +82,7 @@ public class CompanyService {
 
     public record CompanyView(long id, String name, List<String> aliases, String bizNo, String corpCode, String externalId,
                               List<String> tags, String status, Long watchSourceId, String watchStatus,
-                              String watchStatusReason, Map<String, Object> lastBizStatus, long signalCount,
+                              String watchStatusReason, Boolean watchNaver, Map<String, Object> lastBizStatus, long signalCount,
                               long highSignalCount, SignalBrief lastSignal, long documentCount, String createdBy,
                               OffsetDateTime createdAt, OffsetDateTime updatedAt) {
     }
@@ -657,6 +657,8 @@ public class CompanyService {
     private static final String SELECT = """
             SELECT c.id, c.name, c.aliases::text AS aliases, c.biz_no, c.corp_code, c.external_id, c.tags::text AS tags,
                    c.status, c.watch_source_id, w.status AS watch_status, w.status_reason AS watch_status_reason,
+                   (SELECT COALESCE((v.config->>'naver')::boolean, true) FROM source_config_version v
+                    WHERE v.id = w.active_config_version_id) AS watch_naver,
                    c.last_biz_status::text AS last_biz_status, u.name AS created_by, c.created_at, c.updated_at,
                    (SELECT count(*) FROM company_signal g WHERE g.company_id = c.id) AS signal_count,
                    (SELECT count(*) FROM company_signal g WHERE g.company_id = c.id AND g.severity = 'HIGH') AS high_signal_count,
@@ -687,6 +689,7 @@ public class CompanyService {
         return new CompanyView(rs.getLong("id"), rs.getString("name"), strings(rs.getString("aliases")), rs.getString("biz_no"),
                 rs.getString("corp_code"), rs.getString("external_id"), strings(rs.getString("tags")), rs.getString("status"),
                 rs.getObject("watch_source_id", Long.class), rs.getString("watch_status"), rs.getString("watch_status_reason"),
+                rs.getObject("watch_naver", Boolean.class),
                 object(rs.getString("last_biz_status")), rs.getLong("signal_count"), rs.getLong("high_signal_count"), last,
                 rs.getLong("document_count"), rs.getString("created_by"), rs.getObject("created_at", OffsetDateTime.class),
                 rs.getObject("updated_at", OffsetDateTime.class));

@@ -26,13 +26,19 @@ import io.sensinghub.common.ApiException;
  * 키워드 감시 (M2). 현업은 사이트가 아니라 키워드(자사·경쟁사·이슈) 단위로 보도를 본다.
  * <ul>
  *   <li>감시 하나는 {@code source} 한 행({@code kind = WATCH}, {@code watch_name})이고, 키워드는 설정 버전의
- *       config({@code {"method":"API","provider":"naver_news","keywords":[...],"exclude":[...]}})에 둔다.
+ *       config({@code {"method":"API","provider":"naver_news","naver":true|false,"keywords":[...],"exclude":[...]}})에 둔다.
  *       site는 제공자 도메인 한 행(news.naver.com)을 여러 감시가 공유한다.</li>
- *   <li>등록 규칙은 사이트 등록과 같다: REGISTRAR 이상은 바로 ONBOARD 작업이 들어가고, VIEWER는 승인 대기
- *       ({@code registration_request} AWAITING_APPROVAL, 승인은 /registrations/{id}/approve).</li>
- *   <li>진행 상태는 registration_request 한 행({@code input_url = "watch:<이름>"})으로 /registrations/mine에서 본다.
- *       워커는 키가 없으면 REVIEW/API_KEY_REQUIRED로 멈추고, 관리자가 네이버 키를 넣으면 자동으로 다시 진행한다.</li>
- *   <li>키워드 수정은 설정 새 버전 활성화다 (이전 버전은 RETIRED로 남아 롤백할 수 있다).</li>
+ *   <li>기본 동작은 <b>수집 기사 대조</b>다: 워커가 등록된 언론사에서 긁어 온 기사마다 모든 감시의 키워드를 대조해
+ *       document_watch로 남긴다(워커 watchmatch). 이 모드({@code naver: false})의 감시는 ACTIVE지만
+ *       {@code next_run_at}이 NULL이라 스케줄러가 작업을 넣지 않는다.</li>
+ *   <li>네이버 뉴스 검색 API 키(api_credential naver_news, INVALID 아님)가 있으면 {@code naver: true}로 네이버 검색도 함께 붙인다:
+ *       ONBOARD → 주기 수집. 네이버는 2026-07-31부터 검색 API 신규 발급을 중단해 키가 없는 것이 보통이다.
+ *       키가 나중에 들어오면 {@link #attachNaver}가 대조 모드 감시에 네이버 검색을 붙이고, 키를 지우면 {@link #detachNaver}가
+ *       대조 모드로 되돌린다. config에 {@code naver}가 없는 감시(V13 이전에 만든 것)는 네이버 모드로 본다.</li>
+ *   <li>등록 규칙은 사이트 등록과 같다: REGISTRAR 이상은 바로 시작하고, VIEWER는 승인 대기
+ *       ({@code registration_request} AWAITING_APPROVAL, 승인은 /registrations/{id}/approve → {@link #start}).</li>
+ *   <li>진행 상태는 registration_request 한 행({@code input_url = "watch:<이름>"})으로 /registrations/mine에서 본다.</li>
+ *   <li>키워드 수정은 설정 새 버전 활성화다 (이전 버전은 RETIRED로 남아 롤백할 수 있다). 모드는 그대로 이어진다.</li>
  * </ul>
  */
 @Service
@@ -45,9 +51,12 @@ public class WatchService {
     static final int MAX_KEYWORDS = 50;
     /** 회사(거래처) 감시의 이름 접두어 (M3). */
     public static final String COMPANY_PREFIX = "회사:";
+    /** 수집 기사 대조 모드의 안내 문구 (등록 요청 결과 메시지). */
+    public static final String MATCH_MESSAGE = "등록된 언론사에서 수집한 기사에 키워드를 대조합니다.";
 
-    public record WatchView(long id, String name, List<String> keywords, List<String> exclude, String status,
-                            String statusReason, Integer configVersion, int intervalMinutes,
+    /** @param naver 네이버 뉴스 검색도 함께 쓰는지 (false면 수집 기사 대조만) */
+    public record WatchView(long id, String name, List<String> keywords, List<String> exclude, boolean naver,
+                            String status, String statusReason, Integer configVersion, int intervalMinutes,
                             OffsetDateTime lastSuccessAt, OffsetDateTime nextRunAt, long documentCount,
                             String requestedBy, Long registrationId, String registrationStatus,
                             String registrationMessage, OffsetDateTime createdAt) {
@@ -90,9 +99,9 @@ public class WatchService {
         String watchName = cleanName(COMPANY_PREFIX + companyName);
         jdbc.sql("UPDATE source SET watch_name = ?, name = ?, updated_at = now() WHERE id = ?")
                 .params(watchName, "watch:" + watchName, sourceId).update();
-        int version = activateVersion(sourceId, user, terms, List.of(), "회사 이름·별칭 수정");
-        jdbc.sql("UPDATE source SET next_run_at = now(), updated_at = now() WHERE id = ? AND status = 'ACTIVE'")
-                .param(sourceId).update();
+        boolean naver = isNaver(sourceId);
+        int version = activateVersion(sourceId, user, terms, List.of(), naver, "회사 이름·별칭 수정");
+        pullNextRun(sourceId, naver);
         audit.log(user.id(), "WATCH_UPDATED", "source", sourceId,
                 "{\"version\":" + version + ",\"keywords\":" + terms.size() + ",\"company\":true}");
     }
@@ -135,7 +144,8 @@ public class WatchService {
                 """)
                 .params(siteId, "watch:" + watchName, watchName, intervalMinutes, user.id())
                 .query(Long.class).single();
-        activateVersion(sourceId, user, terms, excluded, note);
+        boolean naver = naverAvailable();
+        activateVersion(sourceId, user, terms, excluded, naver, note);
 
         boolean needsApproval = viewerNeedsApproval && !user.role().atLeast(Role.REGISTRAR);
         long requestId = jdbc.sql("""
@@ -144,23 +154,143 @@ public class WatchService {
                 VALUES (?, ?, ?, 'WEB', ?, ?, ?, ?) RETURNING id
                 """)
                 .params(user.id(), "watch:" + watchName, DOMAIN,
-                        needsApproval ? "AWAITING_APPROVAL" : "PROCESSING",
-                        needsApproval ? null : "QUEUED",
-                        needsApproval ? "키워드 감시 요청이 접수되었습니다. 관리자 승인 후 자동으로 진행됩니다."
-                                : "키워드 감시를 접수했어요. 네이버 뉴스 검색 API 키를 확인한 뒤 첫 수집을 시작합니다.",
+                        needsApproval ? "AWAITING_APPROVAL" : "RECEIVED", null,
+                        needsApproval ? "키워드 감시 요청이 접수되었습니다. 관리자 승인 후 자동으로 진행됩니다." : null,
                         sourceId)
                 .query(Long.class).single();
         if (!needsApproval) {
-            jdbc.sql("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', 'REGISTRATION')")
-                    .param(sourceId).update();
+            start(user, sourceId, requestId, false);
         }
         audit.log(user.id(), needsApproval ? "WATCH_REQUESTED" : "WATCH_CREATED", "source", sourceId,
-                "{\"name\":" + quote(watchName) + ",\"keywords\":" + terms.size()
+                "{\"name\":" + quote(watchName) + ",\"keywords\":" + terms.size() + ",\"naver\":" + naver
                         + ",\"registrationId\":" + requestId + "}");
         return get(user, sourceId);
     }
 
-    /** 키워드 수정 = 설정 새 버전 활성화. 감시 중(ACTIVE)이면 다음 틱에 새 키워드로 바로 수집하게 next_run_at을 당긴다. */
+    /**
+     * 감시를 시작한다 (REGISTRAR 이상의 생성, VIEWER 요청의 관리자 승인). 지금 네이버 키가 있는지로 모드를 정하고, 설정의 표시가
+     * 다르면(승인을 기다리는 사이 키가 들어오거나 빠졌으면, 또는 V13 이전 요청이면) 같은 키워드로 설정 새 버전을 만든다.
+     * <ul>
+     *   <li>네이버 모드: ONBOARD 작업 → 워커가 키 확인·첫 검색 후 ACTIVE (요청은 PROCESSING).</li>
+     *   <li>대조 모드: 바로 ACTIVE(next_run_at NULL, 스케줄러가 잡지 않는다), 요청은 COMPLETED/DONE.</li>
+     * </ul>
+     * @return 네이버 모드인지
+     */
+    @Transactional
+    public boolean start(CurrentUser user, long sourceId, long requestId, boolean approved) {
+        boolean naver = naverAvailable();
+        String config = activeConfig(sourceId);
+        if (config == null || !parse(config).containsKey("naver") || naverOf(config) != naver) {
+            activateVersion(sourceId, user, terms(config, "keywords"), terms(config, "exclude"), naver,
+                    naver ? "네이버 뉴스 검색 키가 있어 네이버 검색 함께" : "네이버 키 없음 — 수집 기사 대조");
+        }
+        String lead = approved ? "승인되어 키워드 감시를 시작합니다. " : "키워드 감시를 시작합니다. ";
+        if (naver) {
+            jdbc.sql("""
+                    INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', 'REGISTRATION')
+                    ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
+                    """).param(sourceId).update();
+            updateRequest(requestId, "PROCESSING", "QUEUED",
+                    lead + MATCH_MESSAGE + " 네이버 뉴스 검색 API 키를 확인한 뒤 네이버 검색도 함께 첫 수집을 합니다.");
+        } else {
+            jdbc.sql("""
+                    UPDATE source SET status = 'ACTIVE', status_reason = NULL, next_run_at = NULL, consecutive_failures = 0,
+                           updated_at = now()
+                    WHERE id = ?
+                    """).param(sourceId).update();
+            updateRequest(requestId, "COMPLETED", "DONE", lead + MATCH_MESSAGE);
+        }
+        return naver;
+    }
+
+    /** 네이버 뉴스 검색 API 키가 있는가 (워커가 INVALID로 표시한 키는 없는 것으로 본다). */
+    public boolean naverAvailable() {
+        return jdbc.sql("SELECT count(*) FROM api_credential WHERE provider = ? AND status <> 'INVALID'")
+                .param(PROVIDER).query(Long.class).single() > 0;
+    }
+
+    /**
+     * 네이버 키가 들어왔다: 대조 모드 감시에 네이버 검색을 붙인다 (설정 새 버전 naver true). 수집 중(ACTIVE)이면 ONBOARD를 넣어
+     * 워커가 키를 확인하고 첫 검색을 하게 하고, 일시정지(PAUSED)면 설정만 바꾼다 (재개하면 네이버로 수집한다).
+     * 승인 대기(PENDING) 감시는 승인 때({@link #start}) 정한다. 수집 기사 대조는 모드와 관계없이 계속된다.
+     * @return 네이버 검색을 붙인 감시 수
+     */
+    @Transactional
+    public int attachNaver(CurrentUser admin) {
+        List<Long> ids = watchesInMode("s.status IN ('ACTIVE', 'PAUSED')", false);
+        for (long id : ids) {
+            String config = activeConfig(id);
+            activateVersion(id, admin, terms(config, "keywords"), terms(config, "exclude"), true,
+                    "네이버 뉴스 검색 API 키 등록 — 네이버 검색 함께");
+            int queued = jdbc.sql("""
+                    INSERT INTO crawl_job (source_id, job_type, trigger)
+                    SELECT id, 'ONBOARD', 'MANUAL' FROM source WHERE id = ? AND status = 'ACTIVE'
+                    ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
+                    """).param(id).update();
+            if (queued > 0) {
+                jdbc.sql("""
+                        UPDATE registration_request SET status = 'PROCESSING', step = 'QUEUED', updated_at = now(),
+                            result_message = '네이버 뉴스 검색 API 키가 등록되어 수집 기사 대조에 네이버 검색을 함께 붙입니다.'
+                        WHERE id = (SELECT max(id) FROM registration_request WHERE source_id = ?) AND status = 'COMPLETED'
+                        """).param(id).update();
+            }
+        }
+        return ids.size();
+    }
+
+    /**
+     * 네이버 키를 지웠다: 네이버 모드 감시(키를 기다리며 멈춘 것 포함)를 수집 기사 대조 모드로 되돌린다.
+     * 수집 중·키 대기(REVIEW API_KEY_*)는 ACTIVE(next_run_at NULL)로, 일시정지·대기(PENDING)는 설정만 바꾼다
+     * (대기 중인 ONBOARD는 워커가 대조 모드로 끝낸다, 승인 대기는 승인 때 다시 정한다). 열린 등록 요청은 완료로 닫는다.
+     * @return 대조 모드로 바꾼 감시 수
+     */
+    @Transactional
+    public int detachNaver(CurrentUser admin) {
+        List<Long> ids = watchesInMode("(s.status IN ('ACTIVE', 'PAUSED', 'PENDING') OR (s.status = 'REVIEW' "
+                + "AND s.status_reason IN ('API_KEY_REQUIRED', 'API_KEY_INVALID')))", true);
+        for (long id : ids) {
+            String config = activeConfig(id);
+            activateVersion(id, admin, terms(config, "keywords"), terms(config, "exclude"), false,
+                    "네이버 뉴스 검색 API 키 삭제 — 수집 기사 대조");
+            jdbc.sql("""
+                    UPDATE source SET status = 'ACTIVE', status_reason = NULL, next_run_at = NULL, consecutive_failures = 0,
+                           updated_at = now()
+                    WHERE id = ? AND status IN ('ACTIVE', 'REVIEW')
+                    """).param(id).update();
+            jdbc.sql("""
+                    UPDATE registration_request SET status = 'COMPLETED', step = 'DONE', result_message = ?, updated_at = now()
+                    WHERE source_id = ? AND status IN ('RECEIVED', 'PROCESSING', 'REVIEW')
+                    """).params("네이버 뉴스 검색 API 키가 없어 " + MATCH_MESSAGE, id).update();
+        }
+        return ids.size();
+    }
+
+    /** 활성 설정의 네이버 모드가 naver와 같은 감시 중 상태 조건에 맞는 것 (naver 표시가 없으면 네이버 모드로 본다). */
+    private List<Long> watchesInMode(String statusCondition, boolean naver) {
+        return jdbc.sql("""
+                SELECT s.id FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id
+                WHERE s.kind = 'WATCH' AND %s AND COALESCE((v.config->>'naver')::boolean, true) = ?
+                ORDER BY s.id
+                """.formatted(statusCondition)).param(naver).query(Long.class).list();
+    }
+
+    /** 네이버 모드로 감시 중이면 다음 틱에 새 키워드로 바로 검색하게 한다. 대조 모드는 next_run_at을 NULL로 둔다. */
+    private void pullNextRun(long sourceId, boolean naver) {
+        if (naver) {
+            jdbc.sql("UPDATE source SET next_run_at = now(), updated_at = now() WHERE id = ? AND status = 'ACTIVE'")
+                    .param(sourceId).update();
+        }
+    }
+
+    private void updateRequest(long requestId, String status, String step, String message) {
+        jdbc.sql("UPDATE registration_request SET status = ?, step = ?, result_message = ?, updated_at = now() WHERE id = ?")
+                .params(status, step, message, requestId).update();
+    }
+
+    /**
+     * 키워드 수정 = 설정 새 버전 활성화 (모드는 그대로). 네이버 모드로 감시 중(ACTIVE)이면 다음 틱에 새 키워드로 바로 검색하게
+     * next_run_at을 당긴다. 대조 모드는 워커가 다음 수집 작업부터 새 키워드로 대조하므로 당길 것이 없다.
+     */
     @Transactional
     public WatchView update(CurrentUser user, long id, String name, List<String> keywords, List<String> exclude) {
         WatchView current = get(user, id);
@@ -178,9 +308,9 @@ public class WatchService {
             jdbc.sql("UPDATE source SET watch_name = ?, name = ?, updated_at = now() WHERE id = ?")
                     .params(watchName, "watch:" + watchName, id).update();
         }
-        int version = activateVersion(id, user, terms, excluded, "키워드 수정");
-        jdbc.sql("UPDATE source SET next_run_at = now(), updated_at = now() WHERE id = ? AND status = 'ACTIVE'")
-                .param(id).update();
+        boolean naver = isNaver(id);
+        int version = activateVersion(id, user, terms, excluded, naver, "키워드 수정");
+        pullNextRun(id, naver);
         audit.log(user.id(), "WATCH_UPDATED", "source", id,
                 "{\"version\":" + version + ",\"keywords\":" + terms.size() + "}");
         return get(user, id);
@@ -220,10 +350,11 @@ public class WatchService {
 
     /** 새 설정 버전을 ACTIVE로 만들고 소스가 가리키게 한다 (이전 ACTIVE는 RETIRED). 버전 번호를 돌려준다. */
     private int activateVersion(long sourceId, CurrentUser user, List<String> keywords, List<String> exclude,
-                                String note) {
+                                boolean naver, String note) {
         Map<String, Object> config = new LinkedHashMap<>();
         config.put("method", "API");
         config.put("provider", PROVIDER);
+        config.put("naver", naver);
         config.put("keywords", keywords);
         config.put("exclude", exclude);
         int version = jdbc.sql("SELECT COALESCE(MAX(version), 0) + 1 FROM source_config_version WHERE source_id = ?")
@@ -282,20 +413,38 @@ public class WatchService {
         }
     }
 
-    private List<String> terms(String configJson, String field) {
+    private Map<String, Object> parse(String configJson) {
         if (configJson == null) {
-            return List.of();
+            return Map.of();
         }
         try {
-            Map<String, Object> config = json.readValue(configJson, new TypeReference<Map<String, Object>>() { });
-            Object value = config.get(field);
-            if (value instanceof List<?> list) {
-                return list.stream().filter(String.class::isInstance).map(String.class::cast).toList();
-            }
-            return List.of();
+            return json.readValue(configJson, new TypeReference<Map<String, Object>>() { });
         } catch (JsonProcessingException e) {
-            return List.of();
+            return Map.of();
         }
+    }
+
+    private List<String> terms(String configJson, String field) {
+        if (parse(configJson).get(field) instanceof List<?> list) {
+            return list.stream().filter(String.class::isInstance).map(String.class::cast).toList();
+        }
+        return List.of();
+    }
+
+    /** config의 naver 표시. 없으면(V13 이전에 만든 감시) 네이버 모드로 본다. 워커 jobs.naver_enabled와 같은 규칙. */
+    private boolean naverOf(String configJson) {
+        return !Boolean.FALSE.equals(parse(configJson).get("naver"));
+    }
+
+    private boolean isNaver(long sourceId) {
+        return naverOf(activeConfig(sourceId));
+    }
+
+    private String activeConfig(long sourceId) {
+        return jdbc.sql("""
+                SELECT v.config::text FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id
+                WHERE s.id = ?
+                """).param(sourceId).query(String.class).optional().orElse(null);
     }
 
     private static String quote(String text) {
@@ -318,7 +467,7 @@ public class WatchService {
     private WatchView map(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
         String config = rs.getString("config");
         return new WatchView(rs.getLong("id"), rs.getString("watch_name"), terms(config, "keywords"),
-                terms(config, "exclude"), rs.getString("status"), rs.getString("status_reason"),
+                terms(config, "exclude"), naverOf(config), rs.getString("status"), rs.getString("status_reason"),
                 (Integer) rs.getObject("config_version"), rs.getInt("interval_minutes"),
                 rs.getObject("last_success_at", OffsetDateTime.class), rs.getObject("next_run_at", OffsetDateTime.class),
                 rs.getLong("document_count"), rs.getString("requested_by"),

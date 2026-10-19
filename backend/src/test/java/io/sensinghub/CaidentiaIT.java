@@ -197,7 +197,7 @@ class CaidentiaIT {
         mockCall(MOCK_KEY, HttpMethod.PUT, "/suppliers/SUP-0003", "{\"status\":\"ACTIVE\"}");
         assertThat(counts(post("admin", "/api/v1/integrations/caidentia/sync-now"))).isEqualTo("SUCCESS|9|0|1|0|8");
         assertThat(one("SELECT c.status || '|' || s.status FROM company c JOIN source s ON s.id = c.watch_source_id WHERE c.id = ?", da))
-                .isEqualTo("ACTIVE|PENDING");
+                .isEqualTo("ACTIVE|ACTIVE");                       // 새 감시는 수집 기사 대조 모드라 바로 ACTIVE
         assertThat(count("SELECT count(*) FROM company")).isEqualTo(9L);
 
         // 상태: 마지막 동기화와 기록 5건 (최근 순)

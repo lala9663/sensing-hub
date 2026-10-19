@@ -24,6 +24,7 @@ import io.sensinghub.audit.AuditLogger;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.credential.ApiCredentialService;
 import io.sensinghub.scheduler.CrawlScheduler;
+import io.sensinghub.watch.WatchService;
 
 /**
  * 실제 PostgreSQL(+pgvector)로 등록 → 작업 생성 → 스케줄러 흐름을 확인한다.
@@ -47,6 +48,7 @@ class RegistrationFlowIT {
     @Autowired JdbcClient jdbc;
     @Autowired org.springframework.context.ApplicationContext ctx;
     @Autowired AuditLogger audit;
+    @Autowired javax.sql.DataSource dataSource;
 
     @BeforeEach
     void clean() {
@@ -212,31 +214,38 @@ class RegistrationFlowIT {
     }
 
     @Test
-    void registrarCreatesKeywordWatchAsApiSourceWithOnboardJob() {
+    void registrarCreatesKeywordWatchInLocalMatchModeWithoutNaverKey() {
         ResponseEntity<String> res = post("registrar", "/api/v1/watches",
                 "{\"name\":\" 자사  보도 \",\"keywords\":[\"메타넷\",\" 메타넷글로벌 \",\"메타넷\",\"\"],\"exclude\":[\"채용\"]}");
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
-        assertThat(res.getBody()).contains("\"name\":\"자사 보도\"").contains("\"status\":\"PENDING\"")
+        assertThat(res.getBody()).contains("\"name\":\"자사 보도\"").contains("\"status\":\"ACTIVE\"").contains("\"naver\":false")
                 .contains("\"keywords\":[\"메타넷\",\"메타넷글로벌\"]").contains("\"exclude\":[\"채용\"]")
-                .contains("\"configVersion\":1").contains("\"intervalMinutes\":60")
-                .contains("\"registrationStatus\":\"PROCESSING\"").contains("\"documentCount\":0");
+                .contains("\"configVersion\":1").contains("\"intervalMinutes\":60").contains("\"nextRunAt\":null")
+                .contains("\"registrationStatus\":\"COMPLETED\"").contains("수집한 기사에 키워드를 대조합니다")
+                .contains("\"documentCount\":0");
 
+        // 네이버 키가 없으니 수집 기사 대조 모드: 바로 ACTIVE지만 next_run_at NULL이라 스케줄러가 작업을 넣지 않는다
         long sourceId = jdbc.sql("SELECT id FROM source WHERE kind = 'WATCH'").query(Long.class).single();
         assertThat(jdbc.sql("SELECT watch_name || '|' || method || '|' || status || '|' || interval_minutes || '|' || name "
-                + "FROM source WHERE id = ?").param(sourceId).query(String.class).single())
-                .isEqualTo("자사 보도|API|PENDING|60|watch:자사 보도");
+                + "FROM source WHERE id = ? AND next_run_at IS NULL").param(sourceId).query(String.class).single())
+                .isEqualTo("자사 보도|API|ACTIVE|60|watch:자사 보도");
         assertThat(jdbc.sql("SELECT t.domain || '|' || t.base_url || '|' || (t.risk_flags->>'api_provider') "
                 + "FROM site t JOIN source s ON s.site_id = t.id WHERE s.id = ?").param(sourceId).query(String.class).single())
                 .isEqualTo("news.naver.com|https://news.naver.com|naver_news");
         assertThat(jdbc.sql("SELECT v.version || '|' || v.status || '|' || v.config::text FROM source_config_version v "
                 + "JOIN source s ON s.active_config_version_id = v.id WHERE s.id = ?").param(sourceId).query(String.class).single())
-                .isEqualTo("1|ACTIVE|{\"method\": \"API\", \"exclude\": [\"채용\"], \"keywords\": [\"메타넷\", \"메타넷글로벌\"], "
-                        + "\"provider\": \"naver_news\"}");
-        assertThat(jdbc.sql("SELECT job_type || ':' || status || ':' || trigger FROM crawl_job WHERE source_id = ?")
-                .param(sourceId).query(String.class).single()).isEqualTo("ONBOARD:QUEUED:REGISTRATION");
-        assertThat(jdbc.sql("SELECT input_url || '|' || normalized_domain || '|' || status || '|' || step "
+                .isEqualTo("1|ACTIVE|{\"naver\": false, \"method\": \"API\", \"exclude\": [\"채용\"], "
+                        + "\"keywords\": [\"메타넷\", \"메타넷글로벌\"], \"provider\": \"naver_news\"}");
+        assertThat(jdbc.sql("SELECT count(*) FROM crawl_job WHERE source_id = ?").param(sourceId).query(Long.class).single())
+                .isZero();
+        assertThat(new CrawlScheduler(jdbc).enqueueDueSources()).isZero();
+        assertThat(jdbc.sql("SELECT input_url || '|' || normalized_domain || '|' || status || '|' || step || '|' || result_message "
                 + "FROM registration_request WHERE source_id = ?").param(sourceId).query(String.class).single())
-                .isEqualTo("watch:자사 보도|news.naver.com|PROCESSING|QUEUED");
+                .isEqualTo("watch:자사 보도|news.naver.com|COMPLETED|DONE|키워드 감시를 시작합니다. 등록된 언론사에서 수집한 기사에 키워드를 대조합니다.");
+        // 관리자 키 큐에 쌓이지 않고, 운영 화면의 지연(overdue)·예정 실행에도 잡히지 않는다
+        assertThat(get("admin", "/api/v1/review-queue")).isEmpty();
+        assertThat(get("admin", "/api/v1/ops/sources/health").get(0).get("overdue").asBoolean()).isFalse();
+        assertThat(get("admin", "/api/v1/ops/overview").get("throughput").get("scheduledRunsPerHour").asDouble()).isZero();
 
         // 요청자는 /registrations/mine과 /watches로 진행 상태를 본다. 남의 감시는 안 보이고 ADMIN은 전부 본다
         assertThat(get("registrar", "/api/v1/registrations/mine").toString()).contains("watch:자사 보도");
@@ -277,8 +286,10 @@ class RegistrationFlowIT {
                 .contains("\"exclude\":[\"채용\"]");                                   // 생략한 필드는 그대로
         assertThat(jdbc.sql("SELECT string_agg(version || ':' || status, ',' ORDER BY version) FROM source_config_version "
                 + "WHERE source_id = ?").param(sourceId).query(String.class).single()).isEqualTo("1:RETIRED,2:ACTIVE");
-        assertThat(jdbc.sql("SELECT v.version FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id "
-                + "WHERE s.id = ?").param(sourceId).query(Integer.class).single()).isEqualTo(2);
+        // 모드는 그대로 이어지고, 대조 모드라 next_run_at을 당기지 않는다 (워커가 다음 수집 작업부터 새 키워드로 대조한다)
+        assertThat(jdbc.sql("SELECT v.version || '|' || (v.config->>'naver') || '|' || (s.next_run_at IS NULL) FROM source s "
+                + "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = ?").param(sourceId)
+                .query(String.class).single()).isEqualTo("2|false|true");
         assertThat(post("admin", "/api/v1/sources/" + sourceId + "/configs/1/activate", "").getBody())
                 .contains("\"configVersion\":1");                                       // 기존 롤백도 그대로 된다
         assertThat(jdbc.sql("SELECT string_agg(action, ',' ORDER BY id) FROM audit_log").query(String.class).single())
@@ -286,7 +297,7 @@ class RegistrationFlowIT {
     }
 
     @Test
-    void viewerWatchWaitsForApprovalAndAdminApprovalQueuesOnboard() {
+    void viewerWatchWaitsForApprovalAndApprovalStartsLocalMatch() {
         ResponseEntity<String> res = post("viewer", "/api/v1/watches", "{\"name\":\"경쟁사\",\"keywords\":[\"A사\",\"B사\"]}");
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
         assertThat(res.getBody()).contains("\"registrationStatus\":\"AWAITING_APPROVAL\"").contains("\"status\":\"PENDING\"");
@@ -301,12 +312,14 @@ class RegistrationFlowIT {
         assertThat(queue.get(0).get("inputUrl").asText()).isEqualTo("watch:경쟁사");
         assertThat(queue.get(0).get("domain").asText()).isEqualTo("news.naver.com");
 
+        // 승인도 생성과 같은 규칙: 네이버 키가 없으니 수집 기사 대조로 바로 ACTIVE (ONBOARD 없음)
         assertThat(post("admin", "/api/v1/registrations/" + requestId + "/approve", "").getBody())
-                .contains("\"status\":\"PROCESSING\"").contains("키워드 감시를 시작");
-        assertThat(jdbc.sql("SELECT job_type || ':' || status FROM crawl_job WHERE source_id = ?").param(sourceId)
-                .query(String.class).single()).isEqualTo("ONBOARD:QUEUED");
+                .contains("\"status\":\"COMPLETED\"").contains("승인되어 키워드 감시를 시작").contains("수집한 기사에 키워드를 대조");
+        assertThat(jdbc.sql("SELECT count(*) FROM crawl_job").query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("SELECT status || '|' || (next_run_at IS NULL) FROM source WHERE id = ?").param(sourceId)
+                .query(String.class).single()).isEqualTo("ACTIVE|true");
         assertThat(jdbc.sql("SELECT count(*) FROM source_config_version WHERE source_id = ?").param(sourceId)
-                .query(Long.class).single()).isEqualTo(1L);                             // 승인은 설정을 다시 만들지 않는다
+                .query(Long.class).single()).isEqualTo(1L);                             // 모드가 같으면 설정을 다시 만들지 않는다
         assertThat(get("admin", "/api/v1/review-queue")).isEmpty();
 
         // 반려하면 미리 만들어 둔 감시 소스는 EXCLUDED
@@ -323,8 +336,152 @@ class RegistrationFlowIT {
     }
 
     @Test
+    void naverKeyAttachesNaverSearchToMatchWatchesAndDeletingItFallsBackToMatch() {
+        // A: 대조 모드 수집 중, C: 대조 모드 일시정지, L: V13 이전 네이버 감시가 키를 기다리며 멈춤, B: VIEWER 요청(승인 대기)
+        post("registrar", "/api/v1/watches", "{\"name\":\"A\",\"keywords\":[\"에이\"]}");
+        post("registrar", "/api/v1/watches", "{\"name\":\"C\",\"keywords\":[\"씨\"]}");
+        post("registrar", "/api/v1/watches", "{\"name\":\"L\",\"keywords\":[\"엘\"]}");
+        post("viewer", "/api/v1/watches", "{\"name\":\"B\",\"keywords\":[\"비\"]}");
+        long a = watchId("A");
+        long c = watchId("C");
+        long l = watchId("L");
+        long b = watchId("B");
+        jdbc.sql("UPDATE source SET status = 'PAUSED' WHERE id = ?").param(c).update();
+        legacyWaitingForKey(l, "API_KEY_REQUIRED");
+        assertThat(get("admin", "/api/v1/review-queue?kind=api_key")).hasSize(1);
+
+        // 네이버 키 등록: L은 기존 재개(ONBOARD), A·C는 네이버 검색을 붙인다(설정 v2 naver true). 수집 중인 A만 ONBOARD
+        String body = "{\"provider\":\"naver_news\",\"secret\":\"client-id:client-secret\"}";
+        assertThat(post("admin", "/api/v1/api-credentials", body).getBody())
+                .contains("\"resumedSources\":1").contains("\"attachedWatches\":2");
+        assertThat(mode(a)).isEqualTo("2|true|ACTIVE");
+        assertThat(mode(c)).isEqualTo("2|true|PAUSED");
+        assertThat(mode(l)).isEqualTo("1|-|REVIEW");
+        assertThat(mode(b)).isEqualTo("1|false|PENDING");                               // 승인 때 정한다
+        assertThat(queuedJobs()).isEqualTo(a + ":ONBOARD:MANUAL," + l + ":ONBOARD:MANUAL");
+        assertThat(requestState(a)).isEqualTo("PROCESSING|QUEUED|네이버 뉴스 검색 API 키가 등록되어 수집 기사 대조에 네이버 검색을 함께 붙입니다.");
+        assertThat(requestState(l)).startsWith("PROCESSING|QUEUED|API 키가 등록되어");
+        assertThat(get("registrar", "/api/v1/watches").toString()).contains("\"naver\":true");
+
+        // 네이버 모드로 수집 중이면 키워드 수정이 next_run_at을 당긴다
+        jdbc.sql("UPDATE source SET next_run_at = now() + interval '1 hour' WHERE id = ?").param(a).update();
+        put("registrar", "/api/v1/watches/" + a, "{\"keywords\":[\"에이\",\"에이사\"]}");
+        assertThat(jdbc.sql("SELECT next_run_at <= now() FROM source WHERE id = ?").param(a).query(Boolean.class).single()).isTrue();
+        assertThat(mode(a)).isEqualTo("3|true|ACTIVE");
+
+        // 키가 생긴 뒤 승인한 B는 네이버 모드로 시작한다 (설정 표시가 달라 v2를 만든다)
+        long bRequest = jdbc.sql("SELECT id FROM registration_request WHERE source_id = ?").param(b).query(Long.class).single();
+        assertThat(post("admin", "/api/v1/registrations/" + bRequest + "/approve", "").getBody())
+                .contains("\"status\":\"PROCESSING\"").contains("네이버 검색도 함께");
+        assertThat(mode(b)).isEqualTo("2|true|PENDING");
+        assertThat(queuedJobs()).contains(b + ":ONBOARD:REGISTRATION");
+
+        // 키 삭제: 네이버 모드 감시를 수집 기사 대조 모드로 되돌린다. 남은 ONBOARD는 워커가 대조 모드로 끝낸다
+        HttpHeaders admin = new HttpHeaders();
+        admin.set("X-User", "admin");
+        assertThat(http.exchange("/api/v1/api-credentials/naver_news", HttpMethod.DELETE, new HttpEntity<>(admin), String.class)
+                .getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(mode(a)).isEqualTo("4|false|ACTIVE");
+        assertThat(mode(c)).isEqualTo("3|false|PAUSED");
+        assertThat(mode(l)).isEqualTo("2|false|ACTIVE");
+        assertThat(mode(b)).isEqualTo("3|false|PENDING");
+        assertThat(jdbc.sql("SELECT count(*) FROM source WHERE kind = 'WATCH' AND status = 'ACTIVE' AND next_run_at IS NOT NULL")
+                .query(Long.class).single()).isZero();
+        assertThat(requestState(a)).isEqualTo("COMPLETED|DONE|네이버 뉴스 검색 API 키가 없어 등록된 언론사에서 수집한 기사에 키워드를 대조합니다.");
+        assertThat(requestState(l)).startsWith("COMPLETED|DONE|");
+        assertThat(requestState(b)).startsWith("COMPLETED|DONE|");
+        assertThat(get("admin", "/api/v1/review-queue?kind=api_key")).isEmpty();
+        assertThat(jdbc.sql("SELECT detail::text FROM audit_log WHERE action = 'API_CREDENTIAL_DELETED'").query(String.class)
+                .single()).contains("\"detachedWatches\": 4");
+    }
+
+    @Test
+    void v13MovesWatchesStuckOnNaverKeyToLocalMatch() throws Exception {
+        post("registrar", "/api/v1/watches", "{\"name\":\"자사 보도\",\"keywords\":[\"메타넷\"]}");
+        post("registrar", "/api/v1/watches", "{\"name\":\"키 오류\",\"keywords\":[\"오류\"]}");
+        post("registrar", "/api/v1/watches", "{\"name\":\"반도체 동향\",\"keywords\":[\"반도체\"]}");
+        long stuck = watchId("자사 보도");
+        long invalid = watchId("키 오류");
+        long running = watchId("반도체 동향");
+        legacyWaitingForKey(stuck, "API_KEY_REQUIRED");
+        legacyWaitingForKey(invalid, "API_KEY_INVALID");
+        // 이미 네이버로 잘 돌던 감시 (V13 이전 설정, 다음 실행 예정)
+        jdbc.sql("UPDATE source_config_version SET config = config - 'naver' WHERE source_id = ?").param(running).update();
+        jdbc.sql("UPDATE source SET next_run_at = now() + interval '1 hour' WHERE id = ?").param(running).update();
+        long dart = apiSourceWaitingForKey("dart.fss.or.kr", "API_KEY_REQUIRED");          // 감시가 아닌 키 대기는 그대로
+        assertThat(get("admin", "/api/v1/review-queue?kind=api_key")).hasSize(3);
+
+        runV13();
+
+        assertThat(mode(stuck)).isEqualTo("2|false|ACTIVE");
+        assertThat(mode(invalid)).isEqualTo("2|false|ACTIVE");
+        assertThat(jdbc.sql("SELECT string_agg(version || ':' || status || ':' || COALESCE(change_note, '-'), ',' ORDER BY version) "
+                + "FROM source_config_version WHERE source_id = ?").param(stuck).query(String.class).single())
+                .isEqualTo("1:RETIRED:키워드 감시 생성,2:ACTIVE:네이버 키 없음 — 수집 기사 대조 모드로 전환 (V13)");
+        assertThat(jdbc.sql("SELECT v.config::text FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id "
+                + "WHERE s.id = ?").param(stuck).query(String.class).single())
+                .isEqualTo("{\"naver\": false, \"method\": \"API\", \"exclude\": [], \"keywords\": [\"메타넷\"], \"provider\": \"naver_news\"}");
+        assertThat(jdbc.sql("SELECT count(*) FROM source WHERE id IN (?, ?) AND status_reason IS NULL AND next_run_at IS NULL")
+                .params(stuck, invalid).query(Long.class).single()).isEqualTo(2L);
+        assertThat(requestState(stuck))
+                .isEqualTo("COMPLETED|DONE|네이버 뉴스 검색 API 키가 없어 등록된 언론사에서 수집한 기사에 키워드를 대조합니다.");
+        assertThat(requestState(invalid)).startsWith("COMPLETED|DONE|");
+
+        assertThat(mode(running)).isEqualTo("1|-|ACTIVE");                               // 잘 돌던 감시는 그대로
+        assertThat(jdbc.sql("SELECT next_run_at IS NOT NULL FROM source WHERE id = ?").param(running)
+                .query(Boolean.class).single()).isTrue();
+        JsonNode queue = get("admin", "/api/v1/review-queue?kind=api_key");
+        assertThat(queue).hasSize(1);
+        assertThat(queue.get(0).get("sourceId").asLong()).isEqualTo(dart);
+        assertThat(new CrawlScheduler(jdbc).enqueueDueSources()).isZero();
+
+        runV13();                                                                          // 다시 돌려도 바뀌는 것이 없다
+        assertThat(mode(stuck)).isEqualTo("2|false|ACTIVE");
+    }
+
+    private long watchId(String name) {
+        return jdbc.sql("SELECT id FROM source WHERE kind = 'WATCH' AND watch_name = ?").param(name).query(Long.class).single();
+    }
+
+    /** V13 이전에 만든 네이버 감시가 키 없이 멈춘 상태: 설정에 naver 표시가 없고, REVIEW/사유, 등록 요청도 REVIEW. */
+    private void legacyWaitingForKey(long sourceId, String reason) {
+        jdbc.sql("UPDATE source_config_version SET config = config - 'naver' WHERE source_id = ?").param(sourceId).update();
+        jdbc.sql("UPDATE source SET status = 'REVIEW', status_reason = ?, next_run_at = NULL WHERE id = ?")
+                .params(reason, sourceId).update();
+        jdbc.sql("UPDATE registration_request SET status = 'REVIEW', step = 'REVIEW', result_message = '네이버 키 필요' "
+                + "WHERE source_id = ?").param(sourceId).update();
+    }
+
+    /** "활성 설정 버전|naver 표시(없으면 -)|소스 상태" */
+    private String mode(long sourceId) {
+        return jdbc.sql("SELECT v.version || '|' || COALESCE(v.config->>'naver', '-') || '|' || s.status FROM source s "
+                + "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = ?")
+                .param(sourceId).query(String.class).single();
+    }
+
+    private String queuedJobs() {
+        return jdbc.sql("SELECT string_agg(source_id || ':' || job_type || ':' || trigger, ',' ORDER BY source_id) "
+                + "FROM crawl_job WHERE status = 'QUEUED'").query(String.class).single();
+    }
+
+    private String requestState(long sourceId) {
+        return jdbc.sql("SELECT status || '|' || step || '|' || result_message FROM registration_request WHERE source_id = ? "
+                + "ORDER BY id DESC LIMIT 1").param(sourceId).query(String.class).single();
+    }
+
+    /** V13 마이그레이션을 그대로 한 번 더 돌린다 (Flyway처럼 한 트랜잭션으로). */
+    private void runV13() throws Exception {
+        try (java.sql.Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            org.springframework.jdbc.datasource.init.ScriptUtils.executeSqlScript(conn,
+                    new org.springframework.core.io.ClassPathResource("db/migration/V13__watch_local_match.sql"));
+            conn.commit();
+        }
+    }
+
+    @Test
     void credentialApiRefusesToWorkWithoutSecretKey() {
-        ApiCredentialService unconfigured = new ApiCredentialService(jdbc, audit, "");
+        ApiCredentialService unconfigured = new ApiCredentialService(jdbc, audit, "", ctx.getBean(WatchService.class));
         io.sensinghub.auth.CurrentUser admin = new io.sensinghub.auth.CurrentUser(1, "admin", "운영 관리자",
                 io.sensinghub.auth.Role.ADMIN);
         ApiException e = org.junit.jupiter.api.Assertions.assertThrows(ApiException.class,

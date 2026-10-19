@@ -8,7 +8,9 @@ App.route('/watches', async (view) => {
     <h1>키워드 감시</h1>
     <div class="panel">
       <h2>새 감시</h2>
-      <p class="muted small">키워드(자사·경쟁사·이슈)로 네이버 뉴스 검색 API에서 60분마다 받아 옵니다. 쉼표 또는 줄바꿈으로 나눠 적습니다.${App.role() === 'VIEWER' ? ' 현재 권한(VIEWER)은 관리자 승인 뒤에 진행됩니다.' : ''}</p>
+      <p class="muted small">등록된 언론사에서 수집한 기사마다 키워드(자사·경쟁사·이슈)를 대조해, 걸린 기사를 이 감시로 모읍니다(제목·본문 기준, 제외어가 들어간 기사는 뺍니다).
+        감시를 만든 뒤 새로 수집되는 기사부터 대조합니다. 관리자가 네이버 뉴스 검색 API 키를 등록해 두었다면 네이버 검색도 함께 씁니다.
+        쉼표 또는 줄바꿈으로 나눠 적습니다.${App.role() === 'VIEWER' ? ' 현재 권한(VIEWER)은 관리자 승인 뒤에 진행됩니다.' : ''}</p>
       <form id="create-form" class="form-grid">
         <label class="field"><span>이름</span><input type="text" name="name" class="wide" placeholder="자사 보도" required></label>
         <label class="field"><span>키워드</span><textarea name="keywords" style="min-height:60px" placeholder="메타넷, 메타넷글로벌" required></textarea></label>
@@ -33,10 +35,10 @@ App.route('/watches', async (view) => {
         <thead><tr><th>이름</th><th>키워드</th><th>제외어</th><th>상태</th><th class="right">문서</th><th>마지막 성공</th><th>등록 요청</th><th></th></tr></thead>
         <tbody>${list.map(w => `
           <tr data-id="${w.id}">
-            <td><b>${esc(w.name)}</b><div class="muted small">#${w.id} · ${w.intervalMinutes}분 · 설정 v${w.configVersion || '-'}${w.requestedBy ? ' · ' + esc(w.requestedBy) : ''}</div></td>
+            <td><b>${esc(w.name)}</b><div class="muted small">#${w.id}${w.naver ? ` · 네이버 ${w.intervalMinutes}분` : ''} · 설정 v${w.configVersion || '-'}${w.requestedBy ? ' · ' + esc(w.requestedBy) : ''}</div></td>
             <td>${tags(w.keywords)}</td>
             <td>${tags(w.exclude) || '<span class="muted">-</span>'}</td>
-            <td>${badge(w.status)}${w.statusReason ? `<div class="muted small">${esc(w.statusReason)}</div>` : ''}</td>
+            <td>${App.watchBadge(w.status, w.naver)}${w.statusReason ? `<div class="muted small">${esc(w.statusReason)}</div>` : ''}</td>
             <td class="right">${App.fmtNum(w.documentCount)}</td>
             <td class="nowrap">${App.fmtTime(w.lastSuccessAt)}</td>
             <td>${w.registrationStatus ? badge(w.registrationStatus) : ''}${w.registrationMessage ? `<div class="muted small">${esc(w.registrationMessage)}</div>` : ''}</td>
@@ -60,7 +62,7 @@ App.route('/watches', async (view) => {
         <label class="field"><span>이름</span><input type="text" name="name" class="wide" value="${esc(w.name)}"></label>
         <label class="field"><span>키워드 (쉼표 또는 줄바꿈)</span><textarea name="keywords">${esc(w.keywords.join('\n'))}</textarea></label>
         <label class="field"><span>제외어</span><textarea name="exclude" style="min-height:70px">${esc(w.exclude.join('\n'))}</textarea></label>
-        <p class="muted small">저장하면 설정 새 버전이 활성화되고 이전 버전은 남습니다.</p>
+        <p class="muted small">저장하면 설정 새 버전이 활성화되고 이전 버전은 남습니다. 새 키워드는 다음에 수집되는 기사부터 대조합니다.</p>
       </div>`);
     const saved = await App.modal({
       title: `감시 수정 · ${w.name}`,

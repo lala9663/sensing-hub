@@ -33,6 +33,20 @@ DISCLOSURE_DEFAULT_DAYS = 3
 
 log = logging.getLogger(__name__)
 
+# 수집 기사 대조 모드 감시의 안내 문구 (백엔드 WatchService.MATCH_MESSAGE와 같다)
+MATCH_MESSAGE = "등록된 언론사에서 수집한 기사에 키워드를 대조합니다."
+
+
+def naver_enabled(source: dict) -> bool:
+    """키워드 감시가 네이버 뉴스 검색도 쓰는지. 감시가 아니면 True(해당 없음).
+
+    백엔드가 config에 "naver": true/false를 둔다. 없으면(V13 이전에 만든 감시) 네이버 모드로 본다 — 백엔드 WatchService.naverOf와 같다.
+    false면 수집 기사 대조만 하는 감시라 네이버 키를 요구하지 않는다(대조는 _match_watches가 모든 감시에 한다).
+    """
+    if source.get("kind") != "WATCH":
+        return True
+    return (source.get("config") or {}).get("naver") is not False
+
 
 @dataclass
 class CrawlStats:
@@ -176,11 +190,14 @@ class JobRunner:
         키워드 감시(source.kind WATCH)와 점검 소스(kind CHECK)는 백엔드가 만든 활성 설정을 그대로 쓰고 새 버전을 만들지 않는다.
         키워드 제공자(네이버 뉴스)의 도메인을 사이트처럼 등록하면 REVIEW/KEYWORDS_REQUIRED로 멈춘다.
         점검 소스의 첫 실행은 수집이 아니라 회사 상태 확인(_check)이다.
+        수집 기사 대조 모드 감시(config naver false)는 키를 보지 않고 ACTIVE(next_run_at NULL)로 둔다 (_onboard_match).
         """
         watch = source.get("kind") == "WATCH"
         check = source.get("kind") == "CHECK"
         self.db.update_site(source["site_id"], site_type="NEWS" if provider.keyword_based else "PUBLIC",
                             risk_flags={"api_provider": provider.id})
+        if watch and not naver_enabled(source):
+            return self._onboard_match(job)
         if provider.keyword_based and not watch:
             raise CrawlFailure(Code.KEYWORDS_REQUIRED,
                                f"{provider.name.replace(' 검색', '')}는 키워드 감시로 등록합니다. "
@@ -240,6 +257,17 @@ class JobRunner:
                  source.get("kind", "SITE"), version, stats.new)
         return status
 
+    def _onboard_match(self, job: Job) -> str:
+        """수집 기사 대조 모드 감시의 ONBOARD (보통은 백엔드가 바로 ACTIVE로 두므로 오지 않는다 — 키를 지운 뒤 남은 작업 등).
+
+        키를 요구하지 않는다. ACTIVE로 두되 next_run_at은 NULL이라 스케줄러가 작업을 넣지 않는다.
+        """
+        self.db.activate_match_watch(job.source_id)
+        self.db.update_registration(job.source_id, status="COMPLETED", step="DONE", message=MATCH_MESSAGE)
+        self.db.finish_job(job.id, "SUCCESS", 0, 0, 0, None, note="수집 기사 대조 모드: 네이버 검색 없음")
+        log.info("onboard ok source=%s kind=WATCH mode=match (no naver search)", job.source_id)
+        return "SUCCESS"
+
     def _load_secret(self, provider_id: str, provider: Provider | None, stage: str) -> str:
         """복호화한 키. 대칭키나 자격 증명이 없으면 API_KEY_REQUIRED (사용자 메시지는 제공자의 발급 안내)."""
         hint = provider.key_required_message if provider else MESSAGES[Code.API_KEY_REQUIRED]
@@ -257,6 +285,13 @@ class JobRunner:
             raise CrawlFailure(Code.DISCOVERY_FAILED, "활성 설정이 없습니다.", stage="LIST")
         if source.get("kind") == "CHECK":
             return self._check_job(job, source)
+        if not naver_enabled(source):
+            # 수집 기사 대조 모드 감시는 스스로 수집하지 않는다. 관리자 실행·재개·주기 변경으로 작업이 들어와도
+            # 키를 요구하지 않고 끝내며, next_run_at을 NULL로 되돌려 스케줄러가 다시 넣지 않게 한다
+            self.db.clear_next_run(job.source_id)
+            self.db.finish_job(job.id, "SUCCESS", 0, 0, 0, source["active_config_version_id"],
+                               note="수집 기사 대조 모드: 네이버 검색 없음")
+            return "SUCCESS"
         if source["config"].get("method") == "API":
             stats = self._crawl_api(job, source, source["config"])
         else:
@@ -405,8 +440,11 @@ class JobRunner:
         """공개 API 수집: 허브 루프 대신 커넥터 fetch. 급감 감지는 크롤링과 같이 found_count 기준이다.
 
         0건은 실패가 아니다 (주말·휴일 공시처럼 정상적으로 비는 날이 있다) — PARSE_EMPTY를 내지 않는다.
+        수집 기사 대조 모드 감시는 받을 것이 없다 (키를 요구하지 않는다).
         """
         stats = CrawlStats()
+        if not naver_enabled({"kind": source.get("kind"), "config": config}):
+            return stats
         provider_id = config["provider"]
         if secret is None:
             secret = self._load_secret(provider_id, api_catalog.get(provider_id), stage="LIST")

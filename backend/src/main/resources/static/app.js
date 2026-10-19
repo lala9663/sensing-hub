@@ -65,6 +65,20 @@ const App = (() => {
     return `<span class="badge badge-${color} ${extraClass || ''}" title="${esc(s)}">${esc(label(s))}</span>`;
   }
 
+  /**
+   * 키워드 감시 상태 배지. 수집 중(ACTIVE)이면 모드를 보여 준다: 네이버 키가 없으면 "수집 기사 대조 중"(등록된 언론사에서 긁어 온 기사에
+   * 키워드를 대조), 키가 있으면 "수집 중" + "네이버 검색 함께". 그 밖의 상태는 일반 배지.
+   */
+  function watchBadge(status, naver) {
+    if (status === 'ACTIVE' && naver === false) {
+      return '<span class="badge badge-green" title="등록된 언론사에서 수집한 기사에 키워드를 대조합니다">수집 기사 대조 중</span>';
+    }
+    if (status === 'ACTIVE' && naver) {
+      return `${badge(status)} <span class="badge badge-blue" title="수집 기사 대조에 네이버 뉴스 검색 API를 함께 씁니다">네이버 검색 함께</span>`;
+    }
+    return badge(status);
+  }
+
   const KST = new Intl.DateTimeFormat('ko-KR', {
     timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
@@ -445,7 +459,7 @@ const App = (() => {
   }
 
   return {
-    api, ApiError, qs, esc, html, badge, label, tags, fmtTime, fmtDateTime, fmtAgo, fmtSeconds, fmtNum,
+    api, ApiError, qs, esc, html, badge, watchBadge, label, tags, fmtTime, fmtDateTime, fmtAgo, fmtSeconds, fmtNum,
     kstStartOfToday, parseList, domainOf, notice, showError, clearError, guard, modal, confirm, promptText,
     role, atLeast, isAdmin, loginId: () => state.loginId, route, go, render, every, start,
   };

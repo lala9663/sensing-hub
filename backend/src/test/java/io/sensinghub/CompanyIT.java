@@ -122,23 +122,26 @@ class CompanyIT {
         assertThat(c.get("tags").toString()).isEqualTo("[\"1차 공급사\",\"핵심\"]");
         assertThat(c.get("status").asText()).isEqualTo("ACTIVE");
         assertThat(c.get("watchSourceId").isNull()).isFalse();
-        assertThat(c.get("watchStatus").asText()).isEqualTo("PENDING");
+        assertThat(c.get("watchStatus").asText()).isEqualTo("ACTIVE");                     // 네이버 키 없음 → 수집 기사 대조
+        assertThat(c.get("watchNaver").asBoolean()).isFalse();
         assertThat(c.get("lastBizStatus").isNull()).isTrue();
         assertThat(c.get("signalCount").asLong()).isZero();
         assertThat(c.get("documentCount").asLong()).isZero();
         assertThat(c.get("lastSignal").isNull()).isTrue();
         assertThat(c.get("createdBy").asText()).isEqualTo("등록 담당자");
 
-        // 회사 감시: kind WATCH, 이름 "회사:나부품", 360분, 키워드 = 이름 + 별칭 (별칭의 중복 이름은 cleanTerms가 걸러낸다), ONBOARD 작업
+        // 회사 감시: kind WATCH, 이름 "회사:나부품", 360분, 키워드 = 이름 + 별칭 (별칭의 중복 이름은 cleanTerms가 걸러낸다).
+        // 네이버 키가 없으니 수집 기사 대조 모드: 바로 ACTIVE, next_run_at NULL, ONBOARD 작업 없음
         long watchId = c.get("watchSourceId").asLong();
         assertThat(one("SELECT kind || '|' || watch_name || '|' || method || '|' || status || '|' || interval_minutes || '|' || name "
-                + "FROM source WHERE id = ?", watchId)).isEqualTo("WATCH|회사:나부품|API|PENDING|360|watch:회사:나부품");
+                + "FROM source WHERE id = ? AND next_run_at IS NULL", watchId)).isEqualTo("WATCH|회사:나부품|API|ACTIVE|360|watch:회사:나부품");
         assertThat(one("SELECT v.config::text FROM source_config_version v JOIN source s ON s.active_config_version_id = v.id "
                 + "WHERE s.id = ?", watchId))
-                .isEqualTo("{\"method\": \"API\", \"exclude\": [], \"keywords\": [\"나부품\", \"NABU\"], \"provider\": \"naver_news\"}");
+                .isEqualTo("{\"naver\": false, \"method\": \"API\", \"exclude\": [], \"keywords\": [\"나부품\", \"NABU\"], \"provider\": \"naver_news\"}");
         assertThat(one("SELECT t.domain || '|' || (t.risk_flags->>'api_provider') FROM site t JOIN source s ON s.site_id = t.id "
                 + "WHERE s.id = ?", watchId)).isEqualTo("news.naver.com|naver_news");
-        assertThat(one("SELECT job_type || ':' || status FROM crawl_job WHERE source_id = ?", watchId)).isEqualTo("ONBOARD:QUEUED");
+        assertThat(count("SELECT count(*) FROM crawl_job WHERE source_id = ?", watchId)).isZero();
+        assertThat(one("SELECT status || '|' || step FROM registration_request WHERE source_id = ?", watchId)).isEqualTo("COMPLETED|DONE");
         assertThat(get("registrar", "/api/v1/watches").toString()).contains("\"name\":\"회사:나부품\"");
 
         // 점검 소스: kind CHECK 네 개 (국세청 상태 1440분, DART 고유번호 매핑 10080분, DART 회사별 공시 360분, 조달청 부정당업자 1440분),
@@ -169,7 +172,7 @@ class CompanyIT {
         createCompany("{\"name\":\"가전자\",\"bizNo\":\"1018112345\"}");
         assertThat(count("SELECT count(*) FROM source WHERE kind = 'CHECK'")).isEqualTo(4L);
         assertThat(count("SELECT count(*) FROM source WHERE kind = 'WATCH'")).isEqualTo(2L);
-        assertThat(count("SELECT count(*) FROM crawl_job")).isEqualTo(6L);
+        assertThat(count("SELECT count(*) FROM crawl_job")).isEqualTo(4L);                 // 점검 소스 ONBOARD뿐 (감시는 대조 모드라 작업 없음)
 
         // 검증: 사업자번호 형식·중복, 고유번호 형식, 이름 없음
         assertThat(post("registrar", "/api/v1/companies", "{\"name\":\"다\",\"bizNo\":\"12345\"}").getStatusCode())

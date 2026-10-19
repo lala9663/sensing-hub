@@ -104,7 +104,7 @@
           } else if (a === 'set_api_key') {
             const result = await apiKeyModal(it.provider);
             if (!result) return;
-            App.notice(`${result.credential.provider} 키 저장 — 기다리던 소스 ${result.resumedSources}개를 다시 진행합니다.`);
+            App.notice(`${result.credential.provider} 키 저장 — 기다리던 소스 ${result.resumedSources}개를 다시 진행합니다.${result.attachedWatches ? ` 키워드 감시 ${result.attachedWatches}개에 네이버 검색을 함께 붙입니다.` : ''}`);
           } else {
             const s = await sourceAction(it.sourceId, a);
             if (!s) return;
@@ -362,7 +362,7 @@
           label: form.label.value.trim() || null,
         });
         view.querySelector('#save-result').innerHTML =
-          `<div class="notice">${esc(result.credential.provider)} 키 저장 ${badge(result.credential.status)} — 기다리던 소스 <b>${result.resumedSources}</b>개를 다시 진행합니다.</div>`;
+          `<div class="notice">${esc(result.credential.provider)} 키 저장 ${badge(result.credential.status)} — 기다리던 소스 <b>${result.resumedSources}</b>개를 다시 진행합니다.${result.attachedWatches ? ` 키워드 감시 <b>${result.attachedWatches}</b>개에 네이버 검색을 함께 붙입니다.` : ''}</div>`;
         form.secret.value = '';
         form.label.value = '';
         await load();
