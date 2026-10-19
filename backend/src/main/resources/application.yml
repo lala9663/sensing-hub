@@ -133,7 +133,7 @@ sensing:
   naver:
     # 네이버 뉴스 검색 사용 방식 (NaverSettings). 워커와 같은 변수·같은 값이어야 한다:
     #   display(기본) — 표시 전용. 2026-09-07 개정 약관(검색 결과 저장·캐싱·AI 입력 금지)에 맞춰 결과를 DB·LLM·챗봇·다이제스트에
-    #                   넣지 않고, 키워드 감시 화면의 "네이버 뉴스 실시간"에서 백엔드가 불러와 보여 주기만 한다
+    #                   넣지 않고, "네이버 뉴스" 탭과 키워드 감시 화면의 "네이버 실시간"에서 백엔드가 불러와 보여 주기만 한다
     #   store        — 저장·분석. 법무 확인 뒤에만 켠다. 키워드 감시에 네이버 검색 주기 수집(document 저장)을 붙인다
     #   off          — 네이버를 쓰지 않는다
     mode: ${SENSING_NAVER_MODE:display}
@@ -142,6 +142,8 @@ sensing:
     # 주소만 바꾼다 (테스트·프록시용). 비우면 api의 공식 주소
     search-url: ${SENSING_NAVER_SEARCH_URL:}
     timeout-seconds: 10
+    # "네이버 뉴스" 탭 검색의 사용자별 초당 허용 횟수 (남용 방지, 넘으면 429 NAVER_TOO_FAST). 키당 한도는 50 RPS
+    search-per-second: ${SENSING_NAVER_SEARCH_PER_SECOND:2}
   # 공개 API 자격 증명(api_credential)을 pgcrypto로 암호화하는 대칭키. 워커의 SENSING_SECRET_KEY와 같아야 한다.
   # 비어 있으면 자격 증명 API는 503을 낸다.
   secret-key: ${SENSING_SECRET_KEY:}

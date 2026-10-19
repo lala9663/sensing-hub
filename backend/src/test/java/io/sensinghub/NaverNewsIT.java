@@ -12,6 +12,11 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,6 +65,7 @@ class NaverNewsIT {
         r.add("sensing.naver.mode", () -> "display");
         r.add("sensing.naver.api", () -> "hub");
         r.add("sensing.naver.search-url", () -> hub.base() + "/search/v1/news");
+        r.add("sensing.naver.search-per-second", () -> "2");
         // LLM·임베딩도 가짜 서버로 — 네이버 결과가 LLM으로 흘러가면 /llm 요청이 찍힌다
         r.add("sensing.llm.provider", () -> "openai");
         r.add("sensing.llm.base-url", () -> hub.base() + "/llm/v1");
@@ -251,7 +257,179 @@ class NaverNewsIT {
         assertThat(hub.otherPaths).isEmpty();
     }
 
+    // ------------------------------------------------------------------ 네이버 뉴스 탭: 감시와 무관한 검색
+
+    @Test
+    void newsTabSearchIsDisplayOnlyAuditedAndRateLimited() throws Exception {
+        // 키가 없으면 409 (네이버를 부르지 않는다). 검색어가 없거나 길거나 정렬 값이 틀리면 400
+        Reply noKey = search("viewer", "query=메타넷");
+        assertThat(noKey.status).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(noKey.body.get("error").asText()).isEqualTo("NAVER_KEY_REQUIRED");
+        saveKey(CLIENT_ID + ":" + CLIENT_SECRET);
+        assertThat(search("viewer", "query=   ").status).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(search("viewer", "display=10").status).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(search("viewer", "query=" + "가".repeat(101)).status).isEqualTo(HttpStatus.BAD_REQUEST);
+        Reply badSort = search("viewer", "query=메타넷&sort=popular");
+        assertThat(badSort.status).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(badSort.body.get("message").asText()).contains("date").contains("sim");
+        assertThat(hub.requests).isEmpty();
+
+        jdbc.sql("INSERT INTO site (domain, base_url, name) VALUES ('press.example.com', 'https://press.example.com', '예시일보')")
+                .update();
+        Map<String, Long> before = counts();
+        long viewerId = jdbc.sql("SELECT id FROM app_user WHERE login_id = 'viewer'").query(Long.class).single();
+
+        // VIEWER도 검색한다. 기본은 최신순(date) 20건, 요약 문장까지 (<b> 태그 제거·엔티티 해제·공백 정리), 캐시 금지
+        Reply r = search("viewer", "query=  메타넷   신제품 ");
+        assertThat(r.status).isEqualTo(HttpStatus.OK);
+        assertThat(r.headers.getCacheControl()).contains("no-store");
+        JsonNode body = r.body;
+        assertThat(body.get("query").asText()).isEqualTo("메타넷 신제품");
+        assertThat(body.get("sort").asText()).isEqualTo("date");
+        assertThat(body.get("total").asLong()).isEqualTo(1234);
+        assertThat(body.get("start").asInt()).isEqualTo(1);
+        assertThat(body.get("display").asInt()).isEqualTo(20);
+        assertThat(body.get("nextStart").asInt()).isEqualTo(21);
+        assertThat(body.get("maxStart").asInt()).isEqualTo(1000);
+        assertThat(body.get("sourceLabel").asText()).isEqualTo("NAVER 검색 결과");
+        assertThat(body.get("mode").asText()).isEqualTo("display");
+        JsonNode items = body.get("items");
+        assertThat(items).hasSize(4);                                                      // 감시 제외어 같은 거르기 없음
+        assertThat(items.get(0).get("title").asText()).isEqualTo("메타넷, \"신제품\" 공개");
+        assertThat(items.get(0).get("description").asText()).isEqualTo("메타넷이 \"신제품\"을 공개했다 & <단독> 요약 설명");
+        assertThat(items.get(0).get("press").asText()).isEqualTo("예시일보");
+        assertThat(items.get(0).get("originalUrl").asText()).isEqualTo("https://press.example.com/a/1");
+        assertThat(items.get(0).get("naverUrl").asText()).isEqualTo("https://n.news.naver.com/mnews/article/001/0001");
+        assertThat(items.get(0).get("publishedAt").asText()).isEqualTo("2026-10-16T00:30:00Z");
+        assertThat(items.get(1).get("title").asText()).isEqualTo("메타넷 채용 공고");
+        assertThat(items.get(2).get("press").asText()).isEqualTo("other.example.org");
+        assertThat(items.get(2).get("naverUrl").isNull()).isTrue();
+        assertThat(items.get(3).get("press").asText()).isEqualTo("네이버 뉴스");
+        assertThat(body.toString()).doesNotContain("<b>").doesNotContain("&quot;")
+                .doesNotContain(CLIENT_ID).doesNotContain(CLIENT_SECRET);
+
+        FakeHub.Req req = hub.requests.get(0);
+        assertThat(req.path()).isEqualTo("/search/v1/news");
+        assertThat(req.params()).containsExactly(Map.entry("query", "메타넷 신제품"), Map.entry("display", "20"),
+                Map.entry("start", "1"), Map.entry("sort", "date"), Map.entry("format", "json"));
+        assertThat(req.keyId()).isEqualTo(CLIENT_ID);
+        assertThat(req.key()).isEqualTo(CLIENT_SECRET);
+        assertThat(req.rawQuery()).doesNotContain(CLIENT_SECRET);
+
+        // 정확도순·다음 쪽·크기를 그대로 넘기고, 다시 부르면 다시 요청한다 (캐시 없음)
+        Reply sim = search("viewer", "query=메타넷&sort=SIM&start=21&display=5");
+        assertThat(sim.status).isEqualTo(HttpStatus.OK);
+        assertThat(sim.body.get("sort").asText()).isEqualTo("sim");
+        assertThat(hub.requests).hasSize(2);
+        assertThat(hub.requests.get(1).params()).containsEntry("sort", "sim").containsEntry("start", "21")
+                .containsEntry("display", "5");
+        // display 상한 50, start 상한 1000 — 1000번째 너머는 없으니 더 보기도 없다
+        Reply clamped = search("viewer", "query=메타넷&display=500&start=5000");
+        assertThat(hub.requests.get(2).params()).containsEntry("display", "50").containsEntry("start", "1000");
+        assertThat(clamped.body.get("nextStart").isNull()).isTrue();
+        Reply none = search("viewer", "query=없는검색어");
+        assertThat(none.body.get("total").asLong()).isZero();
+        assertThat(none.body.get("items")).isEmpty();
+        assertThat(none.body.get("nextStart").isNull()).isTrue();
+        assertThat(hub.requests).hasSize(4);
+
+        // DB: 감사 로그(검색어·정렬·쪽)만 늘고 결과는 어디에도 남지 않는다. LLM·임베딩 요청 없음
+        Map<String, Long> after = counts();
+        assertThat(after.get("audit_log")).isEqualTo(before.get("audit_log") + 4);
+        after.remove("audit_log");
+        before.remove("audit_log");
+        assertThat(after).isEqualTo(before);
+        List<Map<String, Object>> audits = jdbc.sql("""
+                SELECT actor_id, target_type, detail::text AS detail FROM audit_log WHERE action = 'NAVER_SEARCH' ORDER BY id
+                """).query().listOfRows();
+        assertThat(audits).hasSize(4);
+        assertThat(audits).allSatisfy(a -> {
+            assertThat(((Number) a.get("actor_id")).longValue()).isEqualTo(viewerId);
+            assertThat(a.get("target_type")).isEqualTo("naver_news");
+            assertThat((String) a.get("detail")).doesNotContain("공개").doesNotContain("요약").doesNotContain("1234")
+                    .doesNotContain("example");
+        });
+        JsonNode firstAudit = json.readTree((String) audits.get(0).get("detail"));
+        assertThat(firstAudit.get("query").asText()).isEqualTo("메타넷 신제품");
+        assertThat(firstAudit.get("sort").asText()).isEqualTo("date");
+        assertThat(firstAudit.get("start").asInt()).isEqualTo(1);
+        assertThat(firstAudit.get("display").asInt()).isEqualTo(20);
+        assertThat(hub.otherPaths).isEmpty();
+
+        // 사용자별 간격 제한 (초당 2회): 동시에 5번 부르면 넘는 호출은 429 NAVER_TOO_FAST이고 네이버·감사 로그에 가지 않는다
+        Thread.sleep(1100);
+        int calls = hub.requests.size();
+        long audited = count("audit_log");
+        List<Reply> burst = parallelSearch("registrar", "query=메타넷", 5);
+        long ok = burst.stream().filter(b -> b.status == HttpStatus.OK).count();
+        List<Reply> tooFast = burst.stream().filter(b -> b.status == HttpStatus.TOO_MANY_REQUESTS).toList();
+        assertThat(ok + tooFast.size()).isEqualTo(5);
+        assertThat(ok).isBetween(1L, 2L);
+        assertThat(tooFast).allSatisfy(b -> {
+            assertThat(b.body.get("error").asText()).isEqualTo("NAVER_TOO_FAST");
+            assertThat(b.body.get("message").asText()).contains("초당 2회");
+        });
+        assertThat(hub.requests).hasSize(calls + (int) ok);
+        assertThat(count("audit_log")).isEqualTo(audited + ok);
+        // 다른 사용자는 영향 없고, 잠시 뒤에는 다시 된다
+        assertThat(search("admin", "query=메타넷").status).isEqualTo(HttpStatus.OK);
+        Thread.sleep(1100);
+        assertThat(search("registrar", "query=메타넷").status).isEqualTo(HttpStatus.OK);
+
+        // 네이버 한도(429)는 간격 제한과 다른 코드로 알린다
+        Reply quota = search("viewer", "query=한도초과");
+        assertThat(quota.status).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(quota.body.get("error").asText()).isEqualTo("NAVER_RATE_LIMITED");
+        assertThat(quota.body.get("message").asText()).contains("하루 허용량");
+
+        // 검색 중 401 → 502 NAVER_KEY_INVALID, 키를 INVALID로 표시. 그 뒤에는 네이버를 부르지 않고 409, 탭은 안내만 보여 준다
+        saveKey(CLIENT_ID + ":wrong-secret");
+        Reply denied = search("viewer", "query=메타넷");
+        assertThat(denied.status).isEqualTo(HttpStatus.BAD_GATEWAY);
+        assertThat(denied.body.get("error").asText()).isEqualTo("NAVER_KEY_INVALID");
+        assertThat(denied.body.toString()).doesNotContain("wrong-secret").doesNotContain(CLIENT_ID);
+        assertThat(credentialStatus()).isEqualTo("INVALID");
+        int afterDenied = hub.requests.size();
+        Reply invalid = search("viewer", "query=메타넷");
+        assertThat(invalid.status).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(invalid.body.get("error").asText()).isEqualTo("NAVER_KEY_INVALID");
+        assertThat(hub.requests).hasSize(afterDenied);
+        assertThat(get("viewer", "/api/v1/naver/status").body.get("liveAvailable").asBoolean()).isFalse();
+
+        assertThat(count("document")).isZero();
+        assertThat(hub.otherPaths).isEmpty();
+    }
+
     // ------------------------------------------------------------------
+
+    /** 탭 검색 한 번. 같은 사용자가 이어 부를 때 간격 제한(초당 2회)에 걸리지 않게 조금 쉬었다 부른다. */
+    private Reply search(String user, String params) throws Exception {
+        Thread.sleep(550);
+        return get(user, "/api/v1/naver/news?" + params);
+    }
+
+    /** 같은 사용자로 동시에 n번 검색한다. */
+    private List<Reply> parallelSearch(String user, String params, int n) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        try {
+            CountDownLatch go = new CountDownLatch(1);
+            List<Future<Reply>> futures = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                futures.add(pool.submit(() -> {
+                    go.await();
+                    return get(user, "/api/v1/naver/news?" + params);
+                }));
+            }
+            go.countDown();
+            List<Reply> replies = new ArrayList<>();
+            for (Future<Reply> f : futures) {
+                replies.add(f.get(60, TimeUnit.SECONDS));
+            }
+            return replies;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 
     private long createWatch(String user, String name, String keywords, String exclude) throws Exception {
         ResponseEntity<String> res = post(user, "/api/v1/watches",
@@ -309,7 +487,8 @@ class NaverNewsIT {
 
     /**
      * 가짜 NAVER API HUB 뉴스 검색. 헤더의 Client ID/Secret이 맞으면 결과, 아니면 401(API Gateway 오류 본문, 받은 값을 일부러 되돌린다).
-     * 검색어로 장애를 흉내 낸다: 한도초과 → 429, SE02 → 400 SE02, 서버오류 → 500 SE99. 그 밖의 경로(/llm 등)는 otherPaths에 남긴다.
+     * 검색어로 장애를 흉내 낸다: 한도초과 → 429, SE02 → 400 SE02, 서버오류 → 500 SE99, 없는검색어 → 0건. 그 밖의 경로(/llm 등)는
+     * otherPaths에 남긴다.
      */
     static final class FakeHub {
         record Req(String method, String path, String rawQuery, Map<String, String> params, String keyId, String key) {
@@ -366,11 +545,14 @@ class NaverNewsIT {
                 send(ex, 400, "{\"errorMessage\":\"Invalid display value (부적절한 display 값입니다.)\",\"errorCode\":\"SE02\"}");
             } else if (query.equals("서버오류")) {
                 send(ex, 500, "{\"errorMessage\":\"System Error\",\"errorCode\":\"SE99\"}");
+            } else if (query.equals("없는검색어")) {
+                send(ex, 200, "{\"lastBuildDate\":\"Fri, 16 Oct 2026 10:00:00 +0900\",\"total\":0,\"start\":1,\"display\":0,\"items\":[]}");
             } else {
                 send(ex, 200, """
                         {"lastBuildDate":"Fri, 16 Oct 2026 10:00:00 +0900","total":1234,"start":%s,"display":4,"items":[
                           {"title":"<b>메타넷</b>, &quot;신제품&quot; 공개","originallink":"https://press.example.com/a/1",
-                           "link":"https://n.news.naver.com/mnews/article/001/0001","description":"<b>메타넷</b> 요약 설명",
+                           "link":"https://n.news.naver.com/mnews/article/001/0001",
+                           "description":"<b>메타넷</b>이 &quot;신제품&quot;을   공개했다 &amp; &lt;단독&gt; 요약 설명",
                            "pubDate":"Fri, 16 Oct 2026 09:30:00 +0900"},
                           {"title":"<b>메타넷</b> 채용 공고","originallink":"https://press.example.com/a/2",
                            "link":"https://n.news.naver.com/mnews/article/001/0002","description":"요약 설명",

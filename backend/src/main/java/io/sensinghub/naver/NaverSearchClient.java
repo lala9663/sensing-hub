@@ -32,7 +32,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 /**
  * 네이버 뉴스 검색 API 한 번 호출 (NAVER API HUB 기본, {@link NaverSettings}). 결과는 호출한 쪽에 돌려줄 뿐 저장·캐싱하지 않는다.
  * <ul>
- *   <li>GET {url}?query=..&display=..&start=..&sort=date(&format=json). 키는 헤더로만 보낸다 (HUB: X-NCP-APIGW-API-KEY-ID/KEY).</li>
+ *   <li>GET {url}?query=..&display=..&start=..&sort=date|sim(&format=json). 키는 헤더로만 보낸다 (HUB: X-NCP-APIGW-API-KEY-ID/KEY).</li>
+ *   <li>제목·요약(description)은 &lt;b&gt; 태그를 지우고 HTML 엔티티를 풀어 돌려준다. 요약은 표시 전용 검색 화면에서만 쓴다.</li>
  *   <li>오류 본문은 두 형식이다: 검색 API {@code {"errorCode":"SE02","errorMessage":".."}},
  *       API Gateway {@code {"error":{"errorCode":"200","message":"Authentication Failed","details":".."}}}.</li>
  *   <li>401·403 → 키 문제({@link Kind#KEY_INVALID}), 429 → 하루 허용량 초과, 400 SE01~SE04·SE06 / 404 SE05 / 300 → 요청·주소 오류,
@@ -59,8 +60,23 @@ public class NaverSearchClient {
             "SE06", "검색어 인코딩이 잘못됐습니다 (UTF-8)",
             "SE99", "네이버 검색 서버 내부 오류입니다");
 
-    /** @param link 네이버 뉴스 주소 (네이버에 없는 기사는 원문 주소와 같다) */
-    public record Item(String title, String originalLink, String link, OffsetDateTime publishedAt) {
+    /** 요약 문장 최대 글자 수 (네이버 요약은 보통 150자 안팎이다). */
+    static final int DESCRIPTION_MAX = 300;
+
+    /**
+     * @param description 요약 문장 (태그 제거·엔티티 해제, {@value #DESCRIPTION_MAX}자까지). 표시 전용 검색 화면만 쓴다
+     * @param link        네이버 뉴스 주소 (네이버에 없는 기사는 원문 주소와 같다)
+     */
+    public record Item(String title, String description, String originalLink, String link, OffsetDateTime publishedAt) {
+    }
+
+    /** 정렬: date 최신순, sim 정확도순. */
+    public enum Sort {
+        DATE, SIM;
+
+        public String param() {
+            return name().toLowerCase(Locale.ROOT);
+        }
     }
 
     public record Page(long total, int start, int display, List<Item> items) {
@@ -104,11 +120,16 @@ public class NaverSearchClient {
 
     /** 날짜순(sort=date) 검색 한 쪽. 키가 틀리거나 한도를 넘으면 {@link NaverSearchException}. */
     public Page search(String clientId, String clientSecret, String query, int display, int start) {
+        return search(clientId, clientSecret, query, display, start, Sort.DATE);
+    }
+
+    /** 검색 한 쪽 (정렬 지정). 키가 틀리거나 한도를 넘으면 {@link NaverSearchException}. */
+    public Page search(String clientId, String clientSecret, String query, int display, int start, Sort sort) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("query", query);
         params.put("display", String.valueOf(display));
         params.put("start", String.valueOf(start));
-        params.put("sort", "date");
+        params.put("sort", sort.param());
         settings.extraParams().forEach(e -> params.put(e.getKey(), e.getValue()));
         StringBuilder url = new StringBuilder(settings.url()).append('?');
         params.forEach((k, v) -> url.append(k).append('=').append(URLEncoder.encode(v, StandardCharsets.UTF_8)).append('&'));
@@ -145,8 +166,9 @@ public class NaverSearchClient {
         }
         List<Item> items = new ArrayList<>();
         for (JsonNode row : body.path("items")) {
-            items.add(new Item(cleanTitle(row.path("title").asText(null)), blankToNull(row.path("originallink").asText(null)),
-                    blankToNull(row.path("link").asText(null)), parsePubDate(row.path("pubDate").asText(null))));
+            items.add(new Item(cleanTitle(row.path("title").asText(null)), cleanDescription(row.path("description").asText(null)),
+                    blankToNull(row.path("originallink").asText(null)), blankToNull(row.path("link").asText(null)),
+                    parsePubDate(row.path("pubDate").asText(null))));
         }
         return new Page(body.path("total").asLong(0), body.path("start").asInt(start), body.path("display").asInt(items.size()),
                 items);
@@ -226,6 +248,16 @@ public class NaverSearchClient {
         }
         String text = WS.matcher(HtmlUtils.htmlUnescape(TAG.matcher(raw).replaceAll(""))).replaceAll(" ").strip();
         return text.isEmpty() ? null : text;
+    }
+
+    /** 요약 문장: 제목과 같게 정리하고 {@value #DESCRIPTION_MAX}자를 넘으면 자르고 "…"를 붙인다. */
+    static String cleanDescription(String raw) {
+        String text = cleanTitle(raw);
+        if (text == null || text.length() <= DESCRIPTION_MAX) {
+            return text;
+        }
+        int end = Character.isHighSurrogate(text.charAt(DESCRIPTION_MAX - 1)) ? DESCRIPTION_MAX - 1 : DESCRIPTION_MAX;
+        return text.substring(0, end).stripTrailing() + "…";
     }
 
     /**
