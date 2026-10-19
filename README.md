@@ -64,7 +64,7 @@ createdb sensing   # 사용자/비밀번호 sensing/sensing 기준 (application.
 cd backend && ./gradlew bootRun
 
 # worker
-cd worker && pip install -e ".[dev,extract,llm-anthropic]"
+cd worker && pip install -e ".[dev,extract,llm-anthropic,nlp]"
 SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worker
 ```
 

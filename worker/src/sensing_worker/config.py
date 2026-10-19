@@ -84,3 +84,12 @@ class Settings:
     adaptive_max_interval: int = field(default_factory=lambda: int(os.getenv("SENSING_ADAPTIVE_MAX_INTERVAL", "1440")))
     # 링크 모음(포털) 페이지를 등록하면 가리키는 언론사를 대신 등록한다. 한 페이지에서 등록할 언론사 수 상한
     portal_max_outlets: int = field(default_factory=lambda: int(os.getenv("SENSING_PORTAL_MAX_OUTLETS", "50")))
+    # 전문 검색 색인과 이슈 묶기 (M5 기반). 큐에 작업이 없을 때 LLM과 무관하게 한 묶음씩 돈다
+    index_enabled: bool = field(default_factory=lambda: _bool("SENSING_INDEX_ENABLED", True))
+    index_batch: int = field(default_factory=lambda: int(os.getenv("SENSING_INDEX_BATCH", "200")))
+    # 이슈 묶기: 이 시간 안의 이슈와만 비교하고, 마지막 문서가 이보다 오래된 이슈는 닫는다
+    issue_window_hours: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_WINDOW_HOURS", "72")))
+    # 붙이는 기준 (issues.Rule). 2026-10-19 운영 DB 제목 2,998건(53개 언론사)으로 보정했다 — docs/decisions.md
+    issue_threshold: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_THRESHOLD", "0.4")))
+    issue_min_shared: int = field(default_factory=lambda: int(os.getenv("SENSING_ISSUE_MIN_SHARED", "2")))
+    issue_pair_threshold: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_PAIR_THRESHOLD", "0.66")))

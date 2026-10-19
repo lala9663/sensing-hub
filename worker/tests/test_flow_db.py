@@ -1130,6 +1130,132 @@ def test_non_portal_discovery_failure_still_goes_to_review(env, monkeypatch):
     assert q(store, "SELECT status FROM registration_request")["status"] == "REVIEW"
 
 
+# ---------------------------------------------------------------------- 색인·이슈 묶기 (M5 기반)
+
+def site_source(store: Store, domain: str, site_type: str) -> int:
+    c = store.conn
+    site_id = c.execute("INSERT INTO site (domain, base_url, site_type) VALUES (%s, %s, %s) RETURNING id",
+                        (domain, f"https://{domain}", site_type)).fetchone()["id"]
+    return c.execute("INSERT INTO source (site_id, name, status) VALUES (%s, %s, 'ACTIVE') RETURNING id",
+                     (site_id, domain)).fetchone()["id"]
+
+
+def add_doc(store: Store, source_id: int, url: str, title: str, hours_ago: float, body: str | None = None) -> int:
+    from datetime import datetime, timedelta, timezone
+    from sensing_worker.db import sha256
+    published = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return store.conn.execute(
+        """
+        INSERT INTO document (source_id, url, url_hash, title, published_at, body_text, content_hash)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+        """, (source_id, url, sha256(url), title, published, body, sha256(title + "\n" + (body or "")))).fetchone()["id"]
+
+
+def issue_of(store: Store, document_id: int) -> dict | None:
+    return q(store, "SELECT i.* FROM issue i JOIN issue_document d ON d.issue_id = i.id WHERE d.document_id = %s",
+             document_id)
+
+
+def test_index_pending_builds_chunks_and_groups_issues(env):
+    from sensing_worker.indexer import index_pending
+    store, runner, settings, sites = env
+    a, b, c = (site_source(store, f"press{i}.example.com", "NEWS") for i in "abc")
+    gov = site_source(store, "gov.example.go.kr", "PUBLIC")
+    yasu = [
+        add_doc(store, a, "https://press-a/1", "다카이치 총리, 야스쿠니 신사에 공물 봉납", 5),
+        add_doc(store, b, "https://press-b/1", "日 다카이치, 야스쿠니 공물 봉납…외교부 유감 표명", 4),
+        add_doc(store, c, "https://press-c/1", "정부, 다카이치 야스쿠니 공물 봉납에 깊은 유감", 3),
+        add_doc(store, a, "https://press-a/2", "다카이치 총리, 야스쿠니 신사에 공물 봉납(종합)", 2),   # 같은 언론사 중복
+    ]
+    apt = add_doc(store, b, "https://press-b/2", "서울 아파트값 88주 연속 상승", 1)
+    body = "\n\n".join(f"{i}번째 문단: 반도체 지원사업 신청 요건과 일정을 안내합니다. " * 8 for i in range(6))
+    notice = add_doc(store, gov, "https://gov/1", "2026년 반도체 지원사업 공고", 6, body=body)
+    press_with_body = add_doc(store, c, "https://press-c/2", "할리스 고객 개인정보 유출", 1, body="언론 기사 본문은 색인하지 않는다")
+    old = add_doc(store, c, "https://press-c/old", "다카이치 총리, 야스쿠니 신사에 공물 봉납", 24 * 10)   # 창 밖의 예전 기사
+
+    out = index_pending(store, settings, limit=100)
+    assert out.fetched == 8
+    assert q(store, "SELECT count(*) AS c FROM document WHERE indexed_at IS NULL")["c"] == 0
+
+    # 조각: 언론 기사는 제목 하나(seq 0), 공공 문서는 제목 + 본문 조각, NEWS 사이트는 본문이 있어도 제목만
+    chunks = store.conn.execute("SELECT document_id, seq, text, index_version FROM chunk ORDER BY document_id, seq").fetchall()
+    by_doc: dict[int, list[dict]] = {}
+    for ch in chunks:
+        by_doc.setdefault(ch["document_id"], []).append(ch)
+    assert [ch["text"] for ch in by_doc[yasu[0]]] == ["다카이치 총리, 야스쿠니 신사에 공물 봉납"]
+    assert [ch["text"] for ch in by_doc[press_with_body]] == ["할리스 고객 개인정보 유출"]
+    assert by_doc[notice][0]["text"] == "2026년 반도체 지원사업 공고" and len(by_doc[notice]) >= 3
+    assert all(len(ch["text"]) <= 800 for ch in by_doc[notice])
+    assert {ch["index_version"] for ch in chunks} <= {"fts-kiwi-v1", "fts-regex-v1"}
+    assert out.chunks == len(chunks)
+
+    def fts(query: str) -> set[int]:
+        rows = store.conn.execute("SELECT DISTINCT document_id FROM chunk WHERE tokens @@ to_tsquery('simple', %s)",
+                                  (query,)).fetchall()
+        return {r["document_id"] for r in rows}
+
+    assert fts("반도체:* & 요건:*") == {notice}                  # 본문 조각까지 색인된다
+    assert fts("봉납:*") == set(yasu) | {old}
+    assert fts("야스쿠니:* & 외교부:*") == {yasu[1]}
+    assert fts("본문:*") == set()                                # 언론 기사 본문은 색인하지 않는다
+
+    # 이슈: 같은 사건 4건(언론사 3곳)이 한 이슈, 10일 전 같은 제목은 창 밖이라 다른 이슈이고 닫힌다
+    issue = issue_of(store, yasu[0])
+    assert all(issue_of(store, d)["id"] == issue["id"] for d in yasu)
+    assert issue["doc_count"] == 4 and issue["source_count"] == 3 and issue["status"] == "OPEN"
+    assert {"다카이치", "야스쿠니", "봉납"} <= set(issue["top_terms"])
+    assert issue["title"] in {"다카이치 총리, 야스쿠니 신사에 공물 봉납", "다카이치 총리, 야스쿠니 신사에 공물 봉납(종합)",
+                              "日 다카이치, 야스쿠니 공물 봉납…외교부 유감 표명", "정부, 다카이치 야스쿠니 공물 봉납에 깊은 유감"}
+    first = q(store, "SELECT published_at FROM document WHERE id = %s", yasu[0])["published_at"]
+    last = q(store, "SELECT published_at FROM document WHERE id = %s", yasu[3])["published_at"]
+    assert issue["first_seen_at"] == first and issue["last_seen_at"] == last
+    old_issue = issue_of(store, old)
+    assert old_issue["id"] != issue["id"] and old_issue["status"] == "CLOSED" and out.issues.closed >= 1
+    assert issue_of(store, apt)["id"] not in (issue["id"], old_issue["id"]) and issue_of(store, apt)["doc_count"] == 1
+    assert out.issues.created + out.issues.joined + out.issues.skipped == 8 and out.issues.joined == 3
+
+    assert index_pending(store, settings, limit=100).fetched == 0   # 더 할 것이 없다
+
+
+def test_reindex_after_document_change_replaces_chunks_and_moves_issue(env):
+    from sensing_worker.indexer import index_pending
+    store, runner, settings, sites = env
+    a, b, c = (site_source(store, f"press{i}.example.com", "NEWS") for i in "abc")
+    gov = site_source(store, "gov.example.go.kr", "PUBLIC")
+    docs = [
+        add_doc(store, a, "https://press-a/1", "할리스 멤버십 해킹, 고객 개인정보 유출", 3),
+        add_doc(store, b, "https://press-b/1", "할리스 고객 개인정보 유출…비밀번호·주소 포함", 2),
+        add_doc(store, c, "https://press-c/1", "할리스 해킹 개인정보 유출, 비밀번호 바꿔야", 1),
+    ]
+    notice = add_doc(store, gov, "https://gov/1", "청년 창업 지원사업 공고", 5, body="첫 본문 문단입니다. " * 10)
+    assert index_pending(store, settings, limit=100).fetched == 4
+    issue = issue_of(store, docs[0])
+    assert issue["doc_count"] == 3 and issue["source_count"] == 3
+    before = {r["id"] for r in store.conn.execute("SELECT id FROM chunk WHERE document_id = %s", (notice,)).fetchall()}
+
+    # 본문이 바뀌면 upsert_document가 version을 올리고 indexed_at을 비운다 → 다시 색인하며 조각을 갈아 끼운다
+    _, status = store.upsert_document(source_id=gov, job_id=None, url="https://gov/1", title="청년 창업 지원사업 공고",
+                                      author=None, section=None, published_at=None,
+                                      body="바뀐 본문: 신청 기한이 연장되었습니다. " * 60)
+    assert status == "UPDATED"
+    # 기사 제목이 다른 사건으로 바뀐 경우: 원래 이슈에서 빠지고 남은 이슈의 통계가 다시 계산된다
+    store.upsert_document(source_id=c, job_id=None, url="https://press-c/1", title="서울 지하철 노조 파업 예고",
+                          author=None, section=None, published_at=None, body=None)
+    out = index_pending(store, settings, limit=100)
+    assert out.fetched == 2
+    after = store.conn.execute("SELECT id, seq, text FROM chunk WHERE document_id = %s ORDER BY seq", (notice,)).fetchall()
+    assert before.isdisjoint({r["id"] for r in after}) and len(after) >= 3
+    assert "연장" in after[1]["text"] and not any("첫 본문" in r["text"] for r in after)
+    assert q(store, "SELECT count(*) AS c FROM chunk WHERE tokens @@ to_tsquery('simple', '연장:*')")["c"] >= 1
+    assert q(store, "SELECT count(*) AS c FROM chunk WHERE tokens @@ to_tsquery('simple', '문단:*')")["c"] == 0
+
+    moved = issue_of(store, docs[2])
+    kept = issue_of(store, docs[0])
+    assert moved["id"] != kept["id"] and moved["doc_count"] == 1
+    assert kept["doc_count"] == 2 and kept["source_count"] == 2
+    assert q(store, "SELECT count(*) AS c FROM issue_document")["c"] == 4
+
+
 def test_crawled_articles_are_matched_against_keyword_watches(env):
     """네이버 키가 없어 REVIEW에 멈춘 감시라도, 우리가 긁어 온 기사에 키워드가 있으면 document_watch로 기록된다."""
     store, runner, settings, sites = env

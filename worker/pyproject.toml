@@ -18,12 +18,15 @@ extract = ["trafilatura>=1.12"]
 dynamic = ["playwright>=1.47"]
 # 등록 시 LLM 레시피 생성에 Claude를 쓸 때 (SENSING_LLM_PROVIDER=anthropic). OpenAI 호환 API는 추가 의존성이 없다
 llm-anthropic = ["anthropic>=1"]
+# 전문 검색 색인·이슈 묶기의 한국어 형태소 분석 (Kiwi). 없으면 정규식 분석기(조사 떼기)로 동작한다
+nlp = ["kiwipiepy>=0.18"]
 dev = ["pytest>=8.3"]
 
 [project.scripts]
 sensing-worker = "sensing_worker.main:main"
 sensing-discovery-eval = "sensing_worker.evaluate:main"
 sensing-watch-backfill = "sensing_worker.backfill_watch:main"
+sensing-index-backfill = "sensing_worker.indexer:main"
 
 [build-system]
 requires = ["setuptools>=69"]

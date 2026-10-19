@@ -484,6 +484,25 @@ class Store:
             FOR UPDATE OF d SKIP LOCKED
             """, (failed_retry_hours, limit)).fetchall()
 
+    # ------------------------------------------------------------------ 색인·이슈 (M5 기반)
+    def lock_pending_index(self, limit: int) -> list[dict]:
+        """색인이 필요한 문서(indexed_at IS NULL)를 최신 수집순으로 limit건 잠그고 돌려준다. self.conn.transaction() 안에서 부른다.
+
+        본문이 바뀌면 upsert_document가 indexed_at을 NULL로 되돌리므로 다시 대상이 된다. FOR UPDATE SKIP LOCKED라
+        워커 여러 대가 같은 문서를 잡지 않는다.
+        """
+        return self.conn.execute(
+            """
+            SELECT d.id, d.source_id, d.title, d.body_text, d.published_at, d.collected_at, t.site_type
+            FROM document d
+            JOIN source s ON s.id = d.source_id
+            JOIN site t ON t.id = s.site_id
+            WHERE d.indexed_at IS NULL
+            ORDER BY d.collected_at DESC, d.id DESC
+            LIMIT %s
+            FOR UPDATE OF d SKIP LOCKED
+            """, (limit,)).fetchall()
+
     def load_watch_hits(self, document_ids: list[int]) -> dict[int, list[tuple[str | None, str | None]]]:
         """문서별 (감시 이름, 걸린 검색어) 목록."""
         if not document_ids:
