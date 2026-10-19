@@ -258,7 +258,7 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
 
 ```bash
-# 사이트 등록 (기사 주소를 넣어도 도메인으로 등록)
+# 사이트 등록 (기사 주소를 넣어도 도메인으로 등록. 목록 주소를 넣으면 그 목록의 기사 종류만 켜고, 이미 수집 중인 도메인이면 기존 소스에 그 종류를 더한다)
 curl -X POST localhost:8080/api/v1/registrations -H 'X-User: registrar' \
      -H 'Content-Type: application/json' -d '{"url":"https://news.example.com/news/articleView.html?idxno=1"}'
 
@@ -368,6 +368,8 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 문서 7,967건 전체를 실패 없이 처리(위 "워커 환경 변수 (LLM 레시피)").
 사이트 하나에 기사 종류(상세 주소 모양) 여러 개(10-19): 정책브리핑은 보도자료만 모이던 것을 다시 탐색하면 종류 19개 중 6개(보도자료·정책뉴스·
 사실은 이렇습니다·국민이 말하는 정책·연설문·청와대 브리핑)를 켜고 실행당 상한을 종류별로 나눠 수집한다. 관리자 소스 상세에서 종류를 켜고 끈다.
+등록 주소가 목록이면 그 목록의 종류만 켜고, 이미 수집 중인 도메인에 다른 목록 주소를 넣으면 중복 대신 기존 소스에 그 종류를 더하며(설정 새 버전),
+공공기관 게시판은 게시판 파라미터(bbsId 등) 값마다 종류로 나눈다.
 수집 원리는 [docs/how-collection-works.md](docs/how-collection-works.md).
 
 **남은 것 (순서대로)**

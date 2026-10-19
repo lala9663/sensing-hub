@@ -137,6 +137,23 @@ class Store:
                 """, (config_id, config["method"], interval_minutes, source_id))
         return config_id, version
 
+    def add_config_version(self, source_id: int, config: dict, note: str) -> tuple[int, int]:
+        """설정 새 버전을 활성화하되 소스 상태·주기·방식은 그대로 둔다 (기존 소스에 기사 종류를 더할 때 — 일시정지 소스를 깨우지 않는다)."""
+        with self.conn.transaction():
+            version = self.conn.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 AS v FROM source_config_version WHERE source_id = %s",
+                (source_id,)).fetchone()["v"]
+            self.conn.execute("UPDATE source_config_version SET status = 'RETIRED' WHERE source_id = %s AND status = 'ACTIVE'",
+                              (source_id,))
+            config_id = self.conn.execute(
+                """
+                INSERT INTO source_config_version (source_id, version, config, status, change_note)
+                VALUES (%s, %s, %s::jsonb, 'ACTIVE', %s) RETURNING id
+                """, (source_id, version, json.dumps(config, ensure_ascii=False), note)).fetchone()["id"]
+            self.conn.execute("UPDATE source SET active_config_version_id = %s, updated_at = now() WHERE id = %s",
+                              (config_id, source_id))
+        return config_id, version
+
     def activate_source(self, source_id: int, method: str, interval_minutes: int) -> None:
         """설정 버전은 그대로 두고 소스만 ACTIVE로 (키워드 감시: 백엔드가 만든 설정을 쓴다)."""
         self.conn.execute(
@@ -214,8 +231,19 @@ class Store:
     def load_registration(self, source_id: int) -> dict | None:
         """소스를 만든 등록 요청 (가장 최근 것). 요청 없이 만든 소스면 None."""
         return self.conn.execute(
-            "SELECT id, user_id, channel, batch_id FROM registration_request WHERE source_id = %s ORDER BY id DESC LIMIT 1",
-            (source_id,)).fetchone()
+            "SELECT id, user_id, channel, batch_id, input_url FROM registration_request WHERE source_id = %s "
+            "ORDER BY id DESC LIMIT 1", (source_id,)).fetchone()
+
+    def open_registrations(self, source_id: int) -> list[dict]:
+        """이 소스에 걸린 진행 중 등록 요청들 (이미 수집 중인 소스에 다른 목록 주소를 넣은 요청 — 백엔드가 중복 대신 넣는다)."""
+        return self.conn.execute(
+            "SELECT id, input_url FROM registration_request WHERE source_id = %s AND status IN ('RECEIVED', 'PROCESSING') "
+            "ORDER BY id", (source_id,)).fetchall()
+
+    def finish_registration(self, registration_id: int, status: str, message: str) -> None:
+        self.conn.execute(
+            "UPDATE registration_request SET status = %s, step = 'DONE', result_message = %s, updated_at = now() WHERE id = %s",
+            (status, message[:500], registration_id))
 
     def find_open_source(self, domain: str) -> int | None:
         """같은 도메인의 열린 사이트 소스 id (백엔드 RegistrationService.findOpenSource와 같은 규칙)."""

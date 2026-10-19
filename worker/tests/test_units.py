@@ -1002,6 +1002,86 @@ def test_multi_kind_heuristic_result_skips_llm_recipe():
         site.close()
 
 
+def test_board_parameter_values_split_into_kinds_and_site_root_rule():
+    from sensing_worker.discovery import KindCandidate, is_site_root, split_by_board
+    sig = "/bbs/view.do?bbsId=*&nttId={n}"
+    generic = pattern_from_signature(sig)
+    urls = [f"https://g.go.kr/bbs/view.do?bbsId=B0{b}&nttId={b}{i}" for b in (1, 2) for i in range(4)]
+    urls.append("https://g.go.kr/bbs/view.do?bbsId=B09&nttId=1")                       # 글이 적은 게시판은 버린다
+    pools = [("https://g.go.kr/", urls, "")]
+    parts = split_by_board(KindCandidate(generic, ["https://g.go.kr/"], urls), pools)
+    assert [c.pattern["signature"] for c in parts] == ["/bbs/view.do?bbsId=B01&nttId={n}", "/bbs/view.do?bbsId=B02&nttId={n}"]
+    b1 = parts[0].pattern
+    assert b1["query_values"] == {"bbsId": "B01"} and b1["id_keys"] == ["nttId"] and len(parts[0].urls) == 4
+    assert matches("https://g.go.kr/bbs/view.do?bbsId=B01&nttId=7", b1)
+    assert not matches("https://g.go.kr/bbs/view.do?bbsId=B02&nttId=7", b1)
+    one_board = [u for u in urls if "B01" in u]
+    assert split_by_board(KindCandidate(generic, [], one_board), pools)[0].pattern is generic   # 게시판 하나면 그대로
+    sorted_list = pattern_from_signature("/list/view.do?id={n}&sort=*")
+    by_sort = [f"https://g.go.kr/list/view.do?id={i}&sort={s}" for s in ("a", "b") for i in range(4)]
+    assert len(split_by_board(KindCandidate(sorted_list, [], by_sort), pools)) == 1        # 게시판 파라미터가 아니다
+    assert is_site_root("https://www.korea.kr/") and is_site_root("korea.kr") and is_site_root("https://x.go.kr/kor/main.do")
+    assert is_site_root("https://x.kr/index.html?utm_source=news")
+    assert not is_site_root("https://www.korea.kr/news/policyNewsList.do")
+    assert not is_site_root("https://x.go.kr/?bbsId=B01")
+
+
+def test_discover_splits_public_board_by_board_parameter():
+    from fakesite import Site, board_site_routes
+    site = Site(board_site_routes())
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, detail = discover(f, "127.0.0.1", site.base, "PUBLIC")
+        assert result.method == "STATIC"
+        assert [(k["name"], k["enabled"]) for k in result.kinds] == [("보도자료", True), ("공지사항", True), ("채용공고", False)]
+        kinds = {k["name"]: k for k in result.kinds}
+        assert kinds["공지사항"]["signature"] == "/bbs/view.do?bbsId=B02&nttId={n}"
+        assert kinds["공지사항"]["hubs"] == [f"{site.base}/bbs/list.do?bbsId=B02"]
+        assert "기사가 아닌" in kinds["채용공고"]["note"]                                      # 메뉴 이름(채용)으로 기본 꺼짐
+        assert result.article_pattern["signature"] == "/bbs/view.do?bbsId=B01&nttId={n}"   # 대표 종류도 게시판별
+        assert "기사 종류 3개 중 2개 켬" in detail
+    finally:
+        f.close()
+        site.close()
+
+
+def test_discover_scope_follows_registered_url():
+    from fakesite import Site, board_site_routes
+    from sensing_worker.jobs import Scope
+    site = _policy_site()
+    board = Site(board_site_routes())
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        # 목록 주소를 등록하면 그 목록의 기사 모양만 켜고 나머지는 후보로 꺼 둔다
+        list_url = f"{site.base}/news/policyNewsList.do"
+        scope = Scope.of_input(list_url)
+        result, detail = discover(f, "127.0.0.1", site.base, "PUBLIC", scope=scope)
+        assert [k["name"] for k in result.kinds if k["enabled"]] == ["정책뉴스"]
+        first = result.kinds[0]
+        assert first["hubs"] == [f"{site.base}/sitemap_policy.xml", list_url] and list_url in first["note"]
+        assert result.article_pattern["signature"] == "/news/policyNewsView.do?newsId={n}"
+        notes = {k["name"]: k["note"] for k in result.kinds[1:]}
+        assert "목록 주소 밖" in notes["보도자료"] and "목록 주소 밖" in notes["presidentView"]   # 검사 안 한 종류는 경로 이름
+        assert "기사가 아닌" in notes["cartoon"]
+        assert not any("presidentView" in h or "speechView" in h for h in site.hits)   # 범위 밖 종류는 검사하지 않는다
+        assert scope.to_config() == {"site": False, "lists": [list_url]}
+
+        # 기사 주소를 넣으면 예전처럼 사이트 전체 (도메인 단위 등록)
+        scope = Scope.of_input(f"{site.base}/news/policyNewsView.do?newsId=20001")
+        result, _ = discover(f, "127.0.0.1", site.base, "PUBLIC", scope=scope)
+        assert len([k for k in result.kinds if k["enabled"]]) == 4 and scope.site and scope.lists == []
+        assert Scope.of_input(site.base + "/").site and Scope.of_input("https://www.korea.kr/main.do").site
+
+        # 게시판 목록 주소를 등록하면 그 게시판만
+        result, _ = discover(f, "127.0.0.1", board.base, "PUBLIC",
+                             scope=Scope.of_input(f"{board.base}/bbs/list.do?bbsId=B02"))
+        assert [(k["name"], k["enabled"]) for k in result.kinds] == [("공지사항", True), ("보도자료", False), ("채용공고", False)]
+    finally:
+        f.close()
+        site.close()
+        board.close()
+
+
 def test_kind_naming_and_non_article_rules():
     from sensing_worker.discovery import is_non_article_kind, kind_name, sitemap_label, title_kind_piece
     title = "연말까지 수도권 주택 착공 - 정책뉴스 | 뉴스 | 대한민국 정책브리핑"

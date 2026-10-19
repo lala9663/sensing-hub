@@ -48,8 +48,8 @@ def env(tmp_path):
     store.close()
 
 
-def register(store: Store, base_url: str) -> int:
-    """백엔드 RegistrationService.startOnboarding과 같은 행을 만든다."""
+def register(store: Store, base_url: str, input_url: str | None = None) -> int:
+    """백엔드 RegistrationService.startOnboarding과 같은 행을 만든다. input_url: 사용자가 넣은 주소 (없으면 홈)."""
     domain = base_url.split("://", 1)[1].split(":")[0]
     c = store.conn
     site_id = c.execute("INSERT INTO site (domain, base_url) VALUES (%s, %s) "
@@ -58,7 +58,7 @@ def register(store: Store, base_url: str) -> int:
     source_id = c.execute("INSERT INTO source (site_id, name, requested_by) VALUES (%s, %s, 2) RETURNING id",
                           (site_id, domain)).fetchone()["id"]
     c.execute("INSERT INTO registration_request (user_id, input_url, normalized_domain, status, step, source_id) "
-              "VALUES (2, %s, %s, 'PROCESSING', 'QUEUED', %s)", (base_url, domain, source_id))
+              "VALUES (2, %s, %s, 'PROCESSING', 'QUEUED', %s)", (input_url or base_url, domain, source_id))
     c.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'REGISTRATION')", (source_id,))
     return source_id
 
@@ -1396,3 +1396,101 @@ def test_legacy_single_pattern_source_keeps_working_and_rediscover_adds_kinds(en
     assert len([k for k in config["article_patterns"] if k["enabled"]]) == 4
     counts = sections_count(store)
     assert counts == {None: 8, "정책뉴스": 6, "청와대 브리핑": 4, "부처 브리핑": 3}   # 이미 받은 보도자료는 다시 받지 않는다
+
+
+def request_kind(store: Store, source_id: int, input_url: str) -> int:
+    """백엔드 RegistrationService가 이미 수집 중인 소스에 다른 목록 주소를 받았을 때 만드는 행 (중복 대신 ONBOARD)."""
+    c = store.conn
+    reg_id = c.execute("INSERT INTO registration_request (user_id, input_url, normalized_domain, status, step, source_id) "
+                       "VALUES (2, %s, '127.0.0.1', 'PROCESSING', 'QUEUED', %s) RETURNING id",
+                       (input_url, source_id)).fetchone()["id"]
+    c.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'REGISTRATION') "
+              "ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING", (source_id,))
+    return reg_id
+
+
+def reg_of(store: Store, reg_id: int) -> dict:
+    return q(store, "SELECT status, result_message FROM registration_request WHERE id = %s", reg_id)
+
+
+def active_config(store: Store, source_id: int) -> dict:
+    return q(store, "SELECT v.version, v.config, v.change_note FROM source s "
+                    "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", source_id)
+
+
+def test_registering_a_list_url_collects_only_that_lists_kind(env):
+    store, runner, settings, sites = env
+    site = policy_site(sites)
+    list_url = f"{site.base}/news/policyNewsList.do"
+    source_id = register(store, site.base, input_url=list_url)
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    cfg = active_config(store, source_id)["config"]
+    assert cfg["scope"] == {"site": False, "lists": [list_url]}
+    assert [k["name"] for k in cfg["article_patterns"] if k["enabled"]] == ["정책뉴스"]
+    assert cfg["article_pattern"]["signature"] == "/news/policyNewsView.do?newsId={n}"
+    assert sections_count(store) == {"정책뉴스": 6}
+    assert "('정책뉴스')만 수집" in q(store, "SELECT result_message FROM registration_request")["result_message"]
+
+
+def test_list_url_for_existing_source_turns_on_kind_or_reports_duplicate(env):
+    from fakesite import board_site_routes
+    store, runner, settings, sites = env
+    site = Site(board_site_routes()); sites.append(site)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    assert sections_count(store) == {"보도자료": 6, "공지사항": 5}                 # 채용공고는 기본 꺼짐
+
+    # 꺼져 있던 게시판의 목록 주소 → 그 종류를 켜고(설정 새 버전) 바로 수집한다
+    recruit = f"{site.base}/bbs/list.do?bbsId=B03"
+    reg = request_kind(store, source_id, recruit)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    assert reg_of(store, reg) == {"status": "COMPLETED",
+                                  "result_message": f"기존 소스 #{source_id}에 '채용공고' 종류를 켰습니다."}
+    cfg = active_config(store, source_id)
+    assert cfg["version"] == 2 and "기사 종류 '채용공고' 켬" in cfg["change_note"]
+    recruit_kind = next(k for k in cfg["config"]["article_patterns"] if k["name"] == "채용공고")
+    assert recruit_kind["enabled"] and recruit in recruit_kind["hubs"] and "기사가 아닌" in recruit_kind["auto_note"]
+    assert cfg["config"]["scope"] == {"site": True, "lists": [recruit]}
+    assert sections_count(store) == {"보도자료": 6, "공지사항": 5, "채용공고": 4}
+    assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "ACTIVE"
+
+    # 이미 켜진 종류의 목록과 홈은 중복 안내, 설정은 그대로
+    dup = request_kind(store, source_id, f"{site.base}/bbs/list.do?bbsId=B01")
+    home = request_kind(store, source_id, site.base + "/")
+    assert process_one(store, runner, settings) == "SUCCESS"
+    assert reg_of(store, dup) == {"status": "DUPLICATE",
+                                  "result_message": f"이미 수집 중인 기사 종류 '보도자료'입니다 (소스 #{source_id})."}
+    assert reg_of(store, home)["status"] == "DUPLICATE"
+    assert active_config(store, source_id)["version"] == 2
+
+
+def test_list_url_adds_new_kind_to_legacy_source_without_waking_a_paused_one(env):
+    from sensing_worker.discovery import pattern_from_signature
+    store, runner, settings, sites = env
+    site = policy_site(sites)
+    source_id = register(store, site.base)
+    store.conn.execute("DELETE FROM crawl_job WHERE source_id = %s", (source_id,))
+    store.conn.execute("UPDATE registration_request SET status = 'COMPLETED' WHERE source_id = %s", (source_id,))
+    legacy = {"method": "SITEMAP", "hubs": [f"{site.base}/sitemapindex.xml"], "site_domain": "127.0.0.1",
+              "article_pattern": pattern_from_signature("/briefing/pressReleaseView.do?newsId={n}"),
+              "sections": [], "selectors": {}, "store_scope": "FULL", "collect_attachments": True}
+    store.activate_new_config(source_id, legacy, "자동 탐색으로 생성", 360)
+    store.conn.execute("UPDATE source SET status = 'PAUSED' WHERE id = %s", (source_id,))
+
+    list_url = f"{site.base}/news/policyNewsList.do"
+    reg = request_kind(store, source_id, list_url)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    assert reg_of(store, reg)["result_message"] == f"기존 소스 #{source_id}에 '정책뉴스' 종류를 추가했습니다."
+    cfg = active_config(store, source_id)["config"]
+    assert [(k["name"], k["enabled"]) for k in cfg["article_patterns"]] == [("pressReleaseView", True), ("정책뉴스", True)]
+    assert cfg["article_patterns"][1]["hubs"] == [list_url]
+    # 목록 링크 절반의 추적 파라미터(pWise)는 서명에 넣지 않는다 (정규 주소에서 뗀다)
+    assert cfg["article_patterns"][1]["signature"] == "/news/policyNewsView.do?newsId={n}"
+    assert cfg["article_pattern"]["signature"].startswith("/briefing/pressReleaseView.do")   # 대표 종류는 그대로
+    # 일시정지 소스는 깨우지 않고 수집도 하지 않는다 (재개하면 새 종류까지 모은다)
+    assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "PAUSED"
+    assert sections_count(store) == {}
+    store.conn.execute("UPDATE source SET status = 'ACTIVE' WHERE id = %s", (source_id,))
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    assert sections_count(store) == {"pressReleaseView": 8, "정책뉴스": 6}

@@ -252,6 +252,15 @@ def multi_kind_routes(counts: dict[str, int] | None = None) -> dict:
             <meta property="og:title" content="{name} 글 {i}번 안내">
             <meta property="article:published_time" content="{_iso(1)}"></head><body><article>{body}</article></body></html>"""
     children["list"] = [("/news/policyNewsList.do", 30), ("/briefing/pressReleaseList.do", 30)]
+    # 정책뉴스 목록 화면: 정책뉴스 글(등록일 포함)과 옆 칸의 보도자료 링크 2개. 실제 사이트처럼 글 링크 절반에는 사이트 자체
+    # 추적 파라미터(pWise·pWiseSub)가 붙어 있다
+    policy_ids = policy_kind_ids(1, counts.get("/news/policyNewsView.do", 6))
+    rows = "".join(f'<li><a href="/news/policyNewsView.do?newsId={i}'
+                   + (f'&amp;pWise=sub&amp;pWiseSub=A{j}' if j % 2 == 0 else "")
+                   + f'">정책뉴스 글 {i}번 안내</a><span>{_kdate(j + 1)}</span></li>' for j, i in enumerate(policy_ids))
+    side = "".join(f'<a href="/briefing/pressReleaseView.do?newsId={i}">보도자료 {i}</a>' for i in policy_kind_ids(0, 2))
+    pages["/news/policyNewsList.do"] = (f"<html><head><title>정책뉴스 | 뉴스 | 테스트 정책브리핑</title></head><body>"
+                                        f"<ul>{rows}</ul><aside>{side}</aside></body></html>")
     child_age = {"brief": 0.1, "policy": 0.2, "briefing": 0.3, "speech": 2, "cartoon": 5, "list": 30}
     index = ("<?xml version='1.0'?><sitemapindex>"
              + "".join(f"<sitemap><loc>{{base}}/sitemap_{c}.xml</loc><lastmod>{_iso(child_age[c])}</lastmod></sitemap>"
@@ -272,3 +281,30 @@ def multi_kind_routes(counts: dict[str, int] | None = None) -> dict:
 
 def with_base(routes: dict, base: str) -> dict:
     return {k: (s, t, b.replace("{base}", base)) for k, (s, t, b) in routes.items()}
+
+
+# 공공기관 게시판형: (게시판 값, 게시판 이름, 글 수)
+BOARDS = (("B01", "보도자료", 6), ("B02", "공지사항", 5), ("B03", "채용공고", 4))
+
+
+def board_site_routes(boards=BOARDS) -> dict:
+    """한 상세 경로를 게시판 파라미터만 바꿔 쓰는 공공기관 누리집: /bbs/view.do?bbsId=B01&nttId=…. RSS·사이트맵은 없다.
+    홈 메뉴가 게시판 목록(/bbs/list.do?bbsId=…)을 가리키고 목록 행에 등록일이 있다. 상세 <title>은 "글 제목 - 게시판 | 테스트시"."""
+    nav = "".join(f'<a href="/bbs/list.do?bbsId={b}">{name}</a>' for b, name, _ in boards)
+    routes = {"/": (200, "text/html; charset=utf-8",
+                    f"<html><head><title>테스트시</title></head><body><nav>{nav}</nav><p>테스트시 누리집</p></body></html>"),
+              "/robots.txt": (404, "text/plain", "")}
+    for k, (b, name, n) in enumerate(boards):
+        ids = [1000 * (k + 1) + i for i in range(1, n + 1)]
+        rows = "".join(f'<tr><td><a href="/bbs/view.do?bbsId={b}&amp;nttId={i}">{name} {i}번 안내</a></td>'
+                       f"<td>{_kdate(j + 1)}</td></tr>" for j, i in enumerate(ids))
+        routes[f"/bbs/list.do?bbsId={b}"] = (200, "text/html; charset=utf-8",
+                                             f"<html><head><title>{name} | 테스트시</title></head><body><nav>{nav}</nav>"
+                                             f"<table>{rows}</table></body></html>")
+        for i in ids:
+            # 정규 주소는 쿼리 키를 정렬하므로 경로 키도 그 순서로 둔다 (bbsId, nttId)
+            routes[f"/bbs/view.do?bbsId={b}&nttId={i}"] = (200, "text/html; charset=utf-8", f"""<html><head>
+            <title>{name} {i}번 안내 - {name} | 테스트시</title><meta property="og:title" content="{name} {i}번 안내">
+            <meta property="article:published_time" content="{_iso(1)}"></head>
+            <body><article><p>{BODY}</p></article></body></html>""")
+    return routes

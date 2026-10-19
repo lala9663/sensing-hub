@@ -110,14 +110,19 @@ def signature(url: str) -> str:
 
 
 def pattern_from_signature(sig: str) -> dict:
+    """서명 → 패턴. 쿼리 값이 {n}·*가 아닌 글자 그대로면(bbsId=B01, 게시판별 종류) 그 값이어야 맞는다 (query_values)."""
     path, _, query = sig.partition("?")
     regex = ("^" + re.escape(path).replace(re.escape("{n}"), r"\d+")
              .replace(re.escape("{id}"), r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*")
              .replace(re.escape("{slug}"), SLUG_REGEX)
              .replace(re.escape("{*}"), WILDCARD_REGEX) + "$")
-    keys = [kv.split("=", 1)[0] for kv in query.split("&") if kv]
-    id_keys = [kv.split("=", 1)[0] for kv in query.split("&") if kv.endswith("={n}")]
-    return {"path": regex, "query_keys": keys, "id_keys": id_keys, "signature": sig}
+    pairs = [kv.partition("=")[::2] for kv in query.split("&") if kv]
+    pattern = {"path": regex, "query_keys": [k for k, _ in pairs], "id_keys": [k for k, v in pairs if v == "{n}"],
+               "signature": sig}
+    values = {k: v for k, v in pairs if v not in ("{n}", "*")}
+    if values:
+        pattern["query_values"] = values
+    return pattern
 
 
 def matches(url: str, pattern: dict) -> bool:
@@ -127,6 +132,9 @@ def matches(url: str, pattern: dict) -> bool:
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     for key in pattern.get("id_keys", []):
         if not query.get(key, "").isdigit():
+            return False
+    for key, value in (pattern.get("query_values") or {}).items():
+        if query.get(key) != value:
             return False
     return all(k in query for k in pattern.get("query_keys", []))
 
@@ -139,6 +147,26 @@ def canonical_article_url(url: str, pattern: dict) -> str:
     qs = "&".join(f"{k}={v}" for k, v in sorted(query))
     path = re.sub(r";jsessionid=[^/?]*", "", parts.path, flags=re.I)
     return f"{parts.scheme}://{parts.netloc}{path}" + (f"?{qs}" if qs else "")
+
+
+def samples_with_dates(urls: list[str], pattern: dict, hints: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """패턴에 맞는 후보(목록에 날짜가 보이는 것부터)와 그 날짜. hints: 원래 주소 → 목록·피드에서 본 날짜."""
+    seen: set[str] = set()
+    hinted, rest, dates = [], [], {}
+    for u in urls:
+        if not matches(u, pattern):
+            continue
+        c = canonical_article_url(u, pattern)
+        if c in seen:
+            continue
+        seen.add(c)
+        hint = hints.get(u)
+        if hint:
+            dates[c] = hint
+            hinted.append(c)
+        else:
+            rest.append(c)
+    return hinted + rest, dates
 
 
 def same_site(url: str, domain: str) -> bool:
@@ -386,23 +414,7 @@ class Discoverer:
                                self.domain, dates)
 
     def _samples(self, urls: list[str], pattern: dict) -> tuple[list[str], dict[str, str]]:
-        """패턴에 맞는 후보(목록에 날짜가 보이는 것부터)와 그 날짜."""
-        seen: set[str] = set()
-        hinted, rest, dates = [], [], {}
-        for u in urls:
-            if not matches(u, pattern):
-                continue
-            c = canonical_article_url(u, pattern)
-            if c in seen:
-                continue
-            seen.add(c)
-            hint = self.hints.get(u)
-            if hint:
-                dates[c] = hint
-                hinted.append(c)
-            else:
-                rest.append(c)
-        return hinted + rest, dates
+        return samples_with_dates(urls, pattern, self.hints)
 
     def _find_feeds(self, html: str, base: str) -> list[str]:
         found = [u for u in feed_links(html, base) if same_site(u, self.domain)]
@@ -573,6 +585,12 @@ NON_ARTICLE_NOTE = "기사가 아닌 종류(사진·영상·카툰·채용·옛 
 # <title>의 "글 제목 - 종류 | 상위 메뉴 | 사이트 이름"을 나누는 구분자 (하이픈·꺾쇠는 앞뒤에 공백이 있어야 한다)
 TITLE_SEP = re.compile(r"\s+[-–—<>:·»]\s+|\s*[|｜]\s*")
 VIEW_WORD = re.compile(r"(view|detail|read|show)", re.I)
+# 공공기관 게시판: 상세 경로는 같고 게시판 파라미터만 다르다 (/bbs/view.do?bbsId=B01&nttId=…). 이 값으로 종류를 나눈다
+BOARD_PARAM = re.compile(r"^(bbs_?(id|cd|code|no|nm)?|board_?(id|cd|code|no|nm)?|bo_table|menu_?(id|no|cd|code)?|m_?id|"
+                         r"cate(gory)?_?(id|cd|code|no)?|tbl|table)$", re.I)
+BOARD_VALUE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+# 사이트 홈으로 보는 주소 경로 (/, /index.do, /main.do, /kor/ …). 백엔드 RegistrationService.SITE_ROOT_PATH와 같다
+SITE_ROOT_PATH = re.compile(r"^/?((ko|kr|kor|en|eng)/?)?((index|main|home|default)(\.[a-z]+)?)?/?$", re.I)
 
 
 @dataclass
@@ -600,9 +618,48 @@ def rank_kinds(pools: list[tuple[str, list[str], str]]) -> list[KindCandidate]:
                 # 원래 주소를 남긴다: 목록 행 날짜(Discoverer.hints)가 원래 주소로 적혀 있다
                 seen.setdefault(canonical_article_url(u, pattern), u)
         if len(seen) >= MIN_KIND_URLS:
-            out.append(KindCandidate(pattern, list(dict.fromkeys(hubs)), list(seen.values()), labels))
+            out += split_by_board(KindCandidate(pattern, list(dict.fromkeys(hubs)), list(seen.values()), labels), pools)
     out.sort(key=lambda c: -len(c.urls))
     return out
+
+
+def board_value(url: str, key: str) -> str:
+    return dict(parse_qsl(urlsplit(url).query, keep_blank_values=True)).get(key, "")
+
+
+def with_board(pattern: dict, key: str, value: str) -> dict:
+    """서명의 게시판 파라미터 자리를 그 값으로 고정한 패턴: /bbs/view.do?bbsId=*&nttId={n} → bbsId=B01"""
+    path, _, query = pattern["signature"].partition("?")
+    parts = [f"{key}={value}" if kv.partition("=")[0] == key else kv for kv in query.split("&") if kv]
+    return pattern_from_signature(path + "?" + "&".join(parts))
+
+
+def split_by_board(cand: KindCandidate, pools: list[tuple[str, list[str], str]]) -> list[KindCandidate]:
+    """같은 상세 경로를 게시판 파라미터(bbsId·boardId·menuId …) 값만 바꿔 쓰는 공공기관 게시판이면 값마다 종류로 나눈다.
+    값마다 주소가 MIN_KIND_URLS개 이상인 게시판이 둘 이상일 때만 나누고(작은 게시판은 버린다), 아니면 그대로 둔다."""
+    fixed = cand.pattern.get("query_values") or {}
+    for key in [k for k in cand.pattern.get("query_keys", []) if BOARD_PARAM.match(k) and k not in fixed]:
+        groups: dict[str, list[str]] = {}
+        for u in cand.urls:
+            groups.setdefault(board_value(u, key), []).append(u)
+        big = sorted(((v, us) for v, us in groups.items() if BOARD_VALUE.match(v) and len(us) >= MIN_KIND_URLS),
+                     key=lambda g: -len(g[1]))
+        if len(big) < 2:
+            continue
+        out = []
+        for value, urls in big:
+            pattern = with_board(cand.pattern, key, value)
+            out.append(KindCandidate(pattern, hubs_for(pattern, pools) or cand.hubs, urls, cand.labels))
+        return out
+    return [cand]
+
+
+def is_site_root(url: str) -> bool:
+    """등록 주소가 사이트 홈인가 (/, /index.do, /main.do, /kor/ …, 추적 파라미터만 붙은 것 포함). 홈이 아니면 목록(또는 기사) 주소다."""
+    u = (url or "").strip()
+    parts = urlsplit(u if "://" in u else "https://" + u)
+    query = [k for k, _ in parse_qsl(parts.query, keep_blank_values=True) if not TRACKING_PARAM.match(k)]
+    return not query and bool(SITE_ROOT_PATH.match(parts.path or "/"))
 
 
 def hubs_for(pattern: dict, pools: list[tuple[str, list[str], str]]) -> list[str]:
@@ -672,13 +729,19 @@ def path_stem(pattern: dict) -> str:
 
 
 def _menu_name(pattern: dict, sections: list[dict]) -> str | None:
-    """홈 메뉴에 이 상세의 목록 주소(…View.do ↔ …List.do)가 있으면 그 메뉴 이름."""
+    """홈 메뉴에 이 상세의 목록 주소(…View.do ↔ …List.do)가 있으면 그 메뉴 이름. 게시판별 종류(bbsId=B01)는 같은 게시판
+    파라미터 값을 단 메뉴 주소(/bbs/list.do?bbsId=B01)의 이름."""
     path = (pattern.get("signature") or "").split("?", 1)[0]
-    if not VIEW_WORD.search(path):
-        return None
-    want = VIEW_WORD.sub("list", path).lower()
+    fixed = pattern.get("query_values") or {}
+    want = VIEW_WORD.sub("list", path).lower() if VIEW_WORD.search(path) else None
     for s in sections:
-        if urlsplit(s["url"]).path.lower() == want:
+        parts = urlsplit(s["url"])
+        if fixed:
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+            hit = all(query.get(k) == v for k, v in fixed.items())
+        else:
+            hit = want is not None and parts.path.lower() == want
+        if hit:
             name = re.sub(r"\s*더\s*보기$", "", s["name"]).strip()
             if name:
                 return name[:40]
@@ -701,19 +764,25 @@ def kind_name(pattern: dict, samples: list[tuple[str | None, Article]] = (), sec
     return _menu_name(pattern, sections) or next((label for label in labels if label), None) or path_stem(pattern)
 
 
+PATTERN_KEYS = ("signature", "path", "query_keys", "id_keys", "query_values")
+
+
 def kind_entry(pattern: dict, name: str, hubs: list[str], enabled: bool, count: int | None,
                quality: str | None = None, note: str | None = None) -> dict:
-    """설정의 article_patterns 항목. 서명 필드(path·query_keys·id_keys·signature)를 그대로 두어 matches()에 바로 쓴다."""
-    return {"name": name, **{k: pattern[k] for k in ("signature", "path", "query_keys", "id_keys") if k in pattern},
+    """설정의 article_patterns 항목. 서명 필드(path·query_keys·id_keys·query_values·signature)를 그대로 두어 matches()에 바로 쓴다."""
+    return {"name": name, **{k: pattern[k] for k in PATTERN_KEYS if k in pattern},
             "hubs": hubs, "enabled": enabled, "count": count, "quality": quality, "note": note}
 
 
 def unique_names(kinds: list[dict]) -> None:
-    """이름이 겹치는 종류는 경로 끝 조각을 붙여 구분한다."""
-    counts = Counter(k["name"] for k in kinds)
+    """이름이 겹치면 뒤에 온 종류에 경로 끝 조각(게시판별 종류면 게시판 값)을 붙여 구분한다. 앞의 이름은 그대로 둔다
+    (이미 문서 section에 쓰인 이름이 바뀌지 않게)."""
+    seen: set[str] = set()
     for k in kinds:
-        if counts[k["name"]] > 1:
-            k["name"] = f"{k['name']} ({path_stem(k)})"
+        if k["name"] in seen:
+            tag = ",".join((k.get("query_values") or {}).values()) or path_stem(k)
+            k["name"] = f"{k['name']} ({tag})"
+        seen.add(k["name"])
 
 
 def article_kinds(config: dict) -> list[dict]:
