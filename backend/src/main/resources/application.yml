@@ -102,6 +102,13 @@ sensing:
     max-tokens: ${SENSING_LLM_MAX_TOKENS:0}
     # 5xx·529 한 번 재시도 전 대기(ms). 429는 재시도하지 않는다
     retry-delay-ms: 1500
+    # 챗봇만 다른 모델을 쓴다 (무료 한도가 모델별이라 요약과 한도를 따로 쓰게 할 때). 비우면 model과 같다
+    chat-model: ${SENSING_CHAT_LLM_MODEL:}
+    # 무료 한도의 하루 기준 시간대 (llm_usage.quota_day, 하루 한도 429 뒤 쉬는 끝 시각). 워커와 같은 변수·같은 값.
+    # Gemini 무료 한도는 태평양 시간 자정(한국 시간 오후 4~5시)에 초기화된다
+    quota-tz: ${SENSING_LLM_QUOTA_TZ:America/Los_Angeles}
+    # 워커 요약의 하루 호출 상한 (워커가 SENSING_ENRICH_DAILY_CALLS로 지킨다). 백엔드는 오늘 워커 기록이 없을 때 운영 지표에 보이는 데만 쓴다
+    enrich-daily-calls: ${SENSING_ENRICH_DAILY_CALLS:300}
   embed:
     # 의미 검색의 질의 임베딩 (EmbeddingConfig). 워커가 문서 조각을 임베딩할 때와 같은 변수·같은 값이어야 한다:
     # none(기본, 전문 검색만) | openai(OpenAI 호환 /embeddings — Gemini OpenAI 호환 주소 포함).

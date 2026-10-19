@@ -18,6 +18,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *   <li>anthropic: {@code ANTHROPIC_API_KEY}(필수), {@code ANTHROPIC_BASE_URL}, {@code SENSING_LLM_MODEL}(기본 claude-opus-5-5)</li>
  * </ul>
  * 설정이 모자라면 기동을 막지 않고 {@link NotConfiguredLlmClient}로 둔다 (챗봇만 "설정되지 않았습니다"로 답한다).
+ * <p>
+ * 챗봇은 {@code SENSING_CHAT_LLM_MODEL}(비우면 SENSING_LLM_MODEL)을 쓴다. 무료 한도가 모델별이므로 챗봇만 다른 무료 모델로 돌려
+ * 요약과 한도를 따로 쓰게 할 수 있다. 설정된 클라이언트는 {@link MeteredLlmClient}로 감싸 워커와 같은 사용량 장부·쉬는 중 기록을 쓴다.
  */
 @Configuration
 public class LlmConfig {
@@ -26,16 +29,32 @@ public class LlmConfig {
     private static final Logger log = LoggerFactory.getLogger(LlmConfig.class);
 
     @Bean
-    public LlmClient llmClient(ObjectMapper json,
-                               @Value("${sensing.llm.provider:none}") String provider,
-                               @Value("${sensing.llm.model:}") String model,
-                               @Value("${sensing.llm.base-url:}") String baseUrl,
-                               @Value("${sensing.llm.api-key:}") String apiKey,
-                               @Value("${sensing.llm.anthropic-api-key:}") String anthropicKey,
-                               @Value("${sensing.llm.anthropic-base-url:https://api.anthropic.com}") String anthropicBaseUrl,
-                               @Value("${sensing.llm.timeout-seconds:60}") String timeout,
-                               @Value("${sensing.llm.max-tokens:0}") int maxTokens,
-                               @Value("${sensing.llm.retry-delay-ms:1500}") long retryDelayMillis) {
+    public LlmClient chatLlmClient(ObjectMapper json, LlmLedger ledger,
+                                   @Value("${sensing.llm.provider:none}") String provider,
+                                   @Value("${sensing.llm.model:}") String model,
+                                   @Value("${sensing.llm.chat-model:}") String chatModel,
+                                   @Value("${sensing.llm.base-url:}") String baseUrl,
+                                   @Value("${sensing.llm.api-key:}") String apiKey,
+                                   @Value("${sensing.llm.anthropic-api-key:}") String anthropicKey,
+                                   @Value("${sensing.llm.anthropic-base-url:https://api.anthropic.com}") String anthropicBaseUrl,
+                                   @Value("${sensing.llm.timeout-seconds:60}") String timeout,
+                                   @Value("${sensing.llm.max-tokens:0}") int maxTokens,
+                                   @Value("${sensing.llm.retry-delay-ms:1500}") long retryDelayMillis) {
+        String effective = isBlank(chatModel) ? model : chatModel.strip();
+        LlmClient client = llmClient(json, provider, effective, baseUrl, apiKey, anthropicKey, anthropicBaseUrl, timeout,
+                maxTokens, retryDelayMillis);
+        if (client instanceof NotConfiguredLlmClient) {
+            return client;
+        }
+        String ledgerModel = isBlank(effective) ? ANTHROPIC_DEFAULT_MODEL : effective.strip();
+        log.info("chat LLM usage ledger: model {}, quota day in {}", ledgerModel, ledger.quotaTimeZone());
+        return new MeteredLlmClient(client, ledger, ledgerModel, LlmLedger.CHAT);
+    }
+
+    /** 제공자 클라이언트 그대로 (장부 없이). model은 이미 고른 값이다. */
+    public LlmClient llmClient(ObjectMapper json, String provider, String model, String baseUrl, String apiKey,
+                               String anthropicKey, String anthropicBaseUrl, String timeout, int maxTokens,
+                               long retryDelayMillis) {
         String p = provider == null ? "" : provider.strip().toLowerCase(Locale.ROOT);
         int timeoutSeconds = seconds(timeout);
         LlmClient client = switch (p) {

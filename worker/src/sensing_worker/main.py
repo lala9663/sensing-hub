@@ -22,6 +22,7 @@ from .heartbeat import WorkerHeartbeat
 from .indexer import index_pending
 from .jobs import JobRunner
 from .llm import NoLlm, describe, make_llm
+from .llm_budget import ENRICH, RECIPE, LlmLedger, MeteredLlm, metered
 from .throttle import DbThrottle
 
 log = logging.getLogger("sensing_worker")
@@ -65,10 +66,16 @@ def process_one(store: Store, runner: JobRunner, settings: Settings,
 
 
 def enrich_idle(store: Store, llm, settings: Settings) -> None:
-    """큐가 비었을 때 한 묶음 보강한다. 보강의 어떤 오류도 수집 루프를 멈추지 않는다."""
+    """큐가 비었을 때 한 묶음 보강한다. 보강의 어떤 오류도 수집 루프를 멈추지 않는다.
+
+    LLM이 쉬는 중(429 뒤)이거나 오늘 보강 상한(SENSING_ENRICH_DAILY_CALLS)에 닿았으면 문서를 잠그지도 부르지도 않는다
+    (MeteredLlm.paused가 쉬기 시작할 때 한 번만 로그를 남긴다). 남은 문서는 풀린 뒤 이어서 한다.
+    """
     if not settings.enrich_enabled or isinstance(llm, NoLlm):
         return
     try:
+        if isinstance(llm, MeteredLlm) and llm.paused() is not None:
+            return
         enrich_pending(store, llm, settings, settings.enrich_batch)
     except Exception:   # DB 오류 등. 다음 루프에 다시 시도한다
         log.exception("enrich failed")
@@ -127,12 +134,17 @@ def main(argv: list[str] | None = None) -> None:
     throttle = DbThrottle(settings.db_url, settings.min_interval_seconds) if settings.shared_throttle else None
     fetcher = PoliteFetcher(settings, throttle=throttle)
     llm = make_llm(settings)   # 제공자 설정이 잘못됐으면(패키지 없음·주소 없음) 여기서 바로 멈춘다
+    # 챗봇(백엔드)과 같은 무료 한도를 나눠 쓴다: 용도별 사용량 장부, 보강 하루 상한, 429 뒤 쉬기 (llm_budget)
+    ledger = None if isinstance(llm, NoLlm) else LlmLedger(settings.db_url, settings.llm_quota_tz)
+    recipe_llm = metered(llm, ledger, RECIPE)
+    enrich_llm = metered(llm, ledger, ENRICH, settings.enrich_daily_calls)
     embedder = make_embedder(settings)   # 임베딩도 같다 (모델 없음·차원이 1024가 아님)
     embed_pacer = Pacer(settings.embed_per_minute, settings.embed_backoff_seconds)
-    runner = JobRunner(store, fetcher, settings, llm=llm)
+    runner = JobRunner(store, fetcher, settings, llm=recipe_llm)
     pruned = runner.evidence.prune()
-    log.info("worker %s started (llm: %s, embedding: %s, evidence dirs pruned: %s)", settings.worker_id,
-             describe(llm), describe_embedder(embedder), pruned)
+    log.info("worker %s started (llm: %s, enrich daily calls: %s, quota tz: %s, embedding: %s, evidence dirs pruned: %s)",
+             settings.worker_id, describe(llm), settings.enrich_daily_calls or "no cap", settings.llm_quota_tz,
+             describe_embedder(embedder), pruned)
     alive = WorkerHeartbeat(settings.db_url, settings.worker_id, settings.heartbeat_seconds)
     alive.start()   # 큐가 비어도 운영 지표에 살아 있는 워커로 보이게 30초마다 신호를 남긴다
     try:
@@ -143,13 +155,15 @@ def main(argv: list[str] | None = None) -> None:
             if status is None:
                 index_idle(store, settings)         # 작업이 없을 때만 색인·이슈 묶기,
                 embed_idle(store, embedder, settings, embed_pacer)     # 색인된 조각의 임베딩,
-                enrich_idle(store, llm, settings)   # 요약·분류를 한 묶음씩 돌린다
+                enrich_idle(store, enrich_llm, settings)   # 요약·분류를 한 묶음씩 돌린다
                 if backfill_idle(store, settings):  # 그리고 과거 기사 채우기를 한 묶음 넣는다 (쉬지 않고 바로 집는다)
                     continue
                 time.sleep(settings.poll_seconds)
     finally:
         alive.stop()
         fetcher.close()
+        if ledger is not None:
+            ledger.close()
         store.close()
 
 

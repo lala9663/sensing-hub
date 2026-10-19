@@ -5,11 +5,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
+import io.sensinghub.llm.LlmLedger;
 import io.sensinghub.review.ReviewQueueService;
 
 /**
@@ -65,9 +67,11 @@ public class OpsService {
     public record Throughput(double scheduledRunsPerHour, long completedLastHour, Double demandRatio, boolean workersShort) {
     }
 
+    /** llm: 오늘(쿼터 기준 날짜) LLM 사용량 — 용도별 호출 수, 요약 상한 대비, 쉬는 중인 모델 ({@link LlmLedger#today}). */
     public record Overview(OffsetDateTime generatedAt, Map<String, Long> sources, Map<String, Long> reviewQueue,
                            JobQueue jobQueue, JobResults24h jobs24h, Documents24h documents24h,
-                           List<ErrorCount> topErrors24h, Throughput throughput, List<WorkerStatus> workers) {
+                           List<ErrorCount> topErrors24h, Throughput throughput, List<WorkerStatus> workers,
+                           LlmLedger.Today llm) {
     }
 
     /** 이 시간(초) 안에 생존 신호가 있어야 살아 있는 워커로 센다. 워커는 30초마다 신호를 남긴다 (SENSING_HEARTBEAT_SECONDS). */
@@ -88,16 +92,21 @@ public class OpsService {
 
     private final JdbcClient jdbc;
     private final ReviewQueueService reviewQueue;
+    private final LlmLedger llmLedger;
+    private final int enrichDailyCalls;
 
-    public OpsService(JdbcClient jdbc, ReviewQueueService reviewQueue) {
+    public OpsService(JdbcClient jdbc, ReviewQueueService reviewQueue, LlmLedger llmLedger,
+                      @Value("${sensing.llm.enrich-daily-calls:300}") int enrichDailyCalls) {
         this.jdbc = jdbc;
         this.reviewQueue = reviewQueue;
+        this.llmLedger = llmLedger;
+        this.enrichDailyCalls = enrichDailyCalls;
     }
 
     public Overview overview(CurrentUser user) {
         user.require(Role.ADMIN);
         return new Overview(OffsetDateTime.now(), sourceCounts(), reviewQueue.counts(user), jobQueue(), jobs24h(),
-                documents24h(), topErrors24h(), throughput(), workers());
+                documents24h(), topErrors24h(), throughput(), workers(), llmLedger.today(enrichDailyCalls));
     }
 
     public List<SourceHealth> sourceHealth(CurrentUser user, String status, int limit) {

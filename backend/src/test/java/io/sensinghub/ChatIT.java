@@ -82,6 +82,7 @@ class ChatIT {
                 """).update();
         jdbc.sql("UPDATE source SET active_config_version_id = NULL").update();
         jdbc.sql("TRUNCATE source_config_version, source, site RESTART IDENTITY CASCADE").update();
+        jdbc.sql("TRUNCATE llm_usage, llm_cooldown").update();   // 429 뒤 쉬는 중 기록이 다음 테스트를 막지 않게 (LlmBudgetIT)
     }
 
     // ------------------------------------------------------------------ 도우미
@@ -652,6 +653,7 @@ class ChatIT {
         assertThat(failed.get("assistant").get("content").asText()).contains("하루 사용 한도");
         assertThat(jdbc.sql("SELECT meta->>'error' FROM chat_message WHERE session_id = ? AND role = 'ASSISTANT'").param(s)
                 .query(String.class).single()).isEqualTo("RATE_LIMITED");
+        jdbc.sql("DELETE FROM llm_cooldown").update();   // 한도가 풀렸다고 치고 이어 간다 (쉬는 동안의 동작은 LlmBudgetIT)
 
         // 도구를 한 번 부른 뒤 한도에 걸려도 그 턴은 저장되고 다음 턴에 다시 보내지 않는다
         LLM.then(toolCall("c1", "list_issues", "{}")).then(Reply.status(429, MockLlmServer.GEMINI_MINUTE_429));
@@ -659,6 +661,7 @@ class ChatIT {
         assertThat(midway.get("assistant").get("content").asText()).contains("약 42초 뒤");
         assertThat(midway.get("assistant").get("citations")).isEmpty();
         assertThat(roles(s)).containsExactly("USER", "ASSISTANT", "USER", "ASSISTANT", "TOOL", "ASSISTANT");
+        jdbc.sql("DELETE FROM llm_cooldown").update();
 
         LLM.then(body -> {
             List<JsonNode> users = messages(body, "user");

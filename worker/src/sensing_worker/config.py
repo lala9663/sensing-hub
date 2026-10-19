@@ -84,10 +84,17 @@ class Settings:
     llm_max_sample_pages: int = field(default_factory=lambda: int(os.getenv("SENSING_LLM_MAX_SAMPLE_PAGES", "5")))
     llm_page_chars: int = field(default_factory=lambda: int(os.getenv("SENSING_LLM_PAGE_CHARS", "30000")))
     llm_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_LLM_TIMEOUT", "120")))
+    # LLM 무료 한도의 하루 기준 시간대 (llm_usage.quota_day, 하루 한도 429 뒤 쉬는 끝 시각). Gemini 무료 한도는 태평양 시간 자정
+    # (한국 시간 오후 4~5시)에 초기화된다. 백엔드 sensing.llm.quota-tz와 같은 값이어야 한다
+    llm_quota_tz: str = field(default_factory=lambda: os.getenv("SENSING_LLM_QUOTA_TZ", "America/Los_Angeles").strip()
+                              or "America/Los_Angeles")
     # 수집 시점 요약·분류(보강). 큐에 작업이 없을 때 LLM이 설정돼 있으면 한 묶음씩 돌린다
     enrich_enabled: bool = field(default_factory=lambda: _bool("SENSING_ENRICH_ENABLED", True))
     # 한 번의 LLM 호출에 묶는 문서 수
     enrich_batch: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_BATCH", "10")))
+    # 보강의 하루 LLM 호출 수 상한 (워커 여러 대 합산, llm_usage 기준). 닿으면 그날은 보강을 쉬고 남은 문서는 다음 날 이어서 한다.
+    # 기본 300 — Gemini Flash-Lite 무료 하루 500번 중 200번을 챗봇·등록 레시피 몫으로 남긴다. 0이면 상한 없음
+    enrich_daily_calls: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_DAILY_CALLS", "300")))
     # 문서당 LLM에 보여 줄 본문 글자 수 상한
     enrich_body_chars: int = field(default_factory=lambda: int(os.getenv("SENSING_ENRICH_BODY_CHARS", "4000")))
     # 작업 큐 교대: 등록(ONBOARD)을 이 횟수 집을 때마다 주기 수집(CRAWL)을 한 번 먼저 집는다 (일괄 등록 수백 건이 주기 수집을 오래 막지 않도록).

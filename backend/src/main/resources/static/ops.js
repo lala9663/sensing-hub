@@ -73,9 +73,39 @@ App.route('/admin/ops', async (view) => {
           <tr><td><span class="badge badge-orange">${esc(e.code)}</span></td><td class="right"><b>${App.fmtNum(e.count)}</b></td></tr>`).join('')}
         </tbody></table>` : '<div class="muted small">실패가 없습니다.</div>'}
       </div>
+      ${llmCard(o.llm)}
       <div class="card" style="grid-column:1 / -1">
         <h3>워커 <span class="muted small" style="font-weight:400">30초마다 신호 · 2분 넘게 없으면 멈춤으로 봄 · 최근 24시간</span></h3>
         ${workerTable(o.workers || [])}
+      </div>`;
+  }
+
+  const PURPOSE = { chat: '챗봇', enrich: '요약·분류', recipe: '등록 레시피', embed: '임베딩' };
+  const PAUSE_REASON = { DAILY: '하루 한도', MINUTE: '분당 한도', RATE_LIMITED: '호출 한도' };
+
+  /** 오늘(쿼터 기준 날짜) LLM 사용량: 쉬는 중인 모델, 요약 상한 대비, 모델·용도별 호출 수 (V19 llm_usage·llm_cooldown). */
+  function llmCard(l) {
+    if (!l) return '';
+    const cap = l.enrichDailyCap || 0;
+    const capHit = cap > 0 && l.enrichCalls >= cap;
+    const pauses = (l.cooldowns || []).map(c => `
+      <div class="warn">쉬는 중: <code>${esc(c.model)}</code> ${esc(PAUSE_REASON[c.reason] || c.reason)} — ${App.fmtDateTime(c.until)}까지
+        (${App.fmtSeconds(c.secondsLeft)} 남음)${c.purpose ? ` · ${esc(PURPOSE[c.purpose] || c.purpose)}에서 429` : ''}${c.quotaId ? ` <span class="muted small">${esc(c.quotaId)}</span>` : ''}</div>`).join('');
+    const rows = (l.usage || []).map(u => `
+      <tr><td><code>${esc(u.model)}</code></td><td>${esc(PURPOSE[u.purpose] || u.purpose)}</td>
+        <td class="right"><b>${App.fmtNum(u.calls)}</b>${u.dailyCap ? ` <span class="muted small">/ ${App.fmtNum(u.dailyCap)}</span>` : ''}</td>
+        <td class="right ${u.rateLimited > 0 ? 'warn' : ''}">${App.fmtNum(u.rateLimited)}</td>
+        <td class="right ${u.errors > 0 ? 'warn' : ''}">${App.fmtNum(u.errors)}</td>
+        <td class="right small">${App.fmtNum(u.inputTokens)}</td><td class="right small">${App.fmtNum(u.outputTokens)}</td></tr>`).join('');
+    return `
+      <div class="card" style="grid-column:1 / -1">
+        <h3>LLM 사용량 (오늘) <span class="muted small" style="font-weight:400">${esc(l.quotaTimeZone)} 기준 ${esc(l.quotaDay)} · ${App.fmtDateTime(l.resetAt)}에 초기화</span></h3>
+        ${pauses || '<div style="color:var(--green)">쉬는 모델이 없습니다</div>'}
+        <dl class="kv mt">
+          <dt>요약·분류 하루 상한</dt><dd class="${capHit ? 'warn' : ''}">${cap > 0 ? `${App.fmtNum(l.enrichCalls)} / ${App.fmtNum(cap)}번${capHit ? ' — 상한에 닿아 초기화까지 쉽니다 (남은 문서는 다음 날 이어서)' : ''}` : `${App.fmtNum(l.enrichCalls)}번 (상한 없음)`}</dd>
+        </dl>
+        ${rows ? `<table class="mt"><thead><tr><th>모델</th><th>용도</th><th class="right">호출</th><th class="right">429</th><th class="right">실패</th><th class="right">입력 토큰</th><th class="right">출력 토큰</th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<div class="muted small mt">오늘은 아직 LLM을 부르지 않았습니다.</div>'}
       </div>`;
   }
 
