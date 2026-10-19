@@ -45,12 +45,14 @@ class UiIT {
         assertThat(app.getBody()).contains("X-User");
 
         for (String script : new String[] {"registrations.js", "documents.js", "issues.js", "companies.js", "watches.js",
-                "digests.js", "chat.js", "chat-dock.js", "admin.js", "ops.js", "caidentia.js", "app.css"}) {
+                "naver.js", "digests.js", "chat.js", "chat-dock.js", "admin.js", "ops.js", "caidentia.js", "app.css"}) {
             assertThat(http.getForEntity("/" + script, String.class).getStatusCode())
                     .as(script).isEqualTo(HttpStatus.OK);
         }
         // 어느 화면에서나 뜨는 챗봇 버튼·대화창
         assertThat(index.getBody()).contains("chat-dock.js").contains("ChatDock.mount()");
+        // 네이버 뉴스 탭: 키가 없어도 메뉴는 보인다 (화면이 안내를 보여 준다)
+        assertThat(index.getBody()).contains("href=\"#/naver\"").contains("naver.js");
     }
 
     /** 챗봇만 있는 새 창: 메뉴 없이 같은 app.js(X-User)와 챗봇 공통 부품을 쓴다. */

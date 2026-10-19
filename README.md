@@ -83,6 +83,7 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 이슈 | 같은 사건을 다룬 기사 묶음. 기간·언론사 수(2곳+/3곳+/5곳+) 칩, 검색, 카드(대표 제목·언론사 N곳·기사 M건·기간·핵심 낱말), 펼쳐 보는 소속 기사 |
 | 거래처 | 회사 목록(사업자번호·신호 수·HIGH·최근 신호·감시 상태), 등록, CSV 붙여넣기 import, 회사 상세(최근 신호·연결 문서), 전체 신호(종류·심각도·기간) |
 | 키워드 감시 | 목록, 생성, 키워드·제외어 수정(설정 새 버전), 감시 행의 "네이버 실시간"(네이버 키가 있을 때, 표시 전용·출처 "NAVER 검색 결과") |
+| 네이버 뉴스 | 검색창(Enter)·정렬(최신순·정확도순)·내 감시 키워드 빠른 검색 칩, 결과(제목=원문 새 탭·언론사·발행 시각·요약 문장·"네이버에서 보기"), 결과 총수, 더 보기(1,000번째까지), 출처 "NAVER 검색 결과"·표시 전용 안내. 검색어는 주소(`#/naver?q=..`)에 남음. 키가 없거나 모드가 off면 안내만. 아래 "네이버 뉴스 탭" |
 | 다이제스트 | 구독 목록, 생성(채널·대상·시각·필터 체크), 미리보기(HTML), 지금 보내기, 보낸 기록 |
 | 챗봇 | **어느 화면에서나 오른쪽 아래 챗봇 버튼** → 화면 위 대화창(화면을 옮겨도 대화 유지, 새 대화·대화 목록·크게 보기·새 창으로). 메뉴 "챗봇"은 대화 목록이 왼쪽에 있는 전체 화면. 질문 입력(Enter 보내기·Shift+Enter 줄바꿈, 예시 질문), "생각 중" 표시, 답의 `[n]` → 근거 목록(원문 링크·이슈 화면), 사용한 도구와 화면 바로 가기. 아래 "챗봇" |
 | 관리자 · 처리 대기 큐 | 종류별 건수, 항목별 사유·메시지·대기 시간과 가능한 조치만(승인 / 반려 사유 / API 키 등록 / 재점검 / 다시 탐색 / 일시정지 / 제외) |
@@ -170,7 +171,8 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 | `SENSING_SECRET_KEY` | (없음) | 백엔드·워커 공통. API 키를 암호화·복호화하는 대칭키(`pgp_sym_encrypt`). 비우면 백엔드 자격 증명 API는 503, 워커는 API 소스를 관리자 큐로 보낸다 |
 | `SENSING_MAX_API_ITEMS` | `500` | 워커. API 소스 실행 1회당 받을 항목 수 상한 |
 | `SENSING_NAVER_DAILY_LIMIT` | `20000` | 워커. 네이버 검색 API 일 호출 상한(공식 25,000). 지금은 호출 수를 로그에 남기는 기준이고 정확한 쿼터 추적은 후속 |
-| `SENSING_NAVER_MODE` | `display` | 백엔드·워커 공통(같은 값). 네이버 뉴스 검색 사용 방식: `display` 표시 전용(결과를 저장·요약·챗봇·다이제스트에 쓰지 않고 감시 화면에서 실시간으로 보여 주기만), `store` 저장·분석(**법무 확인 뒤에만**, 감시에 네이버 주기 수집을 붙여 `document`에 저장), `off` 쓰지 않음. 모르는 값은 `display` |
+| `SENSING_NAVER_MODE` | `display` | 백엔드·워커 공통(같은 값). 네이버 뉴스 검색 사용 방식: `display` 표시 전용(결과를 저장·요약·챗봇·다이제스트에 쓰지 않고 네이버 뉴스 탭·감시 화면에서 실시간으로 보여 주기만), `store` 저장·분석(**법무 확인 뒤에만**, 감시에 네이버 주기 수집을 붙여 `document`에 저장), `off` 쓰지 않음. 모르는 값은 `display` |
+| `SENSING_NAVER_SEARCH_PER_SECOND` | `2` | 백엔드. 네이버 뉴스 탭 검색의 사용자별 초당 허용 횟수(남용 방지, 넘으면 429 `NAVER_TOO_FAST`) |
 | `SENSING_NAVER_API` | `hub` | 백엔드·워커 공통. `hub` = NAVER API HUB(`https://naverapihub.apigw.ntruss.com/search/v1/news`, 헤더 `X-NCP-APIGW-API-KEY-ID`/`X-NCP-APIGW-API-KEY`), `developers` = 예전 개발자센터(`openapi.naver.com/v1/search/news.json`, 2027-06-30 지원 종료) |
 | `SENSING_NAVER_SEARCH_URL` | (없음) | 백엔드·워커. 검색 주소만 바꾼다(테스트·사내 프록시). 헤더는 `SENSING_NAVER_API`를 따른다 |
 
@@ -216,7 +218,26 @@ config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"
    (서버에는 `Client ID:Client Secret` 한 문자열로 암호화 저장).
 3. 저장하면 화면이 바로 **시험 호출**을 합니다. 상태가 `VALID`면 성공, `INVALID`면 "마지막 오류"의 안내(Client ID·Secret, Application의 검색 선택)를
    확인합니다. 등록된 키 목록의 **시험 호출** 버튼으로 다시 확인할 수 있습니다.
-4. **키워드 감시** 화면에서 감시 행의 **네이버 실시간**을 눌러 최신 뉴스가 보이는지 확인합니다. 감시의 "문서" 수는 늘지 않아야 정상입니다(표시 전용).
+4. 왼쪽 메뉴 **네이버 뉴스**에서 검색하거나, **키워드 감시** 화면에서 감시 행의 **네이버 실시간**을 눌러 최신 뉴스가 보이는지 확인합니다.
+   감시의 "문서" 수는 늘지 않아야 정상입니다(표시 전용).
+
+### 네이버 뉴스 탭 (표시 전용)
+
+왼쪽 메뉴 **네이버 뉴스**(`#/naver`)는 감시와 무관하게 아무 검색어로나 네이버 뉴스를 찾아보는 화면입니다. 권한은 VIEWER 이상이면 됩니다.
+
+- 쓰는 법: 검색창에 검색어를 넣고 Enter(또는 "검색"). 정렬은 **최신순**(`sort=date`, 기본)·**정확도순**(`sim`). 처음 들어오면 빈 검색창과
+  **내 키워드 감시의 키워드**가 빠른 검색 칩으로 나옵니다(ADMIN은 전체 감시). 결과마다 제목(누르면 언론사 원문이 새 탭에서 열림), 언론사(원문 주소의
+  도메인 — 등록된 사이트면 그 이름), 발행 시각, 요약 문장(네이버 description의 `<b>` 태그를 지우고 엔티티를 푼 것, 검색 낱말은 굵게),
+  **네이버에서 보기** 링크를 보여 줍니다. 20건씩 **더 보기**로 이어 보고, 네이버 API가 허용하는 1,000번째까지 볼 수 있습니다.
+- 검색어·정렬은 주소에 남습니다(`#/naver?q=반도체%20수출&sort=sim`). 새로 고침하거나 주소를 공유하면 같은 검색을 다시 불러옵니다(결과는 그때 새로 부름).
+- 표시 전용: 화면에 "NAVER 검색 결과" 출처와 "저장하지 않습니다" 안내를 붙입니다. 결과는 `document`·임베딩·요약·챗봇·다이제스트 어디에도 넣지 않고
+  서버 메모리 캐시도 없으며 응답은 `Cache-Control: no-store`입니다. 남는 것은 **감사 로그**(`audit_log` action `NAVER_SEARCH`: 사용자·검색어·정렬·
+  start·display, 결과·건수는 남기지 않음)와 키 상태뿐입니다.
+- 남용 방지: 사용자마다 초당 2회(`SENSING_NAVER_SEARCH_PER_SECOND`), 한 번에 최대 50건(기본 20건), 검색어 100자까지. 너무 빠르면
+  429 `NAVER_TOO_FAST`(네이버 하루 한도 초과는 429 `NAVER_RATE_LIMITED`로 따로 알림).
+- 키가 없거나(`NAVER_KEY_REQUIRED`) INVALID이거나 모드가 `off`(`NAVER_OFF`)면 메뉴는 보이지만 화면은 안내만 보여 줍니다(관리자에게는 API 키 화면 링크).
+- API: `GET /api/v1/naver/news?query=<검색어>&sort=date|sim&start=1&display=20` →
+  `{query, sort, total, start, display, items[{title, description, press, publishedAt, originalUrl, naverUrl}], nextStart, maxStart, fetchedAt, sourceLabel, mode}`.
 
 ### 수집 시점 요약·분류 (M2)
 
@@ -456,8 +477,9 @@ curl localhost:8080/api/v1/ops/overview -H 'X-User: admin'   # 관리자 운영 
 # 키워드 감시 등록 (수집 기사 대조. SENSING_NAVER_MODE=store이고 네이버 키가 있으면 네이버 검색도 60분 주기로. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
 curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
 curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
-# 네이버 뉴스 실시간 (표시 전용: 저장하지 않음, Cache-Control no-store) · 사용 방식·키 상태
+# 네이버 뉴스 실시간 (표시 전용: 저장하지 않음, Cache-Control no-store) · 네이버 뉴스 탭 검색(감시와 무관, 요약 포함, 사용자별 초당 2회) · 사용 방식·키 상태
 curl 'localhost:8080/api/v1/watches/1/naver-news?keyword=%EB%A9%94%ED%83%80%EB%84%B7&display=20&start=1' -H 'X-User: registrar'
+curl 'localhost:8080/api/v1/naver/news?query=%EB%B0%98%EB%8F%84%EC%B2%B4&sort=sim&start=1&display=20' -H 'X-User: viewer'
 curl localhost:8080/api/v1/naver/status -H 'X-User: registrar'
 
 # 수집 문서 (요약·분류·감시 검색어 포함, 발행일 내림차순). since는 수집 시각 기준, topic·keyword·source_id로 거르고 limit 기본 50·최대 200
@@ -574,7 +596,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 
 ### 어디까지 왔고 무엇이 남았나 (2026-10-19)
 
-**된 것** — URL 하나(또는 수백 개 일괄)로 사이트가 자동 등록되고 주기 수집된다. 공개 API(DART·공공데이터포털, 네이버 뉴스는 NAVER API HUB 키가 있을 때 감시 화면 실시간 표시 전용)와 키워드 감시(기본은 수집 기사 대조),
+**된 것** — URL 하나(또는 수백 개 일괄)로 사이트가 자동 등록되고 주기 수집된다. 공개 API(DART·공공데이터포털, 네이버 뉴스는 NAVER API HUB 키가 있을 때 네이버 뉴스 탭 검색·감시 화면 실시간 — 표시 전용)와 키워드 감시(기본은 수집 기사 대조),
 수집 시점 요약·분류, 일간 다이제스트, 거래처 마스터와 위험 신호(국세청·DART 공시·조달청), 케이던시아 연동(목업), 링크 모음 페이지의
 언론사 자동 확장, 운영 지표, 그리고 이 모든 것을 다루는 브라우저 화면. 실측: 표본 10곳 중 9곳 자동 등록(10-19 재측정 10/10),
 주간지 8곳 중 6곳 자동 등록(REVIEW였던 한겨레21·주간한국은 10-19 규칙 보강 뒤 자동 등록), 뉴스스탠드 → 언론사 50곳 자동 등록.
@@ -650,6 +672,9 @@ M2에서 한 일:
   401·403·429·SE 오류 코드를 알기 쉬운 문장으로, `SENSING_NAVER_MODE`(display 기본 | store | off). 표시 전용은 감시 화면 "네이버 실시간"에서
   백엔드가 실시간으로 불러와 제목·언론사·시각·링크만 보여 주고 DB·LLM·챗봇·다이제스트에 넣지 않는다(워커도 수집하지 않는다). 관리자 화면
   Client ID·Secret 입력과 시험 호출(`POST /api/v1/api-credentials/naver_news/verify`)
+- [x] 네이버 뉴스 탭 (2026-10-19): 왼쪽 메뉴 "네이버 뉴스"(`#/naver?q=..`)에서 감시와 무관한 검색어로 네이버 뉴스를 검색해 보여 준다
+  (`GET /api/v1/naver/news`, 최신순·정확도순, 요약 문장, 더 보기 1,000번째까지, 내 감시 키워드 칩). 표시 전용 그대로 — 저장·캐싱·LLM 없음,
+  `Cache-Control: no-store`, 감사 로그에는 검색어만. VIEWER 이상, 사용자별 초당 2회·display 50 상한. 키가 없거나 모드가 off면 안내만
 - [x] 수집 시점 요약·분류: 워커 보강 단계(`enrich.py`, 큐가 비었을 때 묶음 10건을 LLM 한 번에, `SENSING_ENRICH_*`)가
   `document_enrichment`(V6)에 토픽·태그·요약을 두고, `GET /api/v1/documents`(since·topic·keyword·source_id 필터, 상세, 토픽별 건수)로
   읽는다. 언론 기사는 제목만 분류하고 요약을 저장하지 않으며, LLM 장애·검증 실패는 수집에 번지지 않는다

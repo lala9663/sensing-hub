@@ -10,12 +10,13 @@ import org.springframework.web.bind.annotation.RestController;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.naver.NaverNewsService.LiveResult;
+import io.sensinghub.naver.NaverNewsService.SearchResult;
 import io.sensinghub.naver.NaverNewsService.Status;
 import io.sensinghub.naver.NaverNewsService.VerifyResult;
 
 /**
- * 네이버 뉴스 검색 (표시 전용 기본): 사용 방식 조회, 감시별 실시간 보기, 관리자 키 시험 호출.
- * 실시간 보기 응답은 브라우저·프록시도 저장하지 않게 {@code Cache-Control: no-store}다 (약관: 캐싱 금지).
+ * 네이버 뉴스 검색 (표시 전용 기본): 사용 방식 조회, 네이버 뉴스 탭 검색, 감시별 실시간 보기, 관리자 키 시험 호출.
+ * 검색·실시간 보기 응답은 브라우저·프록시도 저장하지 않게 {@code Cache-Control: no-store}다 (약관: 캐싱 금지).
  */
 @RestController
 public class NaverNewsController {
@@ -29,6 +30,16 @@ public class NaverNewsController {
     @GetMapping("/api/v1/naver/status")
     public Status status(CurrentUser user) {
         return service.status(user);
+    }
+
+    /** 네이버 뉴스 탭: 검색어로 네이버 뉴스 한 쪽 (query 필수, display 1~50 기본 20, start 1~1000, sort date|sim). */
+    @GetMapping("/api/v1/naver/news")
+    public ResponseEntity<SearchResult> search(CurrentUser user,
+                                               @RequestParam(required = false) String query,
+                                               @RequestParam(required = false) Integer display,
+                                               @RequestParam(required = false) Integer start,
+                                               @RequestParam(required = false) String sort) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(service.search(user, query, display, start, sort));
     }
 
     @GetMapping("/api/v1/watches/{id}/naver-news")

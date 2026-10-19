@@ -1,6 +1,7 @@
 package io.sensinghub.naver;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -10,6 +11,7 @@ import org.junit.jupiter.api.Test;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import io.sensinghub.common.ApiException;
 import io.sensinghub.naver.NaverSearchClient.Kind;
 import io.sensinghub.naver.NaverSearchClient.NaverSearchException;
 
@@ -87,6 +89,49 @@ class NaverSearchClientTest {
         assertThat(NaverSearchClient.parsePubDate("Thu, 16 Oct 2026 09:30:00 +0900")).isEqualTo(expected);   // 요일이 틀려도
         assertThat(NaverSearchClient.parsePubDate("not a date")).isNull();
         assertThat(NaverSearchClient.parsePubDate(null)).isNull();
+    }
+
+    @Test
+    void cleansDescriptionsAndCutsLongOnes() {
+        assertThat(NaverSearchClient.cleanDescription("<b>메타넷</b>이 &quot;신제품&quot;을\n  공개 &amp; &lt;단독&gt;&#39;"))
+                .isEqualTo("메타넷이 \"신제품\"을 공개 & <단독>'");
+        assertThat(NaverSearchClient.cleanDescription("  ")).isNull();
+        assertThat(NaverSearchClient.cleanDescription(null)).isNull();
+        String exact = "가".repeat(NaverSearchClient.DESCRIPTION_MAX);
+        assertThat(NaverSearchClient.cleanDescription(exact)).isEqualTo(exact);
+        String cut = NaverSearchClient.cleanDescription("<b>" + "나".repeat(400) + "</b>");
+        assertThat(cut).hasSize(NaverSearchClient.DESCRIPTION_MAX + 1).endsWith("…").doesNotContain("<b>");
+        assertThat(NaverSearchClient.Sort.DATE.param()).isEqualTo("date");
+        assertThat(NaverSearchClient.Sort.SIM.param()).isEqualTo("sim");
+    }
+
+    @Test
+    void searchHelpersParseSortAndFindParentDomains() {
+        assertThat(NaverNewsService.parseSort(null)).isEqualTo(NaverSearchClient.Sort.DATE);
+        assertThat(NaverNewsService.parseSort(" ")).isEqualTo(NaverSearchClient.Sort.DATE);
+        assertThat(NaverNewsService.parseSort("Sim")).isEqualTo(NaverSearchClient.Sort.SIM);
+        assertThatThrownBy(() -> NaverNewsService.parseSort("popular")).isInstanceOf(ApiException.class)
+                .hasMessageContaining("sim");
+        assertThat(NaverNewsService.parentDomain("news.example.co.kr")).isEqualTo("example.co.kr");
+        assertThat(NaverNewsService.parentDomain("example.com")).isNull();
+        assertThat(NaverNewsService.parentDomain(null)).isNull();
+    }
+
+    @Test
+    void userRateLimiterAllowsTwoPerSecondPerUser() {
+        long[] now = {0};
+        UserRateLimiter limiter = new UserRateLimiter(2, 1000, () -> now[0]);
+        assertThat(limiter.tryAcquire(1)).isTrue();
+        assertThat(limiter.tryAcquire(1)).isTrue();
+        assertThat(limiter.tryAcquire(1)).isFalse();                 // 1초 안에 세 번째
+        assertThat(limiter.tryAcquire(2)).isTrue();                  // 다른 사용자는 따로 센다
+        now[0] = 999_000_000L;
+        assertThat(limiter.tryAcquire(1)).isFalse();                 // 거절한 호출은 세지 않지만 아직 1초가 안 됐다
+        now[0] = 1_000_000_000L;
+        assertThat(limiter.tryAcquire(1)).isTrue();                  // 첫 두 호출이 창 밖으로 나갔다
+        assertThat(limiter.tryAcquire(1)).isTrue();
+        assertThat(limiter.tryAcquire(1)).isFalse();
+        assertThat(limiter.limit()).isEqualTo(2);
     }
 
     @Test
