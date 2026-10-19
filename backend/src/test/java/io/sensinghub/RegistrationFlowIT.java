@@ -673,6 +673,54 @@ class RegistrationFlowIT {
                 .containsExactlyInAnyOrderEntriesOf(java.util.Map.of("산업동향", 1, "자사", 1));
     }
 
+    /** 키워드 감시 화면에서 넘어오는 감시별 기사 목록: watch_id, watch_id + keyword (같은 키워드가 여러 감시에 있어도 섞이지 않는다). */
+    @Test
+    void documentsApiFiltersByWatchAndKeyword() {
+        long press = siteSource("news.example.com", "NEWS");
+        long a = document(press, "https://news.example.com/articleView?idxno=11", "메타넷 신제품", null,
+                "2026-10-16T09:00:00+09:00", "2026-10-16T10:00:00+09:00", null);
+        long b = document(press, "https://news.example.com/articleView?idxno=12", "메타넷글로벌 수주", null,
+                "2026-10-15T09:00:00+09:00", "2026-10-15T10:00:00+09:00", null);
+        long c = document(press, "https://news.example.com/articleView?idxno=13", "반도체 시장의 메타넷", null,
+                "2026-10-14T09:00:00+09:00", "2026-10-14T10:00:00+09:00", null);
+        long unrelated = document(press, "https://news.example.com/articleView?idxno=14", "날씨", null,
+                "2026-10-16T08:00:00+09:00", "2026-10-16T10:00:00+09:00", null);
+        long self = watchSource(press, "자사 보도");
+        long industry = watchSource(press, "반도체 동향");
+        String sql = "INSERT INTO document_watch (document_id, source_id, keyword) VALUES (?, ?, ?)";
+        jdbc.sql(sql).params(a, self, "메타넷").update();
+        jdbc.sql(sql).params(b, self, "메타넷글로벌").update();
+        jdbc.sql(sql).params(c, industry, "메타넷").update();     // 같은 키워드, 다른 감시
+
+        // VIEWER도 남의 감시에 걸린 기사 목록을 읽는다 (문서 목록 권한과 같다)
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + self).findValuesAsText("id"))
+                .containsExactly(String.valueOf(a), String.valueOf(b));
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + industry).findValuesAsText("id"))
+                .containsExactly(String.valueOf(c));
+        // keyword만이면 감시를 가리지 않는다
+        assertThat(get("viewer", "/api/v1/documents?keyword=메타넷").findValuesAsText("id"))
+                .containsExactly(String.valueOf(a), String.valueOf(c));
+        // watch_id + keyword: 둘 다 만족
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + self + "&keyword=메타넷").findValuesAsText("id"))
+                .containsExactly(String.valueOf(a));
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + self + "&keyword=메타넷글로벌").findValuesAsText("id"))
+                .containsExactly(String.valueOf(b));
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + industry + "&keyword=메타넷글로벌")).isEmpty();
+        // 다른 필터와도 AND
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + self + "&since=2026-10-16").findValuesAsText("id"))
+                .containsExactly(String.valueOf(a));
+        // 감시가 아닌 소스 번호나 없는 번호는 빈 목록
+        assertThat(get("viewer", "/api/v1/documents?watch_id=" + press)).isEmpty();
+        assertThat(get("viewer", "/api/v1/documents?watch_id=999999")).isEmpty();
+        assertThat(get("viewer", "/api/v1/documents").findValuesAsText("id")).contains(String.valueOf(unrelated));
+    }
+
+    private long watchSource(long siteSourceId, String name) {
+        return jdbc.sql("INSERT INTO source (site_id, name, kind, watch_name, method, status) "
+                + "SELECT site_id, ?, 'WATCH', ?, 'API', 'ACTIVE' FROM source WHERE id = ? RETURNING id")
+                .params("watch:" + name, name, siteSourceId).query(Long.class).single();
+    }
+
     private java.util.Map<String, Integer> topicCounts(String path) {
         java.util.Map<String, Integer> counts = new java.util.LinkedHashMap<>();
         get("viewer", path).fields().forEachRemaining(e -> counts.put(e.getKey(), e.getValue().asInt()));

@@ -169,6 +169,8 @@ td.actions { white-space: nowrap; }
 .badge-grey { color: var(--grey); background: var(--grey-bg); }
 .badge-blue { color: var(--primary-dark); background: var(--blue-bg); }
 .tag { display: inline-block; padding: 0 6px; margin-right: 4px; border-radius: 4px; background: #eef2f7; font-size: 12px; }
+a.tag { color: var(--primary-dark); text-decoration: none; }
+a.tag:hover { text-decoration: underline; }
 
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
 .chip {
@@ -208,6 +210,8 @@ td.actions { white-space: nowrap; }
 
 .doc-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
 .doc-item .title { font-size: 14px; font-weight: 600; }
+.doc-item .title .ext { font-size: 11px; font-weight: normal; color: var(--muted); margin-left: 4px; white-space: nowrap; }
+.filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; margin-bottom: 10px; border-radius: 4px; background: var(--blue-bg); }
 .doc-item .meta { color: var(--muted); font-size: 12px; margin: 2px 0; }
 .doc-item .summary { margin: 4px 0; }
 .issue-docs { margin: 6px 0; padding-left: 18px; }

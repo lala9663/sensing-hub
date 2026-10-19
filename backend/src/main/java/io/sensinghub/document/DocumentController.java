@@ -26,7 +26,8 @@ public class DocumentController {
 
     /**
      * 발행일 내림차순 목록.
-     * since: 수집 시각 기준 (ISO 시각 또는 날짜), source_id, topic: 분류 체계 값 포함 여부, keyword: 감시 검색어 일치,
+     * since: 수집 시각 기준 (ISO 시각 또는 날짜), source_id, topic: 분류 체계 값 포함 여부,
+     * watch_id: 그 키워드 감시에 걸린 문서, keyword: 감시 검색어 일치 (watch_id와 함께면 그 감시에서 그 검색어로 걸린 문서),
      * q: 전문 검색 (낱말마다 접두 일치, 모든 낱말 포함, 조사는 뗀다 — DocumentService.appendSearch), limit: 기본 50, 최대 200.
      * 행에 issueId·issueDocCount(워커가 묶은 이슈)가 붙는다.
      */
@@ -35,10 +36,11 @@ public class DocumentController {
                                   @RequestParam(required = false) String since,
                                   @RequestParam(name = "source_id", required = false) Long sourceId,
                                   @RequestParam(required = false) String topic,
+                                  @RequestParam(name = "watch_id", required = false) Long watchId,
                                   @RequestParam(required = false) String keyword,
                                   @RequestParam(required = false) String q,
                                   @RequestParam(required = false) Integer limit) {
-        return service.list(user, since, sourceId, topic, keyword, q, limit);
+        return service.list(user, since, sourceId, topic, watchId, keyword, q, limit);
     }
 
     /** 토픽별 건수 (since는 수집 시각 기준). */
