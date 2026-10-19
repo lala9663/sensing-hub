@@ -95,3 +95,9 @@ class Settings:
     issue_threshold: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_THRESHOLD", "0.4")))
     issue_min_shared: int = field(default_factory=lambda: int(os.getenv("SENSING_ISSUE_MIN_SHARED", "2")))
     issue_pair_threshold: float = field(default_factory=lambda: float(os.getenv("SENSING_ISSUE_PAIR_THRESHOLD", "0.66")))
+    # 과거 기사 채우기(BACKFILL). 큐가 빌 때만 한 묶음씩 돈다 — 한 묶음에 보내는 요청 수(사이트맵·목록·기사·robots 포함)
+    backfill_enabled: bool = field(default_factory=lambda: _bool("SENSING_BACKFILL_ENABLED", True))
+    backfill_chunk: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_CHUNK", "100")))
+    # 채우기 하나가 여는 사이트맵 수 상한(색인 포함)과, 목록 페이지를 거꾸로 넘길 때 허브 하나에서 볼 쪽 수 상한
+    backfill_max_sitemaps: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_MAX_SITEMAPS", "60")))
+    backfill_max_pages: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_MAX_PAGES", "300")))

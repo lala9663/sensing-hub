@@ -56,6 +56,7 @@ class Store:
 
         ONBOARD(사용자가 기다리는 등록)를 먼저 집되, preferred_job_type대로 몇 번에 한 번은 CRAWL을 먼저 집어
         일괄 등록이 주기 수집을 오래 막지 않게 한다. 같은 유형 안에서는 오래 기다린 순이다.
+        과거 기사 채우기(BACKFILL) 묶음은 언제나 맨 뒤다 (다른 작업이 하나라도 대기하면 그것부터).
         """
         prefer = preferred_job_type(self.claimed, self.onboard_ratio)
         row = self.conn.execute(
@@ -64,7 +65,7 @@ class Store:
                    lease_until = now() + make_interval(mins => %s), started_at = COALESCE(started_at, now())
             WHERE id = (
                 SELECT id FROM crawl_job WHERE status = 'QUEUED'
-                ORDER BY CASE WHEN job_type = %s THEN 0 ELSE 1 END, created_at
+                ORDER BY CASE WHEN job_type = 'BACKFILL' THEN 2 WHEN job_type = %s THEN 0 ELSE 1 END, created_at
                 FOR UPDATE SKIP LOCKED LIMIT 1)
             RETURNING id, source_id, job_type, trigger, config_version_id, attempt
             """, (worker_id, lease_minutes, prefer)).fetchone()
@@ -321,8 +322,12 @@ class Store:
             """, (anomalous, source_id)).fetchone()["consecutive_anomalies"]
 
     def upsert_document(self, *, source_id: int, job_id: int, url: str, title: str | None, author: str | None,
-                        section: str | None, published_at: datetime | None, body: str | None) -> tuple[int, str]:
-        """저장 결과: (id, 'NEW' | 'UPDATED' | 'SAME'). 본문이 바뀌면 이전본을 document_version에 남긴다."""
+                        section: str | None, published_at: datetime | None, body: str | None,
+                        collected_at: datetime | None = None) -> tuple[int, str]:
+        """저장 결과: (id, 'NEW' | 'UPDATED' | 'SAME'). 본문이 바뀌면 이전본을 document_version에 남긴다.
+
+        collected_at: 새 문서의 수집 시각을 정할 때만 (과거 기사 채우기는 발행 시각을 넣는다 — backfill.py). 없으면 지금.
+        """
         url_hash = sha256(url)
         content_hash = sha256((title or "") + "\n" + (body or ""))
         with self.conn.transaction():
@@ -333,9 +338,10 @@ class Store:
                 doc_id = self.conn.execute(
                     """
                     INSERT INTO document (source_id, url, url_hash, title, author, section, published_at,
-                                          body_text, content_hash)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-                    """, (source_id, url, url_hash, title, author, section, published_at, body, content_hash)
+                                          body_text, content_hash, collected_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now())) RETURNING id
+                    """, (source_id, url, url_hash, title, author, section, published_at, body, content_hash,
+                          collected_at)
                 ).fetchone()["id"]
                 return doc_id, "NEW"
             if current["content_hash"] == content_hash:
@@ -544,3 +550,153 @@ class Store:
             """, (document_id, document_version, (summary or None) and summary[:600],
                   json.dumps(topics, ensure_ascii=False), json.dumps(tags, ensure_ascii=False),
                   (model or "")[:100] or None, status, (error or "")[:500] or None))
+
+    # ------------------------------------------------------------------ 과거 기사 채우기 (BACKFILL)
+    def enqueue_backfill_chunk(self) -> int | None:
+        """큐가 비었을 때 진행 중인 채우기 하나의 다음 묶음(crawl_job BACKFILL)을 넣는다. 넣은 작업 id, 넣을 것이 없으면 None.
+
+        대상: QUEUED·RUNNING 채우기 중 소스가 ACTIVE 사이트 소스이고, 그 소스에 열린 작업이 없고, 주기 수집 차례가 아직 오지 않은 것
+        (차례가 왔으면 스케줄러가 CRAWL을 넣도록 비워 둔다). 다른 작업이 하나라도 대기 중이면 넣지 않는다.
+        여러 채우기가 있으면 가장 오래 쉰 것(updated_at)부터 돌아가며 한다.
+        """
+        row = self.conn.execute(
+            """
+            INSERT INTO crawl_job (source_id, job_type, config_version_id, trigger, backfill_id)
+            SELECT b.source_id, 'BACKFILL', s.active_config_version_id, 'MANUAL', b.id
+            FROM backfill b JOIN source s ON s.id = b.source_id
+            WHERE b.status IN ('QUEUED', 'RUNNING') AND s.status = 'ACTIVE' AND s.kind = 'SITE'
+              AND (s.next_run_at IS NULL OR s.next_run_at > now())
+              AND NOT EXISTS (SELECT 1 FROM crawl_job j WHERE j.source_id = b.source_id AND j.status IN ('QUEUED', 'RUNNING'))
+              AND NOT EXISTS (SELECT 1 FROM crawl_job q WHERE q.status = 'QUEUED')
+            ORDER BY b.updated_at, b.id
+            LIMIT 1
+            ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
+            RETURNING id
+            """).fetchone()
+        return row["id"] if row else None
+
+    def load_backfill(self, job_id: int, source_id: int) -> dict | None:
+        """이 묶음 작업의 채우기 (crawl_job.backfill_id, 없으면 소스의 열린 채우기)."""
+        row = self.conn.execute(
+            "SELECT b.* FROM backfill b JOIN crawl_job j ON j.backfill_id = b.id WHERE j.id = %s", (job_id,)).fetchone()
+        if row is None:
+            row = self.conn.execute(
+                "SELECT * FROM backfill WHERE source_id = %s AND status IN ('QUEUED', 'RUNNING') ORDER BY id DESC LIMIT 1",
+                (source_id,)).fetchone()
+        return row
+
+    def backfill_status(self, backfill_id: int) -> str | None:
+        row = self.conn.execute("SELECT status FROM backfill WHERE id = %s", (backfill_id,)).fetchone()
+        return row["status"] if row else None
+
+    def start_backfill(self, backfill_id: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE backfill SET status = 'RUNNING', started_at = COALESCE(started_at, now()), updated_at = now()
+            WHERE id = %s AND status = 'QUEUED'
+            """, (backfill_id,))
+
+    def save_backfill(self, backfill_id: int, *, method: str | None, cursor: dict, requests: int,
+                      message: str | None) -> None:
+        """묶음 끝: 진행 위치(cursor)·방법·요청 수·묶음 수를 남긴다. 상태는 건드리지 않는다 (그 사이 취소됐을 수 있다)."""
+        self.conn.execute(
+            """
+            UPDATE backfill SET method = COALESCE(%s, method), cursor = %s::jsonb, request_count = request_count + %s,
+                   chunk_count = chunk_count + 1, message = COALESCE(%s, message), updated_at = now()
+            WHERE id = %s
+            """, (method, json.dumps(cursor, ensure_ascii=False), requests, (message or "")[:500] or None, backfill_id))
+
+    def finish_backfill(self, backfill_id: int, status: str, message: str) -> None:
+        """DONE | FAILED. 사용자가 그 사이 취소했으면 취소로 둔다."""
+        self.conn.execute(
+            """
+            UPDATE backfill SET status = %s, message = %s, finished_at = now(), updated_at = now()
+            WHERE id = %s AND status IN ('QUEUED', 'RUNNING')
+            """, (status, message[:500], backfill_id))
+
+    def backfill_yield_reason(self, source_id: int) -> str | None:
+        """묶음을 멈추고 양보할 이유. 다른 작업이 대기 중이거나, 이 소스의 주기 수집 차례가 왔거나, 소스가 ACTIVE가 아니면."""
+        row = self.conn.execute(
+            """
+            SELECT (SELECT count(*) FROM crawl_job WHERE status = 'QUEUED' AND job_type <> 'BACKFILL') AS queued,
+                   s.status, s.next_run_at IS NOT NULL AND s.next_run_at <= now() AS due
+            FROM source s WHERE s.id = %s
+            """, (source_id,)).fetchone()
+        if row is None:
+            return "소스가 없습니다"
+        if row["status"] != "ACTIVE":
+            return f"소스 상태가 {row['status']}라 멈춤"
+        if row["queued"]:
+            return f"대기 중인 작업 {row['queued']}건에 양보"
+        if row["due"]:
+            return "이 소스의 주기 수집 차례라 양보"
+        return None
+
+    def add_backfill_urls(self, backfill_id: int, rows: list[tuple[str, str | None, str | None]]) -> tuple[int, int]:
+        """찾은 기사 주소 (url, 날짜 힌트, 종류 이름)를 넣는다. 이미 문서로 있는 주소는 SKIPPED로 넣는다(열지 않는다).
+        같은 채우기에서 이미 찾은 주소는 다시 넣지 않는다. (새로 넣은 수, 그중 이미 있던 문서 수)."""
+        if not rows:
+            return 0, 0
+        unique = {sha256(u): (u, hint, kind) for u, hint, kind in rows}
+        hashes = list(unique)
+        inserted = skipped = 0
+        with self.conn.transaction():
+            for i in range(0, len(hashes), 5000):   # 사이트맵 한 파일이 수만 건이어도 한 번에 몇천 건씩
+                part = hashes[i:i + 5000]
+                known = self.known_urls(part)
+                done = self.conn.execute(
+                    """
+                    INSERT INTO backfill_url (backfill_id, url_hash, url, date_hint, kind, status, done_at)
+                    SELECT %s, h, u, d, k, s, CASE WHEN s = 'SKIPPED' THEN now() END
+                    FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[], %s::text[]) WITH ORDINALITY AS t(h, u, d, k, s, n)
+                    ORDER BY n
+                    ON CONFLICT (backfill_id, url_hash) DO NOTHING
+                    RETURNING status
+                    """, (backfill_id, part, [unique[h][0][:2000] for h in part],
+                          [(unique[h][1] or "")[:64] or None for h in part],
+                          [(unique[h][2] or "")[:100] or None for h in part],
+                          ["SKIPPED" if h in known else "PENDING" for h in part])).fetchall()
+                inserted += len(done)
+                skipped += sum(1 for r in done if r["status"] == "SKIPPED")
+            self.conn.execute(
+                """
+                UPDATE backfill SET found_count = found_count + %s, skipped_count = skipped_count + %s, updated_at = now()
+                WHERE id = %s
+                """, (inserted, skipped, backfill_id))
+        return inserted, skipped
+
+    def next_backfill_urls(self, backfill_id: int, limit: int) -> list[dict]:
+        """아직 열지 않은 주소를 찾은 순서대로."""
+        return self.conn.execute(
+            """
+            SELECT url, url_hash, date_hint, kind FROM backfill_url
+            WHERE backfill_id = %s AND status = 'PENDING' ORDER BY seq LIMIT %s
+            """, (backfill_id, limit)).fetchall()
+
+    _BACKFILL_COUNTERS = {"SAVED": "saved_count", "SKIPPED": "skipped_count", "OUT_OF_RANGE": "out_of_range_count",
+                          "FAILED": "failed_count"}
+
+    def mark_backfill_url(self, backfill_id: int, url_hash: str, status: str) -> None:
+        """주소 하나의 결과를 남기고 채우기의 해당 수를 늘린다 (진행률이 화면에 바로 보인다)."""
+        column = self._BACKFILL_COUNTERS[status]
+        with self.conn.transaction():
+            changed = self.conn.execute(
+                """
+                UPDATE backfill_url SET status = %s, done_at = now()
+                WHERE backfill_id = %s AND url_hash = %s AND status = 'PENDING'
+                """, (status, backfill_id, url_hash)).rowcount
+            if changed:
+                self.conn.execute(f"UPDATE backfill SET {column} = {column} + 1, updated_at = now() WHERE id = %s",
+                                  (backfill_id,))
+
+    def pending_backfill_count(self, backfill_id: int) -> int:
+        return self.conn.execute("SELECT count(*) AS c FROM backfill_url WHERE backfill_id = %s AND status = 'PENDING'",
+                                 (backfill_id,)).fetchone()["c"]
+
+    def newest_published(self, urls: list[str]) -> datetime | None:
+        """이미 문서로 있는 주소들의 가장 늦은 발행 시각 (목록에 날짜가 없을 때 멈출 곳을 정하는 데 쓴다)."""
+        if not urls:
+            return None
+        row = self.conn.execute("SELECT max(published_at) AS m FROM document WHERE url_hash = ANY(%s)",
+                                ([sha256(u) for u in urls],)).fetchone()
+        return row["m"] if row else None

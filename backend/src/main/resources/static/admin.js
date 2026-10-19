@@ -197,10 +197,13 @@
   // ================================================================ 소스 상세
   App.route('/admin/sources/:id', async (view, params) => {
     const id = params.id;
+    let bfSource = null;   // 과거 기사 채우기 패널이 쓰는 소스 (load가 채운다)
 
     async function load() {
       const d = await api('GET', `/sources/${encodeURIComponent(id)}`);
       const s = d.source;
+      const backfills = s.kind === 'SITE' ? await api('GET', `/sources/${s.id}/backfills`) : null;
+      bfSource = s;
       const actions = {
         ACTIVE: ['run', 'pause', 'rediscover', 'exclude'],
         PAUSED: ['resume', 'rediscover', 'exclude'],
@@ -244,6 +247,7 @@
                   <td class="small">${esc(j.note || '')}</td></tr>`).join('')}
             </tbody></table>` : '<div class="muted small">작업 기록이 없습니다.</div>'}
         </div>
+        ${backfills ? `<div class="panel" id="backfill-panel">${backfillPanel(s, backfills)}</div>` : ''}
         <div class="panel">
           <h2>최근 오류</h2>
           ${d.recentErrors.length ? `<table>
@@ -296,6 +300,7 @@
           pre.hidden = !pre.hidden;
         });
       });
+      bindBackfill();
     }
 
     await App.guard(load);
@@ -307,6 +312,92 @@
       s = String(s || '');
       return s.length > n ? s.slice(0, n) + '…' : s;
     }
+
+    // ---------------------------------------------------------------- 과거 기사 채우기
+
+    /** 채우기 요청 폼(진행 중인 것이 없을 때)과 기록 표. 진행 중이면 10초마다 이 패널만 다시 그린다. */
+    function backfillPanel(s, list) {
+      const open = list.find(b => b.status === 'QUEUED' || b.status === 'RUNNING');
+      const today = kstDate(0);
+      const form = !open && s.status === 'ACTIVE' ? `
+          <form id="backfill-form" class="row mt">
+            <label>시작 <input type="date" name="from" value="${kstDate(-3)}" max="${today}"></label>
+            <label>끝 <input type="date" name="to" value="${today}" max="${today}"></label>
+            <button type="submit" class="small primary">과거 기사 채우기 요청</button>
+            <span class="muted small">기본 최근 3개월 · 최대 1년</span>
+          </form>` : (!open ? '<div class="muted small mt">수집 중(ACTIVE)인 소스만 요청할 수 있습니다.</div>' : '');
+      return `
+          <h2>과거 기사 채우기</h2>
+          <p class="muted small">등록 전에 나온 기사를 기간을 정해 천천히 가져옵니다. 보관 사이트맵을 먼저 찾고, 없거나 모자라면 목록 페이지를 쪽 번호로 거꾸로 넘깁니다.
+            평소 수집·등록이 기다리면 멈추고 양보하며, 도메인당 2초 간격과 robots.txt를 지킵니다. 언론사는 제목·링크·발행일만 저장합니다.
+            이미 있는 기사는 열지 않고, 열어 본 발행일이 기간 밖이면 저장하지 않습니다.</p>
+          ${form}
+          ${list.length ? `<table class="mt" ${open ? 'data-bf-open="1"' : ''}>
+            <thead><tr><th>#</th><th>기간</th><th>상태</th><th>방법</th><th class="right">찾은 주소</th><th class="right">새로 저장</th><th class="right">이미 있음</th><th class="right">기간 밖</th><th class="right">실패</th><th class="right">남은</th><th>진행</th><th></th></tr></thead>
+            <tbody>${list.map(b => `
+              <tr>
+                <td>#${b.id}</td>
+                <td class="nowrap">${esc(b.from)} ~ ${esc(b.to)}</td>
+                <td>${badge(b.status)}</td>
+                <td class="small">${esc(b.method === 'SITEMAP' ? '보관 사이트맵' : b.method === 'LIST' ? '목록 페이지' : '-')}</td>
+                <td class="right">${App.fmtNum(b.found)}</td>
+                <td class="right">${App.fmtNum(b.saved)}</td>
+                <td class="right">${App.fmtNum(b.skipped)}</td>
+                <td class="right">${App.fmtNum(b.outOfRange)}</td>
+                <td class="right">${App.fmtNum(b.failed)}</td>
+                <td class="right">${App.fmtNum(b.remaining)}</td>
+                <td class="small">${esc(b.message || '')}
+                  <div class="muted">${backfillEta(b)}요청 ${App.fmtNum(b.requests)}회 · 묶음 ${App.fmtNum(b.chunks)}개 · ${esc(b.requestedBy || '-')} ${App.fmtTime(b.createdAt)}${b.finishedAt ? ` → ${App.fmtTime(b.finishedAt)}` : ''}</div></td>
+                <td>${b.status === 'QUEUED' || b.status === 'RUNNING' ? `<button type="button" class="small danger" data-bf-cancel="${b.id}">취소</button>` : ''}</td>
+              </tr>`).join('')}
+            </tbody></table>` : '<div class="muted small mt">요청 기록이 없습니다.</div>'}`;
+    }
+
+    function backfillEta(b) {
+      if (!(b.status === 'QUEUED' || b.status === 'RUNNING') || !b.remaining) return '';
+      // 기사 1건 ≈ 도메인 간격 2초 + 응답 시간 0.5초. 평소 수집에 양보하는 시간은 빼지 않은 하한이다
+      const hours = b.remaining * 2.5 / 3600;
+      return `남은 주소만 빨라도 약 ${hours < 1 ? Math.max(1, Math.round(hours * 60)) + '분' : hours.toFixed(1) + '시간'} · `;
+    }
+
+    /** KST 오늘에서 months개월 전(음수)의 날짜 "YYYY-MM-DD". */
+    function kstDate(months) {
+      const d = new Date(Date.now() + 9 * 3600 * 1000);
+      if (months) d.setUTCMonth(d.getUTCMonth() + months);
+      return d.toISOString().slice(0, 10);
+    }
+
+    function bindBackfill() {
+      const s = bfSource;
+      const form = view.querySelector('#backfill-form');
+      if (form) form.addEventListener('submit', e => {
+        e.preventDefault();
+        App.guard(async () => {
+          const from = form.from.value, to = form.to.value;
+          if (!await App.confirm(`${s.domain}의 ${from} ~ ${to} 기사를 채울까요? 워커가 한가할 때 조금씩 가져오므로 몇 시간~며칠 걸릴 수 있습니다.`, '요청')) return;
+          const b = await api('POST', `/sources/${s.id}/backfills`, { from, to });
+          App.notice(`과거 기사 채우기 #${b.id}를 요청했습니다 (${b.from} ~ ${b.to}).`);
+          await refreshBackfills(true);
+        });
+      });
+      view.querySelectorAll('[data-bf-cancel]').forEach(btn => btn.addEventListener('click', () => App.guard(async () => {
+        if (!await App.confirm(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 취소할까요? 이미 저장한 문서는 그대로 둡니다.`, '취소')) return;
+        await api('POST', `/sources/${s.id}/backfills/${btn.dataset.bfCancel}/cancel`);
+        App.notice(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 취소했습니다.`);
+        await refreshBackfills(true);
+      })));
+    }
+
+    /** 채우기 패널만 다시 그린다. 자동 갱신은 진행 중인 채우기가 보일 때만 한다. */
+    async function refreshBackfills(force) {
+      const panel = view.querySelector('#backfill-panel');
+      if (!panel || !bfSource || (!force && !panel.querySelector('[data-bf-open]'))) return;
+      const list = await api('GET', `/sources/${bfSource.id}/backfills`);
+      panel.innerHTML = backfillPanel(bfSource, list);
+      bindBackfill();
+    }
+
+    return App.every(10000, () => refreshBackfills(false));
   }, { admin: true });
 
   // ================================================================ API 키

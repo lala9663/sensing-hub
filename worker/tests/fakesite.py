@@ -33,7 +33,7 @@ class Site:
                 key = parts.path + (f"?{parts.query}" if parts.query else "")
                 site.hits.append(key)
                 status, ctype, body = site.routes.get(key, site.routes.get(parts.path, (404, "text/html", "not found")))
-                data = body.encode("utf-8")
+                data = body if isinstance(body, bytes) else body.encode("utf-8")   # bytes: gzip 사이트맵 등
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))

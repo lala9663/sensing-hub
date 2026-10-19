@@ -19,6 +19,7 @@ import socket
 import ssl
 import time
 import urllib.robotparser
+import zlib
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
@@ -43,6 +44,9 @@ JS_REDIRECT_RE = re.compile(r"""(?:location|window\.location|document\.location)
 EVIDENCE_CHARS = 20000
 # 바이너리 요청(get_api_bytes)에서 텍스트로도 풀어 두는 최대 크기: 오류 응답(JSON·XML)은 이보다 작고 ZIP은 이보다 크다
 BINARY_TEXT_PEEK_BYTES = 65536
+# 사이트맵 한 파일의 크기 상한 (sitemaps.org 규격: 압축을 푼 크기 50MB·5만 건)
+SITEMAP_MAX_BYTES = 50 * 1024 * 1024
+_XML_ENCODING_RE = re.compile(rb"""<\?xml[^>]*encoding=["']([A-Za-z0-9_.-]+)["']""")
 # OpenSSL SSL_OP_LEGACY_SERVER_CONNECT. Python 3.12부터 ssl 모듈에 상수가 있다
 _OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
 
@@ -160,6 +164,17 @@ class PoliteFetcher:
     # ------------------------------------------------------------------ fetch
     def get(self, url: str) -> Page:
         return self._request(url, check_robots=True, classify=True)
+
+    def get_sitemap(self, url: str, max_bytes: int = SITEMAP_MAX_BYTES) -> Page:
+        """사이트맵(.xml·.xml.gz)을 받는다. robots·간격·차단 분류는 get과 같다. 압축 파일(.gz, Content-Encoding이 아닌 gzip
+        본문)이면 풀어서 text에 둔다. 사이트맵 규격 상한(50MB)까지 읽고, 넘으면 Page.truncated (읽은 데까지 쓴다)."""
+        page = self._request(url, check_robots=True, classify=True, binary=True, max_bytes=max_bytes)
+        raw, truncated = page.body, page.truncated
+        if raw[:2] == b"\x1f\x8b":
+            raw, cut = _gunzip(raw, max_bytes)
+            truncated = truncated or cut
+        return Page(url=page.url, status=page.status, content_type=page.content_type, text=_decode_xml(raw),
+                    headers=page.headers, truncated=truncated)
 
     def get_api(self, url: str, headers: dict[str, str] | None = None) -> Page:
         """공개 API 호출. 도메인 간격·내부망 차단·연결 재시도는 같지만 robots 검사와 차단 화면 분류는 하지 않는다
@@ -361,6 +376,31 @@ def _decode(body: bytes, resp: httpx.Response) -> str:
         return body.decode("cp949")
     except UnicodeDecodeError:
         return loose
+
+
+def _gunzip(data: bytes, limit: int) -> tuple[bytes, bool]:
+    """gzip 본문을 limit 바이트까지 푼다. (풀린 바이트, 잘렸는지). 깨진 압축이면 풀린 데까지."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(data, limit)
+    except zlib.error:
+        return b"", True
+    return out, bool(d.unconsumed_tail)
+
+
+def _decode_xml(raw: bytes) -> str:
+    """사이트맵 바이트 → 글자. 규격은 UTF-8이지만 XML 선언에 다른 인코딩(EUC-KR 등)을 적은 곳은 그것으로 읽는다."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    m = _XML_ENCODING_RE.search(raw[:200])
+    enc = _charset(m.group(1).decode("ascii")) if m else None
+    if enc and _known(enc):
+        return raw.decode(enc, errors="replace")
+    return raw.decode("utf-8", errors="replace")
 
 
 def _known(enc: str) -> bool:
