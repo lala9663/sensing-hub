@@ -1,5 +1,7 @@
 package io.sensinghub.chat;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
@@ -8,6 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -31,6 +34,9 @@ import io.sensinghub.chat.ChatTools.Outcome;
 import io.sensinghub.chat.ChatTools.Ref;
 import io.sensinghub.chat.ChatTools.Refs;
 import io.sensinghub.common.ApiException;
+import io.sensinghub.document.HybridSearch;
+import io.sensinghub.keyword.FeaturedKeywordService;
+import io.sensinghub.keyword.FeaturedKeywordService.FeaturedKeyword;
 import io.sensinghub.llm.LlmClient;
 import io.sensinghub.llm.LlmClient.Message;
 import io.sensinghub.llm.LlmClient.ToolCall;
@@ -48,6 +54,10 @@ import io.sensinghub.llm.LlmException;
  *       오류로 끝난 턴은 다음 턴에 LLM에 다시 보여 주지 않아 대화가 꼬이지 않는다.</li>
  *   <li>세션은 만든 사람만 본다 (관리자도 남의 대화는 404). 같은 세션에 동시에 두 질문은 받지 않는다 (409).</li>
  *   <li>LLM 호출 동안 DB 트랜잭션을 잡지 않는다: 메시지는 한 줄씩 저장하고, 도구(감시 생성·등록)는 각 서비스의 트랜잭션을 쓴다.</li>
+ *   <li>키워드만 보낸 메시지({@link ChatShortcuts#keyword}: "반도체", "삼성전자 DS")는 LLM을 부르지 않고 바로 찾아 답한다
+ *       (USER와 답 두 줄, 답 meta.mode KEYWORD·llmCalls 0). 하루 호출 한도를 아끼고 답이 바로 나온다.</li>
+ *   <li>"네이버 - 검색어" 형식({@link ChatShortcuts#naverQuery})은 화면이 네이버 결과를 직접 보여 준다 (표시 전용).
+ *       이 경로로 오면 저장·LLM 호출 없이 400 NAVER_DISPLAY_ONLY.</li>
  * </ul>
  */
 @Service
@@ -62,6 +72,11 @@ public class ChatService {
     static final String SECRET_NOTICE = "API 키로 보이는 값은 저장하지 않고 지웠습니다. 키는 관리자가 'API 키' 화면에서 등록합니다.";
     static final String EMPTY_ANSWER = "답을 만들지 못했습니다. 질문을 조금 바꿔 다시 시도해 주세요.";
     static final String ROUND_LIMIT_ANSWER = "도구를 여러 번 불러도 답을 정리하지 못했습니다. 질문을 좁혀 다시 물어봐 주세요.";
+    static final String MODE_KEYWORD = "KEYWORD";
+    static final String NAVER_TRY = "네이버에서 찾아보기: 네이버 - ";
+    static final String NAVER_ALSO = "네이버 뉴스 결과도 보기: 네이버 - ";
+    static final String NAVER_DISPLAY_ONLY = "‘네이버 - 검색어’는 네이버 뉴스 결과를 화면에만 보여 주는 형식이라 대화로 보내지 않습니다 "
+            + "(저장·AI 입력 안 함). 화면을 새로 고친 뒤 다시 입력해 주세요.";
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
     private static final Pattern REF = Pattern.compile("\\[(\\d{1,3}(?:\\s*,\\s*\\d{1,3})*)\\]");
@@ -80,9 +95,12 @@ public class ChatService {
     public record ToolUseView(String name, String label, boolean ok, String link, String linkLabel) {
     }
 
-    /** role USER | ASSISTANT. error: LLM 오류 안내로 끝난 답. */
+    /**
+     * role USER | ASSISTANT. error: LLM 오류 안내로 끝난 답. mode: null이면 LLM 답, KEYWORD면 LLM 없이 키워드로 바로 찾은 답
+     * (content의 "[n] 제목 — 언론사 · 시각" 줄을 화면이 근거 줄로 그린다).
+     */
     public record MessageView(long id, String role, String content, OffsetDateTime createdAt, boolean error,
-                              List<CitationView> citations, List<ToolUseView> tools) {
+                              List<CitationView> citations, List<ToolUseView> tools, String mode) {
     }
 
     public record SessionDetail(SessionView session, List<MessageView> messages) {
@@ -100,17 +118,20 @@ public class ChatService {
     private final ObjectMapper json;
     private final LlmClient llm;
     private final ChatTools tools;
+    private final FeaturedKeywordService featuredKeywords;
     private final int maxToolRounds;
     private final int historyTurns;
     private final Map<Long, ReentrantLock> locks = new ConcurrentHashMap<>();
 
     public ChatService(JdbcClient jdbc, ObjectMapper json, LlmClient llm, ChatTools tools,
+                       FeaturedKeywordService featuredKeywords,
                        @Value("${sensing.chat.max-tool-rounds:4}") int maxToolRounds,
                        @Value("${sensing.chat.history-turns:6}") int historyTurns) {
         this.jdbc = jdbc;
         this.json = json;
         this.llm = llm;
         this.tools = tools;
+        this.featuredKeywords = featuredKeywords;
         this.maxToolRounds = Math.max(1, maxToolRounds);
         this.historyTurns = Math.max(0, historyTurns);
     }
@@ -165,6 +186,10 @@ public class ChatService {
         if (text.length() > MAX_CONTENT) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", "메시지는 " + MAX_CONTENT + "자 이하여야 합니다.");
         }
+        // 네이버 결과는 표시 전용: 화면이 직접 불러 보여 준다. 이 경로로 오면(옛 화면 등) 저장도 LLM 호출도 하지 않고 돌려보낸다
+        if (ChatShortcuts.naverQuery(text).isPresent()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "NAVER_DISPLAY_ONLY", NAVER_DISPLAY_ONLY);
+        }
         ReentrantLock lock = locks.computeIfAbsent(sessionId, k -> new ReentrantLock());
         if (!lock.tryLock()) {
             throw ApiException.conflict("앞 질문에 답하는 중입니다. 답이 온 뒤에 다시 보내 주세요.");
@@ -176,10 +201,17 @@ public class ChatService {
         }
     }
 
+    /** 한 턴의 답. mode: null(LLM 답) 또는 {@link #MODE_KEYWORD}. meta.error가 있으면 오류 안내 답이다. */
+    private record Answer(String content, List<Ref> cited, List<ToolUseView> uses, Map<String, Object> meta,
+                          String mode) {
+    }
+
     private TurnResult turn(CurrentUser user, SessionView session, String text) {
         long sessionId = session.id();
         SecretMasker.Result masked = SecretMasker.mask(text);
-        List<Message> convo = new ArrayList<>(history(sessionId));
+        // 키로 보이는 값을 지운 글은 LLM 경로로 보낸다 (저장하지 않았다고 안내한다)
+        Optional<String> keyword = masked.masked() > 0 ? Optional.empty() : ChatShortcuts.keyword(masked.text());
+        List<Message> history = keyword.isPresent() ? List.of() : history(sessionId);
         Map<String, Object> userMeta = new LinkedHashMap<>();
         if (masked.masked() > 0) {
             userMeta.put("maskedSecrets", masked.masked());
@@ -189,7 +221,105 @@ public class ChatService {
             jdbc.sql("UPDATE chat_session SET title = ? WHERE id = ? AND title IS NULL")
                     .params(shorten(masked.text().replaceAll("\\s+", " "), TITLE_CHARS), sessionId).update();
         }
-        convo.add(Message.user(masked.text()));
+
+        Answer answer = keyword.isPresent()
+                ? keywordAnswer(user, masked.text(), keyword.get())
+                : llmAnswer(user, sessionId, history, masked.text());
+        long answerId = insert(sessionId, "ASSISTANT", answer.content(), null, answer.meta());
+        for (Ref ref : answer.cited()) {
+            jdbc.sql("""
+                    INSERT INTO chat_citation (message_id, ref_no, kind, document_id, issue_id, title_snapshot, url_snapshot,
+                                               source_label, published_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """)
+                    .params(answerId, ref.no(), ref.kind(), ref.documentId(), ref.issueId(), shorten(ref.title(), 1000),
+                            shorten(ref.url(), 2000), shorten(ref.sourceLabel(), 300), ref.publishedAt())
+                    .update();
+        }
+        jdbc.sql("UPDATE chat_session SET last_message_at = now() WHERE id = ?").param(sessionId).update();
+
+        OffsetDateTime now = OffsetDateTime.now();
+        MessageView userView = new MessageView(userMessageId, "USER", masked.text(), now, false, List.of(), List.of(),
+                null);
+        MessageView answerView = new MessageView(answerId, "ASSISTANT", answer.content(), now,
+                answer.meta().get("error") != null, answer.cited().stream().map(ChatService::citationView).toList(),
+                answer.uses(), answer.mode());
+        return new TurnResult(session(user, sessionId), userView, answerView,
+                masked.masked() > 0 ? SECRET_NOTICE : null);
+    }
+
+    /**
+     * 키워드만 보낸 메시지: LLM 없이 수집 기사에서 바로 찾아 근거 번호와 함께 답한다 ({@link ChatTools#quickSearch}).
+     * 칩 이름을 그대로 쳤으면(대소문자 무시) 그 칩의 검색어로 찾는다 ('DS' → 관리자가 정한 '삼성전자 DS').
+     * 답 글에는 목록도 [n] 줄로 넣는다: 화면은 이 줄을 근거 목록으로 그리고, 다음 턴에 LLM이 지난 대화로 읽는다.
+     */
+    private Answer keywordAnswer(CurrentUser user, String typed, String keyword) {
+        String flat = ChatShortcuts.flat(typed);
+        Optional<FeaturedKeyword> featured = featuredKeywords.byLabel(flat);
+        String query = featured.map(FeaturedKeyword::query).orElse(keyword);
+        String shown = featured.map(FeaturedKeyword::label).orElse(keyword);
+        Refs refs = new Refs();
+        ChatTools.QuickResult found = tools.quickSearch(user, query, refs);
+        List<ChatTools.QuickHit> words = found.hits().stream().filter(ChatTools.QuickHit::words).toList();
+        List<ChatTools.QuickHit> meaning = found.hits().stream().filter(h -> !h.words()).toList();
+
+        String subject = "‘" + shown + "’" + (query.equals(shown) ? "" : "(검색어 ‘" + query + "’)");
+        StringBuilder out = new StringBuilder();
+        if (words.isEmpty() && meaning.isEmpty()) {
+            out.append(subject).append(" 관련 기사를 최근 ").append(found.days()).append("일 수집한 기사에서 찾지 못했습니다.\n");
+            out.append(NAVER_TRY).append(query);
+        } else {
+            if (!words.isEmpty()) {
+                out.append(subject).append(" 관련 최근 ").append(found.days()).append("일 기사 ").append(words.size())
+                        .append("건 (").append(found.mode() == HybridSearch.Mode.HYBRID ? "관련도순" : "최신순")
+                        .append(" · 수집한 기사에서 바로 찾음)\n");
+                words.forEach(h -> out.append(keywordLine(h.ref())).append('\n'));
+            } else {
+                out.append(subject).append(" 낱말이 든 기사는 최근 ").append(found.days()).append("일 수집한 기사에 없습니다.\n");
+            }
+            if (!meaning.isEmpty()) {
+                out.append("뜻이 가까운 기사 ").append(meaning.size()).append("건 (검색어 낱말은 없음)\n");
+                meaning.forEach(h -> out.append(keywordLine(h.ref())).append('\n'));
+            }
+            out.append(NAVER_ALSO).append(query);
+        }
+
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("mode", MODE_KEYWORD);
+        meta.put("query", query);
+        meta.put("days", found.days());
+        meta.put("count", found.hits().size());
+        meta.put("search", found.mode().name());
+        meta.put("llmCalls", 0);
+        meta.put("link", "#/documents?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
+                .replace("+", "%20") + "&period=" + (found.days() <= 7 ? "7d" : "all"));
+        meta.put("linkLabel", "문서 화면에서 더 보기");
+        List<ToolUseView> uses = List.of(new ToolUseView(ChatTools.SEARCH_DOCUMENTS,
+                ChatTools.label(ChatTools.SEARCH_DOCUMENTS), true, (String) meta.get("link"), (String) meta.get("linkLabel")));
+        return new Answer(out.toString(), found.hits().stream().map(ChatTools.QuickHit::ref).toList(), uses, meta,
+                MODE_KEYWORD);
+    }
+
+    /** "[1] 제목 — 언론사 · 2026-10-16 09:00" (화면은 이 줄을 원문 링크가 달린 근거 줄로 바꿔 그린다). */
+    private static String keywordLine(Ref r) {
+        StringBuilder line = new StringBuilder("[").append(r.no()).append("] ").append(r.title() == null ? "(제목 없음)" : r.title());
+        List<String> meta = new ArrayList<>();
+        if (r.sourceLabel() != null && !r.sourceLabel().isBlank()) {
+            meta.add(r.sourceLabel());
+        }
+        if (r.publishedAt() != null) {
+            meta.add(ChatTools.kst(r.publishedAt()));
+        }
+        if (!meta.isEmpty()) {
+            line.append(" — ").append(String.join(" · ", meta));
+        }
+        return line.toString();
+    }
+
+    /** LLM 경로: (도구 호출 → 실행)을 최대 maxToolRounds번 한 뒤 답. 중간 단계(도구 호출·결과)는 바로 저장한다. */
+    private Answer llmAnswer(CurrentUser user, long sessionId, List<Message> history, String text) {
+        List<Message> convo = new ArrayList<>(history);
+        convo.add(Message.user(text));
 
         String system = ChatPrompt.system(user, ZonedDateTime.now());
         List<LlmClient.Tool> definitions = tools.definitions();
@@ -257,25 +387,7 @@ public class ChatService {
         if (error != null) {
             meta.put("error", error);
         }
-        long answerId = insert(sessionId, "ASSISTANT", answer, null, meta);
-        for (Ref ref : cited) {
-            jdbc.sql("""
-                    INSERT INTO chat_citation (message_id, ref_no, kind, document_id, issue_id, title_snapshot, url_snapshot,
-                                               source_label, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """)
-                    .params(answerId, ref.no(), ref.kind(), ref.documentId(), ref.issueId(), shorten(ref.title(), 1000),
-                            shorten(ref.url(), 2000), shorten(ref.sourceLabel(), 300), ref.publishedAt())
-                    .update();
-        }
-        jdbc.sql("UPDATE chat_session SET last_message_at = now() WHERE id = ?").param(sessionId).update();
-
-        OffsetDateTime now = OffsetDateTime.now();
-        MessageView userView = new MessageView(userMessageId, "USER", masked.text(), now, false, List.of(), List.of());
-        MessageView answerView = new MessageView(answerId, "ASSISTANT", answer, now, error != null,
-                cited.stream().map(ChatService::citationView).toList(), uses);
-        return new TurnResult(session(user, sessionId), userView, answerView,
-                masked.masked() > 0 ? SECRET_NOTICE : null);
+        return new Answer(answer, cited, uses, meta, null);
     }
 
     /**
@@ -432,7 +544,7 @@ public class ChatService {
             switch (r.role()) {
                 case "USER" -> {
                     pending = new ArrayList<>();
-                    out.add(new MessageView(r.id(), "USER", r.content(), r.createdAt(), false, List.of(), List.of()));
+                    out.add(new MessageView(r.id(), "USER", r.content(), r.createdAt(), false, List.of(), List.of(), null));
                 }
                 case "TOOL" -> {
                     String name = String.valueOf(r.meta().get("name"));
@@ -441,8 +553,13 @@ public class ChatService {
                 }
                 default -> {
                     if (r.finalAnswer()) {
+                        String mode = r.meta().get("mode") instanceof String m ? m : null;
+                        if (mode != null && r.meta().get("link") instanceof String link) {   // 키워드 바로 검색: 도구 행 없이 meta에
+                            pending.add(new ToolUseView(ChatTools.SEARCH_DOCUMENTS, ChatTools.label(ChatTools.SEARCH_DOCUMENTS),
+                                    true, link, (String) r.meta().get("linkLabel")));
+                        }
                         out.add(new MessageView(r.id(), "ASSISTANT", r.content(), r.createdAt(), r.failed(),
-                                citations.getOrDefault(r.id(), List.of()), List.copyOf(pending)));
+                                citations.getOrDefault(r.id(), List.of()), List.copyOf(pending), mode));
                         pending = new ArrayList<>();
                     }
                 }

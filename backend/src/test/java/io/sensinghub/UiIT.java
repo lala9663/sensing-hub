@@ -53,6 +53,8 @@ class UiIT {
         assertThat(index.getBody()).contains("chat-dock.js").contains("ChatDock.mount()");
         // 네이버 뉴스 탭: 키가 없어도 메뉴는 보인다 (화면이 안내를 보여 준다)
         assertThat(index.getBody()).contains("href=\"#/naver\"").contains("naver.js");
+        // 관리자 메뉴: 주요 키워드 (네이버 탭·챗봇 칩)
+        assertThat(index.getBody()).contains("href=\"#/admin/keywords\"");
     }
 
     /** 챗봇만 있는 새 창: 메뉴 없이 같은 app.js(X-User)와 챗봇 공통 부품을 쓴다. */
@@ -96,6 +98,14 @@ class UiIT {
         JsonNode answer = sent.getBody().get("assistant");
         assertThat(answer.get("error").asBoolean()).isTrue();
         assertThat(answer.get("content").asText()).contains("LLM이 설정되지 않았습니다");
+
+        // 키워드만 보낸 메시지는 LLM 없이도 수집 기사에서 바로 찾는다
+        ResponseEntity<JsonNode> keyword = http.exchange("/api/v1/chat/sessions/" + id + "/messages", HttpMethod.POST,
+                new HttpEntity<>("{\"content\":\"반도체\"}", h), JsonNode.class);
+        assertThat(keyword.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(keyword.getBody().get("assistant").get("mode").asText()).isEqualTo("KEYWORD");
+        assertThat(keyword.getBody().get("assistant").get("error").asBoolean()).isFalse();
+        assertThat(keyword.getBody().get("assistant").get("content").asText()).startsWith("‘반도체’ 관련");
     }
 
     private JsonNode me(String user) {

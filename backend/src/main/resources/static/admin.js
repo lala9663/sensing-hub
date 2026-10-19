@@ -1,6 +1,6 @@
 'use strict';
 
-/** 관리자: 처리 대기 큐, 소스 목록·건강 상태·상세, API 키. */
+/** 관리자: 처리 대기 큐, 소스 목록·건강 상태·상세, API 키, 주요 키워드. */
 (() => {
   const { api, esc, badge, html } = App;
   const PROVIDERS = [['dart', 'dart — DART 공시'], ['naver_news', 'naver_news — 네이버 뉴스 검색 (NAVER API HUB)'], ['data_go_kr', 'data_go_kr — 공공데이터포털']];
@@ -619,6 +619,132 @@
         await load();
       });
     });
+
+    await App.guard(load);
+  }, { admin: true });
+
+  // ================================================================ 주요 키워드
+  /**
+   * 네이버 뉴스 탭의 빠른 검색 칩과 챗봇 시작 화면 칩에 쓰는 짧은 목록. 표에서 고친 뒤 "저장"하면 목록 전체를 이 순서로 바꾼다
+   * (PUT /featured-keywords, 바뀐 전후는 감사 로그 FEATURED_KEYWORDS_UPDATE). 검색어 칸이 비면 칩 이름으로 찾는다.
+   */
+  App.route('/admin/keywords', async (view) => {
+    const MAX = 20;
+    let rows = [];
+    let saved = '[]';
+
+    view.innerHTML = `
+      <h1>주요 키워드</h1>
+      <div class="panel">
+        <p class="muted small">네이버 뉴스 탭의 빠른 검색 칩과 챗봇 시작 화면의 칩에 쓰는 짧은 목록입니다 (키워드 감시·회사 감시와는 따로입니다).
+          칩을 누르면 <b>검색어</b>로 찾고, 검색어를 비우면 칩 이름으로 찾습니다. 챗봇에 칩 이름을 그대로 쳐도 그 검색어로 찾습니다.
+          저장하면 바뀌기 전과 뒤의 목록이 감사 로그에 남습니다.</p>
+        <p class="muted small">짧은 영문(DS·DX·DSR)은 단독으로 찾으면 다른 뜻의 기사(닌텐도 DS, 대출 규제 DSR 등)가 섞입니다.
+          칩 이름은 그대로 두고 검색어만 <span class="mono">삼성전자 DS</span>처럼 바꿀 수 있습니다.</p>
+        <table class="kw-table">
+          <thead><tr><th class="num">#</th><th>칩 이름</th><th>검색어 <span class="muted small">(비우면 이름과 같음)</span></th><th>순서</th><th></th></tr></thead>
+          <tbody id="kw-rows"></tbody>
+        </table>
+        <form id="kw-add" class="kw-add">
+          <input type="text" name="label" maxlength="30" placeholder="새 키워드 (예: 반도체)" aria-label="새 키워드 이름">
+          <input type="text" name="query" maxlength="100" placeholder="검색어 (비우면 이름과 같음)" aria-label="새 키워드 검색어">
+          <button type="submit">추가</button>
+        </form>
+        <div class="kw-actions">
+          <button type="button" class="primary" id="kw-save">저장</button>
+          <button type="button" id="kw-revert">되돌리기</button>
+          <span class="muted small" id="kw-state"></span>
+        </div>
+      </div>`;
+
+    const tbody = view.querySelector('#kw-rows');
+    const stateEl = view.querySelector('#kw-state');
+    const addForm = view.querySelector('#kw-add');
+
+    const payload = () => rows.map(r => ({ label: r.label.trim(), query: r.query.trim() || r.label.trim() }));
+    const dirty = () => JSON.stringify(payload()) !== saved;
+
+    function showState(text) {
+      stateEl.textContent = text || (dirty() ? '저장하지 않은 변경이 있습니다.' : '');
+    }
+
+    function render() {
+      tbody.innerHTML = rows.length ? rows.map((r, i) => `
+        <tr data-i="${i}">
+          <td class="num">${i + 1}</td>
+          <td><input type="text" class="label" maxlength="30" value="${esc(r.label)}" aria-label="${i + 1}번 칩 이름"></td>
+          <td><input type="text" class="query" maxlength="100" value="${esc(r.query)}" placeholder="${esc(r.label)}" aria-label="${i + 1}번 검색어"></td>
+          <td class="actions">
+            <button type="button" class="small up" ${i === 0 ? 'disabled' : ''} aria-label="${i + 1}번 위로">▲</button>
+            <button type="button" class="small down" ${i === rows.length - 1 ? 'disabled' : ''} aria-label="${i + 1}번 아래로">▼</button>
+          </td>
+          <td class="actions"><button type="button" class="small danger remove">삭제</button></td>
+        </tr>`).join('') : '<tr><td colspan="5" class="empty">주요 키워드가 없습니다. 아래에서 추가하세요.</td></tr>';
+      tbody.querySelectorAll('tr[data-i]').forEach(tr => {
+        const i = Number(tr.dataset.i);
+        tr.querySelector('.label').addEventListener('input', e => {
+          rows[i].label = e.target.value;
+          tr.querySelector('.query').placeholder = e.target.value;
+          showState();
+        });
+        tr.querySelector('.query').addEventListener('input', e => {
+          rows[i].query = e.target.value;
+          showState();
+        });
+        tr.querySelector('.up').addEventListener('click', () => move(i, -1));
+        tr.querySelector('.down').addEventListener('click', () => move(i, 1));
+        tr.querySelector('.remove').addEventListener('click', () => {
+          rows.splice(i, 1);
+          render();
+        });
+      });
+      addForm.querySelector('button').disabled = rows.length >= MAX;
+      showState();
+    }
+
+    function move(i, d) {
+      const j = i + d;
+      if (j < 0 || j >= rows.length) return;
+      [rows[i], rows[j]] = [rows[j], rows[i]];
+      render();
+      const btn = tbody.querySelector(`tr[data-i="${j}"] .${d < 0 ? 'up' : 'down'}`);
+      if (btn && !btn.disabled) btn.focus();
+    }
+
+    function apply(list) {
+      rows = list.items.map(k => ({ label: k.label, query: k.query === k.label ? '' : k.query }));
+      saved = JSON.stringify(payload());
+      render();
+    }
+
+    async function load() {
+      apply(await api('GET', '/featured-keywords'));
+    }
+
+    addForm.addEventListener('submit', e => {
+      e.preventDefault();
+      const label = addForm.label.value.replace(/\s+/g, ' ').trim();
+      if (!label) {
+        addForm.label.focus();
+        return;
+      }
+      if (rows.some(r => r.label.trim().toLowerCase() === label.toLowerCase())) {
+        App.showError(new Error(`이미 있는 키워드입니다: ${label}`));
+        return;
+      }
+      App.clearError();
+      rows.push({ label, query: addForm.query.value.replace(/\s+/g, ' ').trim() });
+      addForm.reset();
+      render();
+      addForm.label.focus();
+    });
+    view.querySelector('#kw-save').addEventListener('click', () => App.guard(async () => {
+      const r = await api('PUT', '/featured-keywords', { items: payload() });
+      apply(r);
+      showState(`저장했습니다 (${r.items.length}개).`);
+      App.notice('주요 키워드를 저장했습니다. 네이버 뉴스 탭과 챗봇 칩에 바로 반영됩니다.');
+    }));
+    view.querySelector('#kw-revert').addEventListener('click', () => App.guard(load));
 
     await App.guard(load);
   }, { admin: true });

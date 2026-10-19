@@ -252,6 +252,129 @@ class ChatIT {
         assertThat(LLM.pending()).isZero();
     }
 
+    // ------------------------------------------------------------------ 키워드 바로 검색 (LLM 없음)
+
+    @Test
+    void keywordOnlyMessageSearchesCollectedArticlesWithoutTheLlm() {
+        long press = siteSource("news.example.com", "NEWS", "예시일보", false);
+        long gov = siteSource("gov.example.go.kr", "PUBLIC", null, false);   // 이름이 없으면 도메인
+        long newest = document(press, "https://news.example.com/1", "반도체 수출 사상 최대", "2026-10-16T09:00:00+09:00",
+                null, "[\"산업동향\"]");
+        long second = document(gov, "https://gov.example.go.kr/1", "반도체 장비 국산화 지원사업 공고",
+                "2026-10-15T09:00:00+09:00", "요약", "[\"지원사업\"]");
+        document(press, "https://news.example.com/2", "가을 축제 개막", "2026-10-17T09:00:00+09:00", null, "[]");
+        // 20일 전에 수집한 문서: 7일 안에 낱말이 든 문서가 있으면 나오지 않고, 없을 때만 30일로 넓혀 나온다
+        long old = document(press, "https://news.example.com/old", "반도체 HBM 공급 계약", "2026-09-28T09:00:00+09:00",
+                null, "[]");
+        jdbc.sql("UPDATE document SET collected_at = now() - interval '20 days' WHERE id = ?").param(old).update();
+
+        long s = session("viewer");
+        JsonNode turn = send("viewer", s, "반도체");
+        JsonNode answer = turn.get("assistant");
+        assertThat(answer.get("mode").asText()).isEqualTo("KEYWORD");
+        assertThat(answer.get("error").asBoolean()).isFalse();
+        assertThat(answer.get("content").asText())
+                .startsWith("‘반도체’ 관련 최근 7일 기사 2건 (최신순")
+                .contains("\n[1] 반도체 수출 사상 최대 — 예시일보 · 2026-10-16 09:00\n")
+                .contains("\n[2] 반도체 장비 국산화 지원사업 공고 — gov.example.go.kr")
+                .endsWith("네이버 뉴스 결과도 보기: 네이버 - 반도체")
+                .doesNotContain("HBM");
+        assertThat(answer.get("citations")).hasSize(2);
+        assertThat(answer.get("citations").get(0).get("documentId").asLong()).isEqualTo(newest);
+        assertThat(answer.get("citations").get(0).get("url").asText()).isEqualTo("https://news.example.com/1");
+        assertThat(answer.get("citations").get(1).get("documentId").asLong()).isEqualTo(second);
+        assertThat(answer.get("tools").get(0).get("link").asText())
+                .isEqualTo("#/documents?q=%EB%B0%98%EB%8F%84%EC%B2%B4&period=7d");
+        assertThat(turn.get("session").get("title").asText()).isEqualTo("반도체");
+
+        // LLM(채팅·임베딩)을 한 번도 부르지 않았다. 저장은 질문과 답 두 줄 + 근거
+        assertThat(LLM.requests()).isEmpty();
+        assertThat(roles(s)).containsExactly("USER", "ASSISTANT");
+        assertThat(jdbc.sql("SELECT meta->>'llmCalls' FROM chat_message WHERE session_id = ? AND role = 'ASSISTANT'")
+                .param(s).query(String.class).single()).isEqualTo("0");
+        assertThat(jdbc.sql("SELECT count(*) FROM chat_citation").query(Long.class).single()).isEqualTo(2);
+        JsonNode detail = call("viewer", HttpMethod.GET, "/api/v1/chat/sessions/" + s, null).getBody();
+        JsonNode reloaded = detail.get("messages").get(1);
+        assertThat(reloaded.get("mode").asText()).isEqualTo("KEYWORD");
+        assertThat(reloaded.get("citations")).hasSize(2);
+        assertThat(reloaded.get("tools").get(0).get("linkLabel").asText()).isEqualTo("문서 화면에서 더 보기");
+        assertThat(detail.get("messages").get(0).get("mode").isNull()).isTrue();
+
+        // 7일 안에 없으면 30일로 넓힌다 ('기사'는 검색어에서 뺀다)
+        JsonNode wider = send("viewer", s, "HBM 기사").get("assistant");
+        assertThat(wider.get("content").asText()).startsWith("‘HBM’ 관련 최근 30일 기사 1건");
+        assertThat(wider.get("citations").get(0).get("documentId").asLong()).isEqualTo(old);
+        assertThat(wider.get("tools").get(0).get("link").asText()).endsWith("&period=all");
+
+        // 없으면 네이버 안내
+        JsonNode none = send("viewer", s, "닌텐도").get("assistant");
+        assertThat(none.get("content").asText())
+                .isEqualTo("‘닌텐도’ 관련 기사를 최근 30일 수집한 기사에서 찾지 못했습니다.\n네이버에서 찾아보기: 네이버 - 닌텐도");
+        assertThat(none.get("citations")).isEmpty();
+        assertThat(LLM.requests()).isEmpty();
+
+        // 키워드가 아닌 질문은 LLM으로 간다: 지난 키워드 답을 대화로 보고, [1]은 그 답의 근거를 이어 쓴다
+        LLM.then(body -> {
+            assertThat(messages(body, "system").get(0).path("content").asText()).contains("되묻지 말고");
+            assertThat(messages(body, "user")).extracting(m -> m.path("content").asText())
+                    .containsExactly("반도체", "HBM 기사", "닌텐도", "첫 번째는 어디 기사야?");
+            assertThat(messages(body, "assistant").get(0).path("content").asText()).contains("[1] 반도체 수출 사상 최대");
+            return text("가장 최근 목록의 첫 번째는 예시일보 기사입니다 [1]");
+        });
+        JsonNode followUp = send("viewer", s, "첫 번째는 어디 기사야?").get("assistant");
+        assertThat(followUp.get("mode").isNull()).isTrue();
+        // 도구 없이 답한 [1]은 근거가 있는 가장 최근 답('HBM' 바로 검색)의 1번이다
+        assertThat(followUp.get("citations")).hasSize(1);
+        assertThat(followUp.get("citations").get(0).get("documentId").asLong()).isEqualTo(old);
+        assertThat(LLM.requests()).hasSize(1);
+        assertThat(LLM.pending()).isZero();
+    }
+
+    /** 칩 이름을 그대로 치면 관리자가 정한 검색어로 찾는다 ('DS' → '삼성전자 DS': 닌텐도 DS 기사가 섞이지 않는다). */
+    @Test
+    void featuredKeywordLabelUsesItsQuery() {
+        long press = siteSource("news.example.com", "NEWS", "예시일보", false);
+        long samsung = document(press, "https://news.example.com/s", "삼성전자 DS부문 3분기 실적", "2026-10-16T09:00:00+09:00",
+                null, "[]");
+        document(press, "https://news.example.com/n", "닌텐도 DS 후속작 루머", "2026-10-17T09:00:00+09:00", null, "[]");
+        String before = jdbc.sql("SELECT query FROM featured_keyword WHERE label = 'DS'").query(String.class).single();
+        jdbc.sql("UPDATE featured_keyword SET query = '삼성전자 DS' WHERE label = 'DS'").update();
+        try {
+            long s = session("viewer");
+            JsonNode answer = send("viewer", s, "ds").get("assistant");
+            assertThat(answer.get("content").asText()).startsWith("‘DS’(검색어 ‘삼성전자 DS’) 관련 최근 7일 기사 1건");
+            assertThat(answer.get("citations")).hasSize(1);
+            assertThat(answer.get("citations").get(0).get("documentId").asLong()).isEqualTo(samsung);
+            // 칩이 아닌 낱말은 그대로 찾는다
+            assertThat(send("viewer", s, "DS 후속작").get("assistant").get("citations")).hasSize(1);
+            assertThat(LLM.requests()).isEmpty();
+        } finally {
+            jdbc.sql("UPDATE featured_keyword SET query = ? WHERE label = 'DS'").param(before).update();
+        }
+    }
+
+    /** "네이버 - 검색어"는 화면이 직접 네이버를 보여 준다. 이 경로로 와도 저장·LLM 호출이 없다 (표시 전용 결과를 대화에 남기지 않음). */
+    @Test
+    void naverFormIsNeitherSavedNorSentToTheLlm() {
+        long s = session("viewer");
+        for (String text : List.of("네이버 - 닌텐도", "네이버-닌텐도", "네이버: 닌텐도", "네이버 닌텐도", "네이버 -")) {
+            ResponseEntity<JsonNode> res = call("viewer", HttpMethod.POST, "/api/v1/chat/sessions/" + s + "/messages",
+                    java.util.Map.of("content", text));
+            assertThat(res.getStatusCode()).as(text).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(res.getBody().get("error").asText()).isEqualTo("NAVER_DISPLAY_ONLY");
+        }
+        assertThat(LLM.requests()).isEmpty();
+        assertThat(roles(s)).isEmpty();
+        assertThat(jdbc.sql("SELECT title FROM chat_session WHERE id = ?").param(s)
+                .query((rs, n) -> java.util.Optional.ofNullable(rs.getString(1))).single()).isEmpty();
+        assertThat(jdbc.sql("SELECT count(*) FROM audit_log WHERE action = 'NAVER_SEARCH'").query(Long.class).single()).isZero();
+
+        // '네이버'로 시작하는 보통 질문은 그대로 LLM으로 간다
+        LLM.then(text("수집한 네이버 관련 기사가 없습니다."));
+        assertThat(send("viewer", s, "네이버 관련 기사 찾아 줘").get("assistant").get("mode").isNull()).isTrue();
+        assertThat(LLM.requests()).hasSize(1);
+    }
+
     /** 워커가 임베딩한 제목 조각을 흉내 낸다 (모델 mock-embed, 1024차원). */
     private void embeddedTitle(long documentId, String title, float[] vector) {
         StringBuilder literal = new StringBuilder("[");

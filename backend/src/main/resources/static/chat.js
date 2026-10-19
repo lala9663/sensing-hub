@@ -5,21 +5,81 @@
  * 전체 화면(#/chat, #/chat/:id — 이 파일 아래), 어느 화면에서나 뜨는 대화창과 챗봇만 있는 새 창(chat-dock.js, chat.html)이 함께 쓴다.
  * 답의 [n]은 아래 근거 목록의 원문 링크(이슈는 이슈 화면)로 바뀐다. 답을 기다리는 동안 "생각 중"을 띄운다.
  * LLM 오류(한도 초과·미설정 등)는 서버가 error=true인 답으로 주므로 주의 색으로만 다르게 보인다.
+ * 바로 가기: 키워드만 보내면 서버가 LLM 없이 바로 찾아 답한다(mode KEYWORD — 근거 줄로 그린다). "네이버 - 검색어"는 서버 대화로
+ * 보내지 않고 이 화면이 GET /naver/news를 불러 임시 카드로 보여 준다 (표시 전용: 대화 기록·LLM에 남기지 않음, 새로 고치면 사라짐).
+ * 시작 화면의 칩은 관리자가 정한 주요 키워드다 (GET /featured-keywords).
  */
 const Chat = (() => {
   const { api, esc } = App;
 
   const EXAMPLES = [
     '오늘 많이 보도된 이슈 알려 줘',
-    '최근 3일 반도체 관련 기사 찾아 줘',
     '내 키워드 감시 목록 보여 줘',
     '내 등록 요청 진행 상태 알려 줘',
   ];
+  const HELP = '키워드만 입력 → 수집 기사 바로 검색 · 네이버 - 검색어 → 네이버 결과만 (저장 안 함)';
+  const NAVER_PAGE = 10;
   const OPEN_KEY = 'sensing.chat.open';
   const LAST_KEY = 'sensing.chat.last.';
   const POPUP_NAME = 'sensing-chat';
   const POPUP_FEATURES = 'width=440,height=700,resizable=yes,scrollbars=yes';
   const NOT_FOUND = '대화를 찾을 수 없어 새 대화를 엽니다 (대화는 만든 사람만 볼 수 있습니다).';
+
+  // ---------------------------------------------------------------- 바로 가기 판별 (서버 ChatShortcuts.java와 같은 규칙 — 바꾸면 둘 다)
+
+  const WORD = /^[\p{L}\p{N}](?:[\p{L}\p{N}&·./+_-]*[\p{L}\p{N}])?$/u;
+  const JAMO_ONLY = /^[ㄱ-ㅎㅏ-ㅣ]+$/;
+  const COUNT = /^\d+(?:일|주|주일|주간|개|건|번|번째|시간|분|달|개월|월|년)$/;
+  const REQUEST_STEMS = ['알려', '찾아', '찾기', '검색해', '보여', '해줘', '주세요', '줘', '요약', '설명해', '궁금',
+    '무엇', '뭐', '뭔', '어떻', '어떤', '어때', '어디', '언제', '누구', '누가', '얼마', '있어', '있나', '있니', '있을까',
+    '없어', '했어', '했나', '됐어', '할까', '해봐', '해라', '만들어', '추가해', '삭제해', '지워', '비교해',
+    '분석해', '알아봐', '가르쳐', '부탁'];
+  const STOP_WORDS = new Set(['왜', '뭘', '뭔가', '이슈', '이슈들', '감시', '등록', '진행', '상태', '목록', '요청', '다이제스트', '챗봇', '키워드',
+    '도움말', '도움', '사용법', '안녕', '안녕하세요', '하이', '헬로', '고마워', '고마워요', '감사', '감사합니다', '땡큐', '수고',
+    '응', '네', '예', '아니', '아니요', '그래', '좋아', '오케이', 'ok', 'okay', 'yes', 'no', 'hi', 'hello', 'hey', 'help',
+    'thanks', 'test', '테스트', 'what', 'why', 'how', 'who', 'when', 'where', 'show', 'find', 'search', 'list',
+    '오늘', '어제', '그제', '내일', '최근', '요즘', '이번', '지난', '이번주', '지난주', '이번달', '지난달', '금주', '올해',
+    '작년', '지금', '주간', '일간', '더', '다시', '계속', '그거', '이거', '저거', '그중', '위', '아래', '다음', '이전']);
+  const FILLER_WORDS = new Set(['관련', '기사', '기사들', '뉴스', '소식', '보도', '동향', '자료', '문서', 'news', 'article', 'articles']);
+  const NAVER_SEPARATED = /^네이버(?:\s*뉴스)?\s*[-:：–—]\s*(.*)$/;
+  const NAVER_SPACED = /^네이버\s+(.+)$/;
+
+  function flat(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  /** 키워드만이면 검색어(채움 말을 뺀 것), 아니면 null. */
+  function keywordOf(text) {
+    const t = flat(text);
+    if (!t || t.length > 40) return null;
+    const words = t.split(' ');
+    if (words.length > 4) return null;
+    const compact = t.replace(/ /g, '').toLowerCase();
+    if (REQUEST_STEMS.some(s => compact.includes(s))) return null;
+    const query = [];
+    for (const w of words) {
+      const lower = w.toLowerCase();
+      if (!WORD.test(w) || JAMO_ONLY.test(w) || COUNT.test(w) || STOP_WORDS.has(lower)) return null;
+      if (!FILLER_WORDS.has(lower)) query.push(w);
+    }
+    return query.length ? query.join(' ') : null;
+  }
+
+  /** "네이버 - 닌텐도"·"네이버: 닌텐도"·"네이버 닌텐도"(뒤가 키워드만일 때)면 네이버 검색어('' 가능), 아니면 null. */
+  function naverQuery(text) {
+    const t = flat(text);
+    const sep = NAVER_SEPARATED.exec(t);
+    if (sep) return sep[1].trim();
+    const spaced = NAVER_SPACED.exec(t);
+    return spaced ? keywordOf(spaced[1]) : null;
+  }
+
+  // ---------------------------------------------------------------- 주요 키워드 (GET /featured-keywords)
+
+  /** 관리자가 고칠 수 있으므로 화면마다 새로 묻는다. 못 읽으면 빈 목록. */
+  function featuredKeywords() {
+    return api('GET', '/featured-keywords').then(r => (r && r.items) || []).catch(() => []);
+  }
 
   // ---------------------------------------------------------------- 메시지 그리기
 
@@ -48,15 +108,54 @@ const Chat = (() => {
     return s;
   }
 
+  function citationItem(c) {
+    const meta = [c.sourceLabel, c.publishedAt ? App.fmtDateTime(c.publishedAt) : ''].filter(Boolean).join(' · ');
+    return `<li><span class="ref-no">[${c.refNo}]</span>
+      <a ${linkAttrs(c)}>${esc(c.title || c.url || '(제목 없음)')}</a>
+      ${c.kind === 'ISSUE' ? '<span class="badge badge-blue">이슈</span>' : ''}
+      ${meta ? `<span class="muted small">${esc(meta)}</span>` : ''}</li>`;
+  }
+
   function citationsHtml(citations) {
     if (!(citations || []).length) return '';
-    return `<ul class="chat-cites">${citations.map(c => {
-      const meta = [c.sourceLabel, c.publishedAt ? App.fmtDateTime(c.publishedAt) : ''].filter(Boolean).join(' · ');
-      return `<li><span class="ref-no">[${c.refNo}]</span>
-        <a ${linkAttrs(c)}>${esc(c.title || c.url || '(제목 없음)')}</a>
-        ${c.kind === 'ISSUE' ? '<span class="badge badge-blue">이슈</span>' : ''}
-        ${meta ? `<span class="muted small">${esc(meta)}</span>` : ''}</li>`;
-    }).join('')}</ul>`;
+    return `<ul class="chat-cites">${citations.map(citationItem).join('')}</ul>`;
+  }
+
+  /**
+   * 키워드 바로 검색 답(mode KEYWORD, LLM 없음): 글의 "[n] 제목 — 언론사 · 시각" 줄을 원문 링크가 달린 근거 줄로 그리고,
+   * "네이버 - 검색어" 안내는 누르면 네이버 결과를 보여 주는 단추로 바꾼다.
+   */
+  function keywordBody(m) {
+    const byNo = new Map((m.citations || []).map(c => [c.refNo, c]));
+    let out = '';
+    let items = [];
+    const flush = () => {
+      if (items.length) out += `<ul class="chat-cites keyword">${items.join('')}</ul>`;
+      items = [];
+    };
+    String(m.content || '').split('\n').forEach((line, i) => {
+      const ref = /^\[(\d{1,3})\] /.exec(line);
+      const c = ref && byNo.get(Number(ref[1]));
+      if (c) {
+        items.push(citationItem(c));
+        return;
+      }
+      flush();
+      if (!line.trim()) return;
+      const naver = /^(.*?)네이버 - (.+)$/.exec(line);
+      out += naver
+        ? `<div class="kw-line">${esc(naver[1])}<button type="button" class="chip naver-try" data-q="${esc(naver[2])}"
+             title="네이버 뉴스 결과를 이 대화에 잠깐 보여 줍니다 (저장 안 함)">네이버 - ${esc(naver[2])}</button></div>`
+        : `<div class="kw-line ${i === 0 ? 'kw-head' : ''}">${esc(line)}</div>`;
+    });
+    flush();
+    return out;
+  }
+
+  function keywordTools(tools) {
+    const t = (tools || []).find(x => x.link && x.link.startsWith('#/'));
+    return `<div class="chat-tools">LLM 없이 수집 기사에서 바로 찾음${t
+      ? ` <a href="${esc(t.link)}">${esc(t.linkLabel || '문서 화면')} →</a>` : ''}</div>`;
   }
 
   /** 사용한 도구(중복 없이)와 화면 바로 가기. */
@@ -77,6 +176,11 @@ const Chat = (() => {
     if (m.role === 'USER') {
       return `<div class="chat-msg user" data-id="${m.id || ''}"><div class="bubble">${esc(m.content)}</div></div>`;
     }
+    if (m.mode === 'KEYWORD') {
+      return `<div class="chat-msg assistant keyword" data-id="${m.id || ''}">
+        <div class="bubble">${keywordBody(m)}${keywordTools(m.tools)}</div>
+      </div>`;
+    }
     return `<div class="chat-msg assistant ${m.error ? 'error' : ''}" data-id="${m.id || ''}">
       <div class="bubble">
         <div class="text">${renderText(m.content, m.citations)}</div>
@@ -88,10 +192,109 @@ const Chat = (() => {
 
   function emptyHtml() {
     return `<div class="chat-empty">
-      <p>수집한 기사·문서와 이슈를 물어보거나, 키워드 감시·사이트 등록을 말로 요청할 수 있습니다.<br>
+      <p>수집한 기사·문서와 이슈를 물어보거나, 키워드 감시·사이트 등록을 말로 요청할 수 있습니다.
+        키워드만 보내면(예: 반도체) AI를 거치지 않고 수집한 기사를 바로 찾아 드립니다.<br>
         <span class="muted small">언론 기사는 제목·링크만 저장하므로 답은 제목·분류와 원문 링크로 드립니다. API 키는 채팅으로 받지 않습니다.</span></p>
-      <div class="chips">${EXAMPLES.map(t => `<button type="button" class="chip example">${esc(t)}</button>`).join('')}</div>
+      <div class="chips featured" aria-label="주요 키워드"></div>
+      <div class="chips examples"><span class="muted small">이렇게 물어보세요</span>${EXAMPLES.map(t =>
+        `<button type="button" class="chip example">${esc(t)}</button>`).join('')}</div>
     </div>`;
+  }
+
+  // ---------------------------------------------------------------- 네이버 결과 카드 (표시 전용 — 저장·AI 입력 안 함)
+
+  function safeHttp(url) {
+    return /^https?:\/\//i.test(String(url || '')) ? url : '';
+  }
+
+  function naverItemHtml(it) {
+    const original = safeHttp(it.originalUrl);
+    const naverUrl = safeHttp(it.naverUrl);
+    const title = esc(it.title || it.originalUrl || '(제목 없음)');
+    const when = it.publishedAt ? App.fmtDateTime(it.publishedAt) : '';
+    return `<li>
+      ${original ? `<a class="naver-news-title" href="${esc(original)}" target="_blank" rel="noopener noreferrer">${title}</a>`
+        : `<span class="naver-news-title">${title}</span>`}
+      <div class="naver-news-meta"><span class="press">${esc(it.press || '')}</span>${when ? `<span>${esc(when)}</span>` : ''}${naverUrl
+        ? `<a href="${esc(naverUrl)}" target="_blank" rel="noopener noreferrer">네이버에서 보기</a>` : ''}</div>
+      ${it.description ? `<p class="naver-news-desc">${esc(it.description)}</p>` : ''}
+    </li>`;
+  }
+
+  /** 키 없음·INVALID·꺼짐은 안내 문장으로 (네이버를 부르기 전에 서버가 거절한다). */
+  function naverProblem(e) {
+    const code = (e && e.error) || '';
+    const admin = App.isAdmin() && /^NAVER_KEY_/.test(code) ? ' <a href="#/admin/credentials">API 키 화면으로 →</a>' : '';
+    if (code === 'NAVER_OFF') {
+      return '네이버 뉴스 검색이 꺼져 있습니다 (서버 설정 SENSING_NAVER_MODE=off). 쓰려면 관리자가 display로 바꾸고 백엔드를 다시 시작해야 합니다.';
+    }
+    if (code === 'NAVER_KEY_REQUIRED') {
+      return '네이버 API 키가 아직 없습니다. 관리자가 API 키 화면에서 naver_news를 등록하면 볼 수 있습니다.' + admin;
+    }
+    if (code === 'NAVER_KEY_INVALID') {
+      return '네이버 API 키가 유효하지 않습니다. 관리자가 API 키 화면에서 다시 등록하거나 시험 호출해 주세요.' + admin;
+    }
+    return esc((e && e.message) || String(e));
+  }
+
+  /**
+   * 대화 영역에 네이버 뉴스 결과 카드를 붙인다 (GET /naver/news, 최신순 10건씩). 서버 대화로 보내지 않으므로 대화 기록·LLM에 들어가지
+   * 않고, 새로 고치면 사라진다. 사용자 글도 이 화면에만 보인다.
+   */
+  function naverCard(log, text, query) {
+    log.appendChild(App.html(`<div class="chat-msg user naver"><div class="bubble">${esc(text)}</div></div>`));
+    const tab = `#/naver${App.qs({ q: query })}`;
+    const card = App.html(`<div class="chat-msg assistant naver-card">
+      <div class="bubble">
+        <div class="naver-card-head"><span class="naver-source">NAVER 검색 결과</span> <span class="naver-card-summary"></span></div>
+        <ul class="naver-news"></ul>
+        <div class="naver-card-foot"></div>
+        <div class="naver-card-note">NAVER 검색 결과 · 표시 전용 · 저장 안 함 (대화 기록·AI에 남기지 않고, 새로 고치면 사라집니다)
+          ${query ? ` · <a href="${esc(tab)}">네이버 뉴스 탭에서 보기 →</a>` : ''}</div>
+      </div>
+    </div>`);
+    log.appendChild(card);
+    const summary = card.querySelector('.naver-card-summary');
+    const list = card.querySelector('.naver-news');
+    const foot = card.querySelector('.naver-card-foot');
+    let shown = 0;
+
+    if (!query) {
+      foot.innerHTML = '<div class="naver-error">네이버 다음에 검색어를 입력해 주세요 (예: 네이버 - 닌텐도).</div>';
+      return;
+    }
+
+    async function page(start) {
+      foot.innerHTML = '<span class="muted small">네이버에서 불러오는 중…</span>';
+      let r;
+      try {
+        r = await api('GET', '/naver/news' + App.qs({ query, sort: 'date', start, display: NAVER_PAGE }));
+      } catch (e) {
+        if (!card.isConnected) return;
+        foot.innerHTML = `<div class="naver-error">${naverProblem(e)}</div>`
+          + (e && (e.error === 'NAVER_TOO_FAST' || e.status === 0 || e.status >= 500)
+            ? ' <button type="button" class="small retry">다시 시도</button>' : '');
+        const retry = foot.querySelector('.retry');
+        if (retry) retry.addEventListener('click', () => page(start));
+        return;
+      }
+      if (!card.isConnected) return;
+      list.insertAdjacentHTML('beforeend', r.items.map(naverItemHtml).join(''));
+      shown += r.items.length;
+      if (!shown) list.innerHTML = `<li class="muted">"${esc(r.query)}"에 대한 네이버 뉴스 검색 결과가 없습니다.</li>`;
+      summary.textContent = `“${r.query}” · 최신순 · 검색 결과 ${App.fmtNum(r.total)}건${shown ? ` 중 ${App.fmtNum(shown)}건` : ''}`;
+      if (r.nextStart) {
+        foot.innerHTML = '<button type="button" class="small more">더 보기</button>';
+        const more = foot.querySelector('.more');
+        more.addEventListener('click', () => {
+          more.disabled = true;
+          page(r.nextStart);
+        });
+      } else {
+        foot.innerHTML = '';
+      }
+    }
+    return page(1);
   }
 
   // ---------------------------------------------------------------- 기억 (저장소를 못 쓰면 기억만 못 한다)
@@ -140,8 +343,8 @@ const Chat = (() => {
   function showStatus(warnEl, infoEl) {
     status().then(s => {
       if (!s.configured) {
-        warnEl.innerHTML = 'LLM이 설정되지 않아 챗봇이 답할 수 없습니다. 관리자는 백엔드에 <span class="mono">SENSING_LLM_PROVIDER</span> 등을 '
-          + '설정해 주세요 (README "챗봇").';
+        warnEl.innerHTML = 'LLM이 설정되지 않아 질문에는 답할 수 없습니다 (키워드만 보내는 바로 검색과 "네이버 - 검색어"는 됩니다). '
+          + '관리자는 백엔드에 <span class="mono">SENSING_LLM_PROVIDER</span> 등을 설정해 주세요 (README "챗봇").';
         warnEl.hidden = false;
       } else if (infoEl) {
         infoEl.textContent = `모델: ${s.provider}` + (s.search ? ` · 문서 검색: ${s.search}` : '');
@@ -182,7 +385,8 @@ const Chat = (() => {
         <textarea name="content" rows="2" maxlength="2000" aria-label="질문"
           placeholder="질문을 입력하세요 (Enter 보내기, Shift+Enter 줄바꿈)"></textarea>
         <button type="submit" class="primary">보내기</button>
-      </form>`;
+      </form>
+      <div class="chat-help muted small">${esc(HELP)}</div>`;
 
     const log = root.querySelector('.chat-log');
     const form = root.querySelector('.chat-input');
@@ -206,6 +410,28 @@ const Chat = (() => {
         input.value = b.textContent;
         send();
       }));
+      // 주요 키워드 칩: 이름을 그대로 보내면 서버가 그 칩의 검색어로 바로 찾는다 (LLM 없음)
+      const box = log.querySelector('.featured');
+      featuredKeywords().then(items => {
+        if (!box.isConnected || !items.length) return;
+        box.innerHTML = '<span class="muted small">주요 키워드</span>' + items.map(k =>
+          `<button type="button" class="chip keyword" data-k="${esc(k.label)}"
+             title="${esc(k.query === k.label ? `‘${k.label}’ 기사 바로 찾기` : `검색어: ${k.query}`)}">${esc(k.label)}</button>`).join('');
+        box.querySelectorAll('.keyword').forEach(b => b.addEventListener('click', () => {
+          input.value = b.dataset.k;
+          send();
+        }));
+      });
+    }
+
+    /** "네이버 - 검색어": 서버 대화로 보내지 않고 이 화면에만 네이버 결과를 보여 준다. */
+    function showNaver(text, query) {
+      App.clearError();
+      const empty = log.querySelector('.chat-empty');
+      if (empty) empty.remove();
+      const loaded = naverCard(log, text, query);
+      scrollDown();
+      if (loaded) loaded.then(scrollDown);
     }
 
     function thinking() {
@@ -236,6 +462,13 @@ const Chat = (() => {
     async function send() {
       const text = input.value.trim();
       if (!text || st.sending) return;
+      const naver = naverQuery(text);
+      if (naver !== null) {
+        input.value = '';
+        showNaver(text, naver);
+        input.focus();
+        return;
+      }
       const gen = st.gen;
       const current = () => st.alive && gen === st.gen;
       App.clearError();
@@ -324,6 +557,12 @@ const Chat = (() => {
     form.addEventListener('submit', e => {
       e.preventDefault();
       send();
+    });
+    // 키워드 답의 "네이버 - 검색어" 단추
+    log.addEventListener('click', e => {
+      const b = e.target.closest('.naver-try');
+      if (!b || st.sending) return;
+      showNaver(`네이버 - ${b.dataset.q}`, b.dataset.q);
     });
     input.addEventListener('keydown', e => {
       // 한글 입력 중(조합 중)의 Enter는 글자 확정이다: 보내지 않는다
@@ -447,6 +686,6 @@ const Chat = (() => {
 
   return {
     conversation, sessionList, status, showStatus, lastId, rememberLast, wasOpen, rememberOpen,
-    popupUrl, openPopup, POPUP_BLOCKED, NOT_FOUND,
+    popupUrl, openPopup, POPUP_BLOCKED, NOT_FOUND, keywordOf, naverQuery, featuredKeywords,
   };
 })();

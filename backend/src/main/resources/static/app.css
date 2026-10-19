@@ -220,6 +220,13 @@ a.tag:hover { text-decoration: underline; }
 .naver-error { color: var(--red); }
 button.naver.active { background: var(--blue-bg); }
 
+/* 관리자 주요 키워드 (admin.js) */
+.kw-table td input { width: 100%; min-width: 120px; }
+.kw-table .num { width: 32px; color: var(--muted); }
+.kw-add { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.kw-add input { flex: 1; min-width: 160px; }
+.kw-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
 /* 네이버 뉴스 탭 (naver.js, 표시 전용) */
 .naver-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
 .naver-title h1 { margin: 0; }
@@ -323,6 +330,21 @@ a.btn.primary:hover { background: var(--primary-dark); }
 .chat-input textarea { min-height: 44px; max-height: 160px; resize: vertical; flex: 1; }
 .chat-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .chat-loading, .chat-none { padding: 12px; }
+.chat-help { margin: 4px 2px 0; }
+.chat-empty .chips { align-items: center; margin: 8px 0; }
+/* 키워드 바로 검색 답 (LLM 없음): 머리 한 줄 + 근거 줄 */
+.chat-msg.keyword .kw-line { margin: 2px 0; white-space: pre-wrap; }
+.chat-msg.keyword .kw-head { font-weight: 600; }
+.chat-msg.keyword .chat-cites.keyword { border-top: none; margin: 4px 0 6px; padding-top: 0; }
+.kw-line .naver-try { margin-left: 4px; padding: 1px 8px; font-size: 12px; }
+/* "네이버 - 검색어" 임시 카드 (표시 전용, 서버에 저장하지 않음) */
+.chat-msg.user.naver .bubble { background: #03a94d; }
+.chat-msg.naver-card .bubble { background: #fff; border-color: #b7e4c7; width: min(760px, 88%); }
+.naver-card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.naver-card .naver-news li { padding: 6px 0; }
+.naver-card .naver-news-title { font-size: 14px; }
+.naver-card-foot { padding-top: 6px; }
+.naver-card-note { margin-top: 6px; padding: 4px 8px; border-radius: 4px; background: #effaf3; color: #166534; font-size: 12px; }
 
 /* 떠 있는 챗봇 버튼과 작은 챗봇 창 (chat-dock.js): 화면 위 대화창(.floating)과 새 창(.popup, chat.html)이 같은 모양을 쓴다.
    모달(확인 창, z-index 100)이 대화창 위에 뜬다. 버튼이 있으면 본문 아래에 여백을 두어 표의 마지막 줄·열을 버튼 위로 올려 볼 수 있다 */
@@ -364,6 +386,8 @@ body.has-chat-fab #content { padding-bottom: 96px; }
 .chat-win .chat-log { border: none; border-radius: 0; padding: 8px 12px; }
 .chat-win .chat-input { margin: 0; padding: 8px 10px; border-top: 1px solid var(--border); }
 .chat-win .chat-input textarea { min-height: 40px; max-height: 120px; resize: none; }
+.chat-win .chat-help { margin: 0; padding: 0 10px 6px; font-size: 11px; }
+.chat-win .chat-msg.naver-card .bubble { width: 92%; }
 .chat-win .chat-msg .bubble { max-width: 92%; }
 .chat-win .chat-empty { padding: 12px 4px; }
 body.chat-popup-page { height: 100vh; display: flex; flex-direction: column; background: var(--panel); }
