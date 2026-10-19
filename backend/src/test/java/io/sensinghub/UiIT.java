@@ -45,12 +45,12 @@ class UiIT {
         assertThat(app.getBody()).contains("X-User");
 
         for (String script : new String[] {"registrations.js", "documents.js", "issues.js", "companies.js", "watches.js",
-                "naver.js", "digests.js", "chat.js", "chat-dock.js", "admin.js", "ops.js", "caidentia.js", "app.css"}) {
+                "naver.js", "digests.js", "chat.js", "chat-dock.js", "admin.js", "ops.js", "caidentia.js", "app.css", "chat.css"}) {
             assertThat(http.getForEntity("/" + script, String.class).getStatusCode())
                     .as(script).isEqualTo(HttpStatus.OK);
         }
         // 어느 화면에서나 뜨는 챗봇 버튼·대화창
-        assertThat(index.getBody()).contains("chat-dock.js").contains("ChatDock.mount()");
+        assertThat(index.getBody()).contains("chat-dock.js").contains("ChatDock.mount()").contains("href=\"chat.css\"");
         // 네이버 뉴스 탭: 키가 없어도 메뉴는 보인다 (화면이 안내를 보여 준다)
         assertThat(index.getBody()).contains("href=\"#/naver\"").contains("naver.js");
         // 관리자 메뉴: 주요 키워드 (네이버 탭·챗봇 칩)
@@ -64,6 +64,7 @@ class UiIT {
         assertThat(popup.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(popup.getBody())
                 .contains("app.js").contains("chat.js").contains("chat-dock.js").contains("ChatDock.mountPopup(")
+                .contains("href=\"chat.css\"")
                 .doesNotContain("id=\"menu\"");
     }
 
@@ -98,6 +99,7 @@ class UiIT {
         JsonNode answer = sent.getBody().get("assistant");
         assertThat(answer.get("error").asBoolean()).isTrue();
         assertThat(answer.get("content").asText()).contains("LLM이 설정되지 않았습니다");
+        assertThat(answer.get("errorKind").asText()).isEqualTo("NOT_CONFIGURED");
 
         // 키워드만 보낸 메시지는 LLM 없이도 수집 기사에서 바로 찾는다
         ResponseEntity<JsonNode> keyword = http.exchange("/api/v1/chat/sessions/" + id + "/messages", HttpMethod.POST,

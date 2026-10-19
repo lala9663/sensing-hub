@@ -648,6 +648,7 @@ class ChatIT {
         LLM.then(Reply.status(429, MockLlmServer.GEMINI_DAILY_429));
         JsonNode failed = send("viewer", s, "주요 이슈 알려 줘");
         assertThat(failed.get("assistant").get("error").asBoolean()).isTrue();
+        assertThat(failed.get("assistant").get("errorKind").asText()).isEqualTo("RATE_LIMITED");   // 화면은 문구가 아니라 종류로 그린다
         assertThat(failed.get("assistant").get("content").asText()).contains("하루 사용 한도");
         assertThat(jdbc.sql("SELECT meta->>'error' FROM chat_message WHERE session_id = ? AND role = 'ASSISTANT'").param(s)
                 .query(String.class).single()).isEqualTo("RATE_LIMITED");
@@ -668,10 +669,12 @@ class ChatIT {
         });
         JsonNode ok = send("viewer", s, "다시 해 볼게");
         assertThat(ok.get("assistant").get("error").asBoolean()).isFalse();
+        assertThat(ok.get("assistant").get("errorKind").isNull()).isTrue();
 
         JsonNode detail = call("viewer", HttpMethod.GET, "/api/v1/chat/sessions/" + s, null).getBody();
         assertThat(detail.get("messages")).hasSize(6);
         assertThat(detail.get("messages").get(1).get("error").asBoolean()).isTrue();
+        assertThat(detail.get("messages").get(1).get("errorKind").asText()).isEqualTo("RATE_LIMITED");
         assertThat(detail.get("messages").get(3).get("tools").get(0).get("name").asText()).isEqualTo("list_issues");
         assertThat(LLM.pending()).isZero();
     }

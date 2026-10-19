@@ -97,10 +97,11 @@ public class ChatService {
 
     /**
      * role USER | ASSISTANT. error: LLM 오류 안내로 끝난 답. mode: null이면 LLM 답, KEYWORD면 LLM 없이 키워드로 바로 찾은 답
-     * (content의 "[n] 제목 — 언론사 · 시각" 줄을 화면이 근거 줄로 그린다).
+     * (content의 "[n] 제목 — 언론사 · 시각" 줄을 화면이 근거 줄로 그린다). errorKind: 오류 답의 종류(meta.error — LlmException.Kind 이름
+     * 등, 오류가 아니면 null). 화면은 안내 문구가 아니라 이 값으로 오류 카드의 제목·도움말을 고른다 (문구는 바뀔 수 있다).
      */
     public record MessageView(long id, String role, String content, OffsetDateTime createdAt, boolean error,
-                              List<CitationView> citations, List<ToolUseView> tools, String mode) {
+                              List<CitationView> citations, List<ToolUseView> tools, String mode, String errorKind) {
     }
 
     public record SessionDetail(SessionView session, List<MessageView> messages) {
@@ -240,10 +241,10 @@ public class ChatService {
 
         OffsetDateTime now = OffsetDateTime.now();
         MessageView userView = new MessageView(userMessageId, "USER", masked.text(), now, false, List.of(), List.of(),
-                null);
-        MessageView answerView = new MessageView(answerId, "ASSISTANT", answer.content(), now,
-                answer.meta().get("error") != null, answer.cited().stream().map(ChatService::citationView).toList(),
-                answer.uses(), answer.mode());
+                null, null);
+        String errorKind = errorKind(answer.meta());
+        MessageView answerView = new MessageView(answerId, "ASSISTANT", answer.content(), now, errorKind != null,
+                answer.cited().stream().map(ChatService::citationView).toList(), answer.uses(), answer.mode(), errorKind);
         return new TurnResult(session(user, sessionId), userView, answerView,
                 masked.masked() > 0 ? SECRET_NOTICE : null);
     }
@@ -443,6 +444,12 @@ public class ChatService {
         return used.stream().map(previous::get).filter(Objects::nonNull).toList();
     }
 
+    /** 답 meta.error (오류 종류 이름, 없으면 null). 문자열이 아닌 값이 들어 있어도 종류를 모르는 오류로 본다. */
+    private static String errorKind(Map<String, Object> meta) {
+        Object error = meta == null ? null : meta.get("error");
+        return error == null ? null : String.valueOf(error);
+    }
+
     private static CitationView citationView(Ref r) {
         return new CitationView(r.no(), r.kind(), r.documentId(), r.issueId(), r.title(), r.url(), r.sourceLabel(),
                 r.publishedAt());
@@ -544,7 +551,8 @@ public class ChatService {
             switch (r.role()) {
                 case "USER" -> {
                     pending = new ArrayList<>();
-                    out.add(new MessageView(r.id(), "USER", r.content(), r.createdAt(), false, List.of(), List.of(), null));
+                    out.add(new MessageView(r.id(), "USER", r.content(), r.createdAt(), false, List.of(), List.of(), null,
+                            null));
                 }
                 case "TOOL" -> {
                     String name = String.valueOf(r.meta().get("name"));
@@ -558,8 +566,9 @@ public class ChatService {
                             pending.add(new ToolUseView(ChatTools.SEARCH_DOCUMENTS, ChatTools.label(ChatTools.SEARCH_DOCUMENTS),
                                     true, link, (String) r.meta().get("linkLabel")));
                         }
-                        out.add(new MessageView(r.id(), "ASSISTANT", r.content(), r.createdAt(), r.failed(),
-                                citations.getOrDefault(r.id(), List.of()), List.copyOf(pending), mode));
+                        String errorKind = errorKind(r.meta());
+                        out.add(new MessageView(r.id(), "ASSISTANT", r.content(), r.createdAt(), errorKind != null,
+                                citations.getOrDefault(r.id(), List.of()), List.copyOf(pending), mode, errorKind));
                         pending = new ArrayList<>();
                     }
                 }

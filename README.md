@@ -356,7 +356,22 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 
 답을 기다리는 동안에는 "크게 보기"·"새 창으로"를 잠시 막습니다 (답이 지금 창에만 그려지므로). 상단 사용자를 바꾸면 대화창·새 창은 그 사용자의
 마지막 대화(없으면 새 대화)로 바뀝니다. 화면 코드는 `static/chat.js`(메시지 그리기·보내기·생각 중·근거 링크·대화 목록 공통 부품과 전체 화면),
-`static/chat-dock.js`(떠 있는 버튼·대화창·새 창), `static/chat.html`(새 창)입니다.
+`static/chat-dock.js`(떠 있는 버튼·대화창·새 창), `static/chat.html`(새 창), 모양은 `static/chat.css`입니다.
+
+**화면 모양** (외부 글꼴·라이브러리 없이 순수 CSS/JS):
+- 사용자 글은 오른쪽 말풍선(강조색), 답은 왼쪽에 아바타와 "센싱 봇" 이름, 배경 없는 넓은 본문. 시각은 흐리게 작게.
+- 답 본문은 간단한 마크다운(굵게·목록·번호 목록·제목 줄·`코드`·`[글](https://…)`·맨 주소)으로 그립니다(HTML은 모두 이스케이프, 링크는 http(s)만).
+  `[n]`은 알약 모양 근거 칩 — 마우스를 올리거나 키보드로 가면 제목·언론사·날짜 미리보기, 누르면 원문 새 탭(이슈는 이슈 화면). 아래 "근거 N건"(5건 넘으면 접힘)과
+  답마다 **복사** 단추(답 + 근거 제목·주소). 키워드 바로 검색 답은 "AI 없이 바로 검색" 꼬리표와 기사 카드 목록.
+- 생각 중: 점 세 개 + 단계 문구("질문을 살펴보는 중…" → "수집 기사 검색 중…" → "근거를 정리하는 중…" → "답을 쓰는 중…", 3초부터 경과 초). 키워드만 보낸 글은 "수집 기사 검색 중…".
+- 입력창은 아래 고정, 글에 맞춰 늘어나는 입력칸과 둥근 테두리 안의 보내기 아이콘(빈 칸·보내는 중에는 비활성), Enter 보내기·Shift+Enter 줄바꿈.
+- 빈 화면: 인사 한 줄, 주요 키워드 칩, 예시 질문 카드 4개, "네이버 - 검색어" 사용법 한 줄.
+- 오류 답(한도 초과·미설정·시간 초과 등)은 주의 카드로, 제목·도움말은 안내 문구가 아니라 답의 `errorKind`(서버 `meta.error` — `RATE_LIMITED`·`NOT_CONFIGURED`·
+  `TIMEOUT` …, 이름에 LIMIT·QUOTA·BUDGET이 들어가면 한도 카드)로 고릅니다. 시간 초과·서버 오류·보내기 실패는 "질문 다시 넣기" 단추.
+- 떠 있는 대화창: 열고 닫을 때 투명도·위치 전환(0.18초), 머리는 은은한 그라데이션, 머리 단추는 아이콘(새 대화·대화 목록·크게 보기·새 창으로·닫기 —
+  이름은 `aria-label`·`title`). 네이버 결과 카드도 같은 카드 모양(초록 "N" 표시, "표시 전용" 꼬리표).
+- 다크 모드: 시스템이 다크면 챗봇 영역(전체 화면 카드·대화창·새 창·미리보기)만 어두운 토큰(`--c-*`, 밑값은 app.css 토큰)으로 바뀝니다(앱 전체 다크 모드는 아직 없음).
+  움직임 줄이기(`prefers-reduced-motion`)면 전환·애니메이션을 끕니다. 375px 폭에서는 대화창이 화면 전체, 예시 카드는 한 줄에 하나.
 
 | 도구 | 하는 일 | 부르는 코드 |
 | --- | --- | --- |
@@ -531,7 +546,7 @@ curl -X POST localhost:8080/api/v1/companies -H 'X-User: registrar' -H 'Content-
 curl localhost:8080/api/v1/companies -H 'X-User: viewer'            # GET /api/v1/companies/1 (최근 신호·문서 20건, 종류별 최근 1건 latestByKind), PUT /api/v1/companies/1, DELETE 는 보관. POST /api/v1/companies/import 는 JSON 배열 또는 CSV(name,aliases(;구분),biz_no,...) upsert
 curl 'localhost:8080/api/v1/company-signals?since=2026-10-15&severity=HIGH' -H 'X-User: viewer'   # kind=BIZ_STATUS|NEWS|... · GET /api/v1/companies/1/signals?since=
 
-# 챗봇 (VIEWER 이상, 대화는 만든 사람만): 설정 여부 · 대화 만들기 · 질문(답이 올 때까지 기다린다, LLM 오류는 error=true인 답) · 대화 불러오기 · 목록 · 지우기
+# 챗봇 (VIEWER 이상, 대화는 만든 사람만): 설정 여부 · 대화 만들기 · 질문(답이 올 때까지 기다린다, LLM 오류는 error=true·errorKind(RATE_LIMITED 등)인 답, 키워드 바로 검색은 mode KEYWORD) · 대화 불러오기 · 목록 · 지우기
 curl localhost:8080/api/v1/chat/status -H 'X-User: viewer'          # {"configured":true,"provider":"openai gemini-3.5-flash-lite","maxToolRounds":4}
 curl -X POST localhost:8080/api/v1/chat/sessions -H 'X-User: viewer' -H 'Content-Type: application/json' -d '{}'
 curl -X POST localhost:8080/api/v1/chat/sessions/1/messages -H 'X-User: viewer' -H 'Content-Type: application/json' -d '{"content":"오늘 많이 보도된 이슈 알려 줘"}'

@@ -11,36 +11,43 @@
 const ChatDock = (() => {
   const { esc } = App;
 
-  const ICON = `<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" focusable="false">
+  /** 떠 있는 버튼: 말풍선 안에 센싱 아이콘 */
+  const FAB_ICON = `<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" focusable="false">
     <path d="M5 3.5h14a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3h-7.2L6.5 21.6v-4.1H5a3 3 0 0 1-3-3v-8a3 3 0 0 1 3-3z" fill="currentColor"/>
     <circle class="dot" cx="8" cy="10.5" r="1.4"/><circle class="dot" cx="12" cy="10.5" r="1.4"/><circle class="dot" cx="16" cy="10.5" r="1.4"/>
   </svg>`;
+  const CLOSE_MS = 180;   // 닫는 움직임 길이 (chat.css .chat-win.floating 전환과 같다)
+
+  function toolButton(cls, iconName, label, title, extra = '') {
+    return `<button type="button" class="icon-btn ${cls}" aria-label="${esc(label)}" title="${esc(title || label)}" ${extra}>${Chat.icon(iconName, 17)}</button>`;
+  }
 
   /**
    * 작은 챗봇 창 하나를 el 안에 그린다.
    * actions.href(id) — 대화 목록 링크 주소, actions.onChange(id) — 보이는 대화가 바뀌었을 때(새 대화면 null),
    * actions.close(), actions.expand(id), actions.popout(id) — 없는 동작은 버튼을 그리지 않는다. actions.who — 머리에 보일 사용자.
+   * 머리 단추는 아이콘이고 이름은 aria-label·title로 둔다.
    */
   function compact(el, actions) {
     el.innerHTML = `
       <div class="chat-win-head">
+        <span class="avatar" aria-hidden="true">${Chat.icon('bot', 16)}</span>
         <div class="chat-win-title">
-          <strong>챗봇</strong>
-          ${actions.who ? `<span class="muted small">${esc(actions.who)}</span>` : ''}
-          <span class="muted small conv-title"></span>
-          ${actions.close ? '<button type="button" class="close" aria-label="챗봇 닫기" title="닫기 (Esc)">×</button>' : ''}
+          <strong>${esc(Chat.BOT_NAME)}</strong>
+          <span class="conv-title">${actions.who ? esc(actions.who) : '새 대화'}</span>
         </div>
         <div class="chat-win-tools" role="toolbar" aria-label="챗봇 메뉴">
-          <button type="button" class="new">새 대화</button>
-          <button type="button" class="list" aria-pressed="false">대화 목록</button>
-          ${actions.expand ? '<button type="button" class="expand" title="왼쪽에 대화 목록이 있는 챗봇 화면으로">크게 보기</button>' : ''}
-          ${actions.popout ? '<button type="button" class="popout" title="챗봇만 있는 작은 브라우저 창으로">새 창으로</button>' : ''}
+          ${toolButton('new', 'plus', '새 대화')}
+          ${toolButton('list', 'list', '대화 목록', '', 'aria-pressed="false"')}
+          ${actions.expand ? toolButton('expand', 'expand', '크게 보기', '왼쪽에 대화 목록이 있는 챗봇 화면으로') : ''}
+          ${actions.popout ? toolButton('popout', 'popout', '새 창으로', '챗봇만 있는 작은 브라우저 창으로') : ''}
+          ${actions.close ? toolButton('close', 'close', '챗봇 닫기', '닫기 (Esc)') : ''}
         </div>
       </div>
       <div class="chat-warn" hidden></div>
       <div class="chat-win-notice" role="status" hidden></div>
       <div class="chat-win-list" hidden>
-        <div class="chat-win-list-head muted small">내 대화 (최근 순)</div>
+        <div class="chat-win-list-head">내 대화 (최근 순)</div>
         <div class="chat-sessions" role="navigation" aria-label="내 대화 목록"></div>
       </div>
       <div class="chat-body"></div>`;
@@ -64,7 +71,7 @@ const ChatDock = (() => {
     }
 
     function setTitle(title) {
-      titleEl.textContent = title ? `· ${title}` : '';
+      titleEl.textContent = title || (actions.who ? actions.who : '새 대화');
       titleEl.title = title || '';
     }
 
@@ -177,7 +184,7 @@ const ChatDock = (() => {
   /** 오른쪽 아래 버튼과 대화창을 붙인다. 챗봇(LLM)이 설정돼 있을 때만 보이고, 전체 화면 챗봇(#/chat)에서는 감춘다. */
   function mount() {
     const fab = App.html(`<button type="button" class="chat-fab" aria-label="챗봇 열기" title="챗봇"
-      aria-haspopup="dialog" aria-expanded="false" aria-controls="chat-dock" hidden>${ICON}</button>`);
+      aria-haspopup="dialog" aria-expanded="false" aria-controls="chat-dock" hidden>${FAB_ICON}</button>`);
     const panel = App.html(`<section id="chat-dock" class="chat-win floating" role="dialog" aria-modal="false"
       aria-label="챗봇 대화창" tabindex="-1" hidden></section>`);
     document.body.append(fab, panel);
@@ -185,6 +192,25 @@ const ChatDock = (() => {
     let enabled = false;
     let win = null;
     let user = App.loginId();
+    let isOpen = false;
+    let hideTimer = null;
+
+    /**
+     * 대화창을 보이거나 감춘다. 열 때는 hidden을 풀고 다음 프레임에 .is-open(투명도·위치 전환), 닫을 때는 .is-open을 빼고
+     * 전환이 끝난 뒤 hidden. 움직임 줄이기 설정이면 바로 바꾼다.
+     */
+    function showPanel(on) {
+      clearTimeout(hideTimer);
+      if (on) {
+        panel.hidden = false;
+        void panel.offsetWidth;   // 처음 상태를 그린 뒤 전환이 시작되게
+        panel.classList.add('is-open');
+      } else {
+        panel.classList.remove('is-open');
+        if (Chat.reducedMotion()) panel.hidden = true;
+        else hideTimer = setTimeout(() => { if (!isOpen) panel.hidden = true; }, CLOSE_MS);
+      }
+    }
 
     function onChatScreen() {
       return /^#\/chat(\/|\?|$)/.test(location.hash);
@@ -210,18 +236,22 @@ const ChatDock = (() => {
 
     function update() {
       const allowed = enabled && !onChatScreen();
-      if (!allowed && !panel.hidden) {
+      if (!allowed && isOpen) {
+        isOpen = false;
+        clearTimeout(hideTimer);
+        panel.classList.remove('is-open');
         panel.hidden = true;
         Chat.rememberOpen(false);
       }
-      fab.hidden = !allowed || !panel.hidden;
-      fab.setAttribute('aria-expanded', String(!panel.hidden));
+      fab.hidden = !allowed || isOpen;
+      fab.setAttribute('aria-expanded', String(isOpen));
       document.body.classList.toggle('has-chat-fab', allowed);
     }
 
     function open(focus) {
       ensureWin();
-      panel.hidden = false;
+      isOpen = true;
+      showPanel(true);
       Chat.rememberOpen(true);
       update();
       win.sync();
@@ -229,7 +259,8 @@ const ChatDock = (() => {
     }
 
     function close(focusFab) {
-      panel.hidden = true;
+      isOpen = false;
+      showPanel(false);
       Chat.rememberOpen(false);
       update();
       if (focusFab && !fab.hidden) fab.focus();

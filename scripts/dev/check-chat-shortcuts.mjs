@@ -12,7 +12,8 @@ const cases = readFileSync(join(root, 'backend/src/test/resources/chat-shortcuts
   .split(/\r?\n/).filter(l => l && !l.startsWith('#')).map(l => l.split('\t'));
 
 const App = { api: async () => ({}), esc: s => String(s), route: () => {}, html: () => null };
-const context = vm.createContext({ App, localStorage: null, window: {}, location: {}, history: {} });
+const document = { addEventListener: () => {} };   // 근거 미리보기 리스너만 단다
+const context = vm.createContext({ App, document, localStorage: null, window: {}, location: {}, history: {} });
 vm.runInContext(`${source}\nthis.Chat = Chat;`, context);
 const { Chat } = context;
 
