@@ -27,7 +27,8 @@ public class DocumentController {
     /**
      * 발행일 내림차순 목록.
      * since: 수집 시각 기준 (ISO 시각 또는 날짜), source_id, topic: 분류 체계 값 포함 여부, keyword: 감시 검색어 일치,
-     * limit: 기본 50, 최대 200.
+     * q: 전문 검색 (낱말마다 접두 일치, 모든 낱말 포함, 조사는 뗀다 — DocumentService.appendSearch), limit: 기본 50, 최대 200.
+     * 행에 issueId·issueDocCount(워커가 묶은 이슈)가 붙는다.
      */
     @GetMapping
     public List<DocumentRow> list(CurrentUser user,
