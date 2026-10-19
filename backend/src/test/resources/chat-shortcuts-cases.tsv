@@ -1,0 +1,52 @@
+# 챗봇 바로 가기 판별 사례: 종류<TAB>입력<TAB>기대값. 기대값 NONE은 해당 없음(LLM 경로), EMPTY는 빈 검색어.
+# 서버(ChatShortcutsTest)와 화면(scripts/dev/check-chat-shortcuts.mjs → static/chat.js)이 같은 파일로 확인한다.
+keyword	반도체	반도체
+keyword	삼성전자 DS	삼성전자 DS
+keyword	메타넷 글로벌	메타넷 글로벌
+keyword	  DSR  	DSR
+keyword	ds	ds
+keyword	반도체 관련 기사	반도체
+keyword	SK하이닉스 HBM 수출 동향	SK하이닉스 HBM 수출
+keyword	AI·반도체	AI·반도체
+keyword	S&P	S&P
+keyword	2분기 실적	2분기 실적
+keyword	정리해고	정리해고
+keyword	추가경정예산	추가경정예산
+keyword	네이버	네이버
+keyword	네이버 뉴스	네이버
+keyword	반도체?	NONE
+keyword	반도체 알려 줘	NONE
+keyword	반도체 기사 찾아줘	NONE
+keyword	테슬라 어때	NONE
+keyword	뭐야	NONE
+keyword	오늘 이슈	NONE
+keyword	주요 이슈	NONE
+keyword	최근 3일 반도체	NONE
+keyword	반도체 10개	NONE
+keyword	1번 기사	NONE
+keyword	내 감시 목록	NONE
+keyword	안녕	NONE
+keyword	Hello	NONE
+keyword	ㅋㅋㅋ	NONE
+keyword	삼성전자, 하이닉스	NONE
+keyword	삼성전자.	NONE
+keyword	반도체 수출 동향 전망 분석	NONE
+keyword	기사	NONE
+keyword	뉴스 관련	NONE
+keyword	가나다라마바사아자차카타파하 가나다라마바사아자차카타파하 가나다라마바사아자차카타파하	NONE
+keyword		NONE
+naver	네이버 - 닌텐도	닌텐도
+naver	네이버-닌텐도	닌텐도
+naver	네이버: 닌텐도	닌텐도
+naver	네이버 닌텐도	닌텐도
+naver	네이버 뉴스 - 반도체 수출	반도체 수출
+naver	네이버뉴스: 삼성전자 DS	삼성전자 DS
+naver	네이버 — 삼성전자 DS	삼성전자 DS
+naver	네이버 - 반도체 수출 전망 알려줘	반도체 수출 전망 알려줘
+naver	네이버 -	EMPTY
+naver	네이버 관련 기사 찾아 줘	NONE
+naver	네이버 주가 어때	NONE
+naver	네이버	NONE
+naver	네이버 뉴스	NONE
+naver	오늘 네이버 - 반도체	NONE
+naver	닌텐도	NONE

@@ -3,7 +3,8 @@
 /**
  * 네이버 뉴스 탭 (표시 전용): 검색어로 네이버 뉴스를 불러와 보여 주기만 한다 (GET /naver/news — 저장·요약·챗봇·다이제스트에 쓰지 않음).
  * #/naver?q=<검색어>(&sort=sim): 검색어·정렬을 주소에 남겨 새로 고침·공유가 된다. 검색할 때는 history로 주소만 바꾸고(화면을 다시
- * 그리지 않음), 뒤로 가기나 링크로 주소가 바뀌면 라우터가 다시 그린다. 처음에는 빈 검색창과 내 키워드 감시 키워드를 빠른 검색 칩으로 보여 준다.
+ * 그리지 않음), 뒤로 가기나 링크로 주소가 바뀌면 라우터가 다시 그린다. 처음에는 빈 검색창과 주요 키워드(관리자가 정한 짧은 목록,
+ * GET /featured-keywords — 감시 키워드 전체는 너무 많아 쓰지 않는다)를 빠른 검색 칩으로 보여 준다.
  * 키가 없거나 INVALID이거나 모드가 off면 메뉴는 그대로 두고 안내만 보여 준다 (GET /naver/status).
  */
 App.route('/naver', async (view, params, query) => {
@@ -127,29 +128,23 @@ App.route('/naver', async (view, params, query) => {
     chipsEl.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c.dataset.k === state.q));
   }
 
+  /** 주요 키워드 칩 (관리자가 정한 짧은 목록). 칩 이름과 검색어가 다르면 검색어로 찾는다 ('DS' → '삼성전자 DS'). */
   async function loadChips() {
-    let watches = [];
+    let items = [];
     try {
-      watches = await api('GET', '/watches');
+      items = ((await api('GET', '/featured-keywords')) || {}).items || [];
     } catch (e) {
-      watches = [];   // 감시를 못 읽어도 검색은 된다
+      items = [];   // 칩을 못 읽어도 검색은 된다
     }
     if (!chipsEl.isConnected) return;
-    const seen = new Set();
-    const keywords = [];
-    (watches || []).forEach(w => (w.keywords || []).forEach(k => {
-      const key = String(k).toLowerCase();
-      if (k && !seen.has(key) && keywords.length < MAX_CHIPS) {
-        seen.add(key);
-        keywords.push(k);
-      }
-    }));
-    if (!keywords.length) {
-      chipsEl.innerHTML = '<span class="muted small">키워드 감시를 만들면 그 키워드가 여기 빠른 검색으로 나옵니다. <a href="#/watches">키워드 감시로 가기</a></span>';
+    const edit = App.isAdmin() ? ' <a href="#/admin/keywords" class="small">주요 키워드 편집</a>' : '';
+    if (!items.length) {
+      chipsEl.innerHTML = `<span class="muted small">주요 키워드가 없습니다.</span>${edit}`;
       return;
     }
-    chipsEl.innerHTML = '<span class="muted small">내 감시 키워드</span>' + keywords.map(k =>
-      `<button type="button" class="chip" data-k="${esc(k)}">${esc(k)}</button>`).join('');
+    chipsEl.innerHTML = '<span class="muted small">주요 키워드</span>' + items.slice(0, MAX_CHIPS).map(k =>
+      `<button type="button" class="chip" data-k="${esc(normalize(k.query))}"
+         ${k.query !== k.label ? `title="검색어: ${esc(k.query)}"` : ''}>${esc(k.label)}</button>`).join('') + edit;
     chipsEl.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
       input.value = c.dataset.k;
       run(c.dataset.k);

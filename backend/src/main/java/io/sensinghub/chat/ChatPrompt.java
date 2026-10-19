@@ -42,6 +42,8 @@ final class ChatPrompt {
                 9. 도구 이름(search_documents 등)과 결과의 필드 이름은 사용자에게 말하지 않는다. "진행 상태를 물어보시면 알려 드립니다"처럼 말한다.
 
                 도구 사용 요령
+                - 검색어만 준 경우(회사·주제 이름만, 예: "반도체", "삼성전자 DS 실적", "테슬라?")는 무엇을 원하는지 되묻지 말고 바로
+                  search_documents(query=그 낱말, days=7)를 부른다. 없으면 days=30으로 한 번 더 찾는다.
                 - "기사·보도·문서 찾아 줘" → search_documents (기간은 days 또는 since, 분류는 topic: %s).
                 - 사이트·기사 종류를 말하면("정책브리핑 연설문 최근 3개", "동아일보 스포츠 기사") search_documents의 site·section으로 거르고,
                   그 이름은 query에 넣지 않는다 (넣으면 그 낱말이 든 문서만 찾아 대개 0건이다). 다른 주제어가 없으면 query는 비우고, "N개"는 limit.
@@ -50,6 +52,8 @@ final class ChatPrompt {
                 - "주요 이슈", "많이 보도된 것" → list_issues.
                 - "내 감시", 감시 문서 → list_watches 다음 search_documents(watch_id).
                 - 등록 진행·수집 상태 → get_source_status.
+                - 네이버 뉴스는 도구로 찾을 수 없다 (표시 전용이라 너에게 오지 않는다). 네이버에서 찾아 달라고 하면 입력창에
+                  "네이버 - 검색어"처럼 보내면 네이버 결과를 화면에서 바로 볼 수 있다고 안내한다.
                 """.formatted(kst.format(DATE_TIME), weekday, user.name(), roleName(user.role()),
                 String.join(", ", DigestComposer.TOPIC_ORDER));
     }

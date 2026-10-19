@@ -68,6 +68,8 @@ public class ChatTools {
     static final int SUMMARY_CHARS = 300;
     static final int SECTION_HINTS = 20;
     static final int MAX_WATCHES = 30;
+    /** 키워드 바로 검색 기간: 먼저 7일, 낱말이 든 문서가 없으면 30일. */
+    static final int[] QUICK_DAYS = {7, 30};
     static final String CREDENTIALS_PATH = "#/admin/credentials";
     static final String CREDENTIALS_GUIDE = "API 키는 채팅으로 받지 않습니다. 관리자가 관리자 메뉴의 'API 키' 화면에서 등록하면 "
             + "그 키를 기다리던 소스가 자동으로 이어서 진행됩니다.";
@@ -395,6 +397,43 @@ public class ChatTools {
             result.put("note", String.join(" ", notes));
         }
         return success(result, null, null);
+    }
+
+    /** 키워드 바로 검색 결과. words: 검색어 낱말이 든 문서 (false면 뜻만 가까운 문서). days: 실제로 찾은 기간. */
+    public record QuickHit(Ref ref, boolean words) {
+    }
+
+    public record QuickResult(List<QuickHit> hits, int days, HybridSearch.Mode mode) {
+    }
+
+    /**
+     * 키워드만 보낸 메시지를 LLM 없이 찾는다 (ChatService). search_documents와 같은 검색(하이브리드, 의미 검색이 없으면 최신순)을
+     * 최근 {@link #QUICK_DAYS}[0]일에서 하고, 낱말이 든 문서가 없으면 {@link #QUICK_DAYS}[1]일로 넓힌다. LLM이 걸러 주지 않으므로
+     * 뜻만 가까운 문서는 낱말이 든 문서 뒤로 보낸다. 근거 번호는 refs에 붙인다.
+     */
+    public QuickResult quickSearch(CurrentUser user, String query, Refs refs) {
+        HybridSearch.Result found = null;
+        int days = QUICK_DAYS[0];
+        for (int d : QUICK_DAYS) {
+            days = d;
+            String from = OffsetDateTime.now(DigestComposer.KST).minusDays(d).toString();
+            found = search.search(user, new Filter(from, null, null, null, null, List.of(), null), query, DEFAULT_DOCUMENTS);
+            if (found.hits().stream().anyMatch(HybridSearch.Hit::words)) {
+                break;
+            }
+        }
+        List<HybridSearch.Hit> ordered = new ArrayList<>(found.hits().stream().filter(HybridSearch.Hit::words).toList());
+        found.hits().stream().filter(h -> !h.words()).forEach(ordered::add);
+        Map<Long, SiteInfo> sites = sites(ordered.stream().map(h -> h.row().sourceId()).distinct().toList());
+        List<QuickHit> hits = new ArrayList<>();
+        for (HybridSearch.Hit hit : ordered) {
+            DocumentRow d = hit.row();
+            SiteInfo site = sites.getOrDefault(d.sourceId(), new SiteInfo("UNKNOWN", null, false));
+            String source = site.name() != null && !site.name().isBlank() ? site.name() : d.domain();
+            int no = refs.document(d.id(), d.title(), d.url(), source, d.publishedAt());
+            hits.add(new QuickHit(refs.get(no), hit.words()));
+        }
+        return new QuickResult(hits, days, found.mode());
     }
 
     /**
