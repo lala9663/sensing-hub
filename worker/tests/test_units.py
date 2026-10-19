@@ -1998,6 +1998,15 @@ def test_portal_message_and_batch_id():
     assert portal_message(2, "portal:7", duplicates=1, over_cap=3).endswith("(이미 등록된 1곳 제외, 상한을 넘은 3곳 제외) [묶음 portal:7]")
 
 
+def test_naver_enabled_reads_watch_mode_and_defaults_to_naver_for_old_configs():
+    from sensing_worker.jobs import naver_enabled
+    assert naver_enabled({"kind": "WATCH", "config": {"naver": False, "keywords": ["a"]}}) is False
+    assert naver_enabled({"kind": "WATCH", "config": {"naver": True}}) is True
+    assert naver_enabled({"kind": "WATCH", "config": {"keywords": ["a"]}}) is True     # V13 이전 감시 = 네이버 모드
+    assert naver_enabled({"kind": "WATCH", "config": None}) is True
+    assert naver_enabled({"kind": "SITE", "config": {"naver": False}}) is True         # 감시가 아니면 해당 없음
+
+
 def test_watch_keywords_match_crawled_documents():
     """긁어 온 기사도 키워드 감시에 대조한다: 대소문자·공백 무시, 제외어는 제목 기준, 감시당 처음 걸린 검색어 하나."""
     from sensing_worker.watchmatch import from_configs, match_keywords

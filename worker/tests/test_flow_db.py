@@ -425,8 +425,12 @@ def test_dart_without_secret_key_or_with_mismatched_key_goes_to_review(env):
 
 # ---------------------------------------------------------------- 키워드 감시 (M2, 네이버 뉴스 검색)
 
-def register_watch(store: Store, name: str, keywords: list[str], exclude: list[str] | None = None, user_id: int = 2) -> int:
-    """백엔드 WatchService.create와 같은 행: site(news.naver.com) + source(kind WATCH) + 설정 v1 + 등록 요청 + ONBOARD."""
+def register_watch(store: Store, name: str, keywords: list[str], exclude: list[str] | None = None, user_id: int = 2,
+                   naver: bool | None = None) -> int:
+    """백엔드 WatchService.create와 같은 행: site(news.naver.com) + source(kind WATCH) + 설정 v1 + 등록 요청 + ONBOARD.
+
+    naver None이면 V13 이전 설정(naver 표시 없음 = 네이버 모드), False면 수집 기사 대조 모드.
+    """
     import json as _json
     c = store.conn
     site_id = c.execute("INSERT INTO site (domain, base_url, risk_flags) VALUES (%s, %s, %s::jsonb) "
@@ -437,6 +441,8 @@ def register_watch(store: Store, name: str, keywords: list[str], exclude: list[s
         "VALUES (%s, %s, 'WATCH', %s, 'API', 'PENDING', 60, %s) RETURNING id",
         (site_id, "watch:" + name, name, user_id)).fetchone()["id"]
     config = {"method": "API", "provider": "naver_news", "keywords": keywords, "exclude": exclude or []}
+    if naver is not None:
+        config["naver"] = naver
     config_id = c.execute(
         "INSERT INTO source_config_version (source_id, version, config, status, change_note, created_by) "
         "VALUES (%s, 1, %s::jsonb, 'ACTIVE', '키워드 감시 생성', %s) RETURNING id",
@@ -496,6 +502,54 @@ def test_keyword_watch_waits_for_naver_key_then_collects_titles_and_hits(env):
     job = q(store, "SELECT found_count, new_count FROM crawl_job ORDER BY id DESC LIMIT 1")
     assert job["found_count"] == 5 and job["new_count"] == 0
     assert q(store, "SELECT count(*) AS c FROM document_watch")["c"] == 5
+
+
+def test_match_mode_watch_needs_no_naver_key_and_hits_crawled_articles(env):
+    """수집 기사 대조 모드(naver false — 네이버 키가 없을 때의 기본): ONBOARD·CRAWL 모두 키를 요구하지 않고,
+    등록된 언론사에서 긁어 온 기사로 감시에 걸린다."""
+    from fakenaver import naver_handler
+    from sensing_worker.jobs import MATCH_MESSAGE
+    store, runner, settings, sites = env
+    handler = naver_handler()
+    api, s = api_runner(store, settings, handler)
+    watch = register_watch(store, "산업", ["103번"], naver=False)
+
+    # 백엔드는 보통 바로 ACTIVE로 두지만, ONBOARD가 남아 있어도(키를 지운 직후 등) 키 없이 대조 모드로 끝낸다
+    assert process_one(store, api, s) == "SUCCESS"
+    assert handler.calls == []
+    src = q(store, "SELECT status, status_reason, next_run_at FROM source WHERE id = %s", watch)
+    assert src["status"] == "ACTIVE" and src["status_reason"] is None and src["next_run_at"] is None
+    reg = q(store, "SELECT status, step, result_message FROM registration_request WHERE source_id = %s", watch)
+    assert (reg["status"], reg["step"], reg["result_message"]) == ("COMPLETED", "DONE", MATCH_MESSAGE)
+    assert q(store, "SELECT count(*) AS c FROM crawl_error")["c"] == 0
+
+    # 관리자 실행·재개로 CRAWL이 들어와도 키를 요구하지 않고, next_run_at을 비워 스케줄러가 다시 넣지 않게 한다
+    store.conn.execute("UPDATE source SET next_run_at = now() WHERE id = %s", (watch,))
+    assert crawl(store, api, s, watch, trigger="MANUAL") == "SUCCESS"
+    assert handler.calls == []
+    src = q(store, "SELECT status, next_run_at FROM source WHERE id = %s", watch)
+    assert src["status"] == "ACTIVE" and src["next_run_at"] is None
+    assert q(store, "SELECT note FROM crawl_job ORDER BY id DESC LIMIT 1")["note"] == "수집 기사 대조 모드: 네이버 검색 없음"
+
+    # 등록된 언론사에서 긁어 온 기사에 대조된다 (네이버 호출 없이)
+    site = Site(news_site_routes()); sites.append(site)
+    register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+    hits = store.conn.execute("SELECT d.title, w.keyword FROM document_watch w JOIN document d ON d.id = w.document_id "
+                              "WHERE w.source_id = %s", (watch,)).fetchall()
+    assert [(h["title"], h["keyword"]) for h in hits] == [("기사 제목 103번 소식", "103번")]
+
+
+def test_naver_mode_watch_still_waits_for_key(env):
+    """naver true(키가 있을 때 만든 감시)는 지금처럼 키를 요구한다 — 키를 지운 사이 실행되면 REVIEW/API_KEY_REQUIRED."""
+    from fakenaver import naver_handler
+    store, _, settings, _ = env
+    handler = naver_handler()
+    api, s = api_runner(store, settings, handler)
+    watch = register_watch(store, "자사", ["메타넷"], naver=True)
+    assert process_one(store, api, s) == "FAILED"
+    src = q(store, "SELECT status, status_reason FROM source WHERE id = %s", watch)
+    assert (src["status"], src["status_reason"]) == ("REVIEW", "API_KEY_REQUIRED")
 
 
 def test_two_watches_share_one_document_with_a_hit_each(env):

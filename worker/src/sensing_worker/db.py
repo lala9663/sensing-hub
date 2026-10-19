@@ -146,6 +146,18 @@ class Store:
             WHERE id = %s
             """, (method, interval_minutes, source_id))
 
+    def activate_match_watch(self, source_id: int) -> None:
+        """수집 기사 대조 모드 감시를 ACTIVE로. next_run_at은 NULL이라 스케줄러가 작업을 넣지 않는다 (백엔드 WatchService.start와 같다)."""
+        self.conn.execute(
+            """
+            UPDATE source SET status = 'ACTIVE', status_reason = NULL, next_run_at = NULL, consecutive_failures = 0,
+                   consecutive_anomalies = 0, updated_at = now()
+            WHERE id = %s
+            """, (source_id,))
+
+    def clear_next_run(self, source_id: int) -> None:
+        self.conn.execute("UPDATE source SET next_run_at = NULL, updated_at = now() WHERE id = %s", (source_id,))
+
     def mark_crawl_result(self, source_id: int, success: bool, interval_minutes: int) -> None:
         if success:
             self.conn.execute(
@@ -353,7 +365,8 @@ class Store:
     def load_watch_keywords(self) -> list[dict]:
         """수집 문서에 대조할 키워드 감시: 제외되지 않은 WATCH 소스의 id와 활성 설정(config: keywords·exclude).
 
-        키가 없어 REVIEW에 멈춘 감시도 포함한다 — 네이버에서 못 받아도 우리가 긁어 온 기사에서는 걸릴 수 있다.
+        수집 기사 대조 모드(config naver false, 네이버 키 없음 — 기본)든 네이버 모드든, 키가 없어 REVIEW에 멈춘 감시든 모두 대조한다
+        — 네이버에서 못 받아도 우리가 긁어 온 기사에서는 걸릴 수 있다.
         """
         return self.conn.execute(
             """

@@ -57,7 +57,7 @@ public class OpsService {
 
     /**
      * 처리량 추정.
-     * @param scheduledRunsPerHour ACTIVE 소스의 시간당 예정 실행 수 (Σ 60/interval_minutes)
+     * @param scheduledRunsPerHour ACTIVE 소스의 시간당 예정 실행 수 (Σ 60/interval_minutes). 수집 기사 대조 모드 키워드 감시(next_run_at NULL)는 실행이 없으므로 뺀다
      * @param completedLastHour    최근 1시간에 끝난 작업 수
      * @param demandRatio          예정/실제. 1을 넘으면 워커가 예정된 수집을 다 소화하지 못한다 (실제 완료가 0이면 null)
      * @param workersShort         워커가 모자란다고 보는 판정 (demandRatio > 1, 또는 완료가 없는데 예정 실행과 대기 작업이 있음)
@@ -77,7 +77,7 @@ public class OpsService {
      * 소스 건강 상태 한 줄. "조용히 멈춘 소스"를 찾기 위한 것이라 마지막 성공이 오래된 순(없는 것이 먼저)으로 준다.
      * @param avgFound   최근 10회 끝난 실행의 평균 기사 후보 수 (실행이 없으면 null)
      * @param avgNew     최근 10회 끝난 실행의 평균 새 문서 수
-     * @param overdue    ACTIVE인데 마지막 성공이 주기의 3배보다 오래됐거나 한 번도 없음
+     * @param overdue    ACTIVE인데 마지막 성공이 주기의 3배보다 오래됐거나 한 번도 없음 (수집 기사 대조 모드 감시는 자체 실행이 없어 제외)
      */
     public record SourceHealth(long id, String kind, String domain, String name, String status, String statusReason,
                                int intervalMinutes, boolean intervalLocked, OffsetDateTime lastSuccessAt,
@@ -108,7 +108,7 @@ public class OpsService {
                 SELECT s.id, s.kind, t.domain, s.name, s.status, s.status_reason, s.interval_minutes, s.interval_locked,
                        s.last_success_at, s.next_run_at, s.consecutive_failures, s.consecutive_anomalies,
                        r.avg_found, r.avg_new, l.status AS last_job_status, COALESCE(l.finished_at, l.started_at) AS last_job_at,
-                       (s.status = 'ACTIVE' AND (s.last_success_at IS NULL
+                       (s.status = 'ACTIVE' AND NOT (s.kind = 'WATCH' AND s.next_run_at IS NULL) AND (s.last_success_at IS NULL
                             OR s.last_success_at < now() - make_interval(mins => s.interval_minutes * 3))) AS overdue
                 FROM source s
                 JOIN site t ON t.id = s.site_id
@@ -215,7 +215,8 @@ public class OpsService {
     }
 
     private Throughput throughput() {
-        double scheduled = jdbc.sql("SELECT COALESCE(sum(60.0 / GREATEST(interval_minutes, 1)), 0) FROM source WHERE status = 'ACTIVE'")
+        double scheduled = jdbc.sql("SELECT COALESCE(sum(60.0 / GREATEST(interval_minutes, 1)), 0) FROM source WHERE status = 'ACTIVE' "
+                + "AND NOT (kind = 'WATCH' AND next_run_at IS NULL)")
                 .query(java.math.BigDecimal.class).single().doubleValue();
         long completed = jdbc.sql("SELECT count(*) FROM crawl_job WHERE finished_at >= now() - interval '1 hour'")
                 .query(Long.class).single();

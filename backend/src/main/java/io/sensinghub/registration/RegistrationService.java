@@ -16,6 +16,7 @@ import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.common.UrlNormalizer;
+import io.sensinghub.watch.WatchService;
 
 /**
  * 사이트 등록. 사용자는 URL만 넣고, 이후 단계(사전 점검·자동 탐색·품질 검사·첫 수집)는
@@ -27,12 +28,15 @@ public class RegistrationService {
     private final JdbcClient jdbc;
     private final AuditLogger audit;
     private final boolean viewerNeedsApproval;
+    private final WatchService watches;
 
     public RegistrationService(JdbcClient jdbc, AuditLogger audit,
-                               @Value("${sensing.registration.viewer-needs-approval}") boolean viewerNeedsApproval) {
+                               @Value("${sensing.registration.viewer-needs-approval}") boolean viewerNeedsApproval,
+                               WatchService watches) {
         this.jdbc = jdbc;
         this.audit = audit;
         this.viewerNeedsApproval = viewerNeedsApproval;
+        this.watches = watches;
     }
 
     public enum Channel { WEB, CHAT }
@@ -94,13 +98,9 @@ public class RegistrationService {
             throw ApiException.conflict("승인 대기 상태가 아닙니다.");
         }
         if (reg.sourceId() != null && isWatch(reg.sourceId())) {
-            // 키워드 감시(WatchService.create가 소스·설정을 먼저 만들어 둔다): 승인은 ONBOARD 작업을 넣는 것뿐이다
-            jdbc.sql("""
-                    INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', 'REGISTRATION')
-                    ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
-                    """).param(reg.sourceId()).update();
-            updateRequest(requestId, "PROCESSING", "QUEUED",
-                    "승인되어 키워드 감시를 시작합니다. 네이버 뉴스 검색 API 키를 확인한 뒤 첫 수집을 합니다.", null);
+            // 키워드 감시(WatchService.create가 소스·설정을 먼저 만들어 둔다): 생성과 같은 규칙으로 시작한다
+            // (네이버 키가 있으면 ONBOARD, 없으면 수집 기사 대조로 바로 ACTIVE)
+            watches.start(admin, reg.sourceId(), requestId, true);
             audit.log(admin.id(), "REGISTRATION_APPROVED", "registration_request", requestId, null);
             return get(requestId);
         }

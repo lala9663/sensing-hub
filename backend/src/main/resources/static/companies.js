@@ -88,7 +88,7 @@
               <td class="right">${c.highSignalCount > 0 ? `<span class="badge badge-red">${c.highSignalCount}</span>` : '0'}</td>
               <td>${c.lastSignal ? `${badge(c.lastSignal.severity)} ${esc(c.lastSignal.title)}<div class="muted small">${badge(c.lastSignal.kind)} ${App.fmtTime(c.lastSignal.observedAt)}</div>` : '<span class="muted">-</span>'}</td>
               <td class="right">${App.fmtNum(c.documentCount)}</td>
-              <td>${badge(c.watchStatus)}${c.watchStatusReason ? `<div class="muted small">${esc(c.watchStatusReason)}</div>` : ''}</td>
+              <td>${App.watchBadge(c.watchStatus, c.watchNaver)}${c.watchStatusReason ? `<div class="muted small">${esc(c.watchStatusReason)}</div>` : ''}</td>
               <td>${badge(c.status)}</td>
             </tr>`).join('')}
           </tbody>
@@ -108,7 +108,7 @@
             externalId: form.externalId.value.trim() || null,
             tags: App.parseList(form.tags.value),
           });
-          App.notice(`"${c.name}" 등록 (#${c.id}). 감시 ${App.label(c.watchStatus)}`);
+          App.notice(`"${c.name}" 등록 (#${c.id}). 감시 ${c.watchStatus === 'ACTIVE' && c.watchNaver === false ? '수집 기사 대조 중' : App.label(c.watchStatus)}`);
           form.reset();
           await load();
         });
@@ -190,7 +190,7 @@
           ${c.externalId ? `<dt>케이던시아</dt><dd>공급사 ID <span class="mono">${esc(c.externalId)}</span>${tierOf(c) ? ` · 등급 <b>${esc(tierOf(c))}</b>` : ''}
             ${App.isAdmin() ? '<a class="small" href="#/admin/caidentia">연동 상태</a>' : ''}</dd>` : '<dt>외부 ID</dt><dd class="muted">-</dd>'}
           <dt>태그</dt><dd>${tags(c.tags) || '-'}</dd>
-          <dt>감시</dt><dd>${badge(c.watchStatus)} ${c.watchStatusReason ? `<span class="muted small">${esc(c.watchStatusReason)}</span>` : ''}
+          <dt>감시</dt><dd>${App.watchBadge(c.watchStatus, c.watchNaver)} ${c.watchStatusReason ? `<span class="muted small">${esc(c.watchStatusReason)}</span>` : ''}
             ${c.watchSourceId && App.isAdmin() ? `<a class="small" href="#/admin/sources/${c.watchSourceId}">소스 #${c.watchSourceId}</a>` : ''}</dd>
           <dt>신호 / HIGH</dt><dd>${App.fmtNum(c.signalCount)} / ${App.fmtNum(c.highSignalCount)}</dd>
           <dt>연결 문서</dt><dd>${App.fmtNum(c.documentCount)}</dd>
