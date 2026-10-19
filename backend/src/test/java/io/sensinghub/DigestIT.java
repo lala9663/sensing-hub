@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -360,11 +361,14 @@ class DigestIT {
                 .get("id").asLong();
         long ga = read(post("registrar", "/api/v1/companies", "{\"name\":\"가전자\"}").getBody()).get("id").asLong();
         jdbc.sql("INSERT INTO document_company (document_id, company_id, matched_by) VALUES (?, ?, 'TAG')").params(s.rival(), ga).update();
+        // created_at은 DB 기본값(now())에 맡기지 않고 JVM 시계로 넣는다. 기간 끝은 JVM의 now라서, WSL 안 DB 시계가
+        // 몇십 ms 앞서 있으면 방금 넣은 신호가 '<= now' 밖으로 밀려 0건이 된다.
+        OffsetDateTime minuteAgo = OffsetDateTime.now().minusMinutes(1);
         jdbc.sql("""
-                INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, observed_at, document_id)
-                VALUES (?, 'NEWS', 'MEDIUM', 'h1', 'A사, 메타넷 추격', '2026-10-16T08:30:00+09:00', ?),
-                       (?, 'BIZ_STATUS', 'HIGH', '0320260930', '폐업자 (폐업일 2026-09-30)', '2026-10-16T06:00:00+09:00', NULL)
-                """).params(ga, s.rival(), nabu).update();
+                INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, observed_at, document_id, created_at)
+                VALUES (?, 'NEWS', 'MEDIUM', 'h1', 'A사, 메타넷 추격', '2026-10-16T08:30:00+09:00', ?, ?),
+                       (?, 'BIZ_STATUS', 'HIGH', '0320260930', '폐업자 (폐업일 2026-09-30)', '2026-10-16T06:00:00+09:00', NULL, ?)
+                """).params(ga, s.rival(), minuteAgo, nabu, minuteAgo).update();
 
         // 전체 구독: 거래처 신호 절이 맨 앞 (HIGH인 나부품 먼저), 그 뒤 감시·토픽 묶음은 그대로
         long all = subscribe("viewer", "전체", "EMAIL", "viewer@example.com", null);
@@ -399,12 +403,14 @@ class DigestIT {
         assertThat(w.get("text").asText()).doesNotContain("거래처 신호");
 
         // 문서는 모두 지난 다이제스트 전에 수집됐고 신호만 새로 생겼다 → 문서 0건이어도 보낸다
+        // (지난 전송·새 신호 시각도 JVM 시계로: 앞의 신호 < last_sent_at < 새 신호 < send-now의 now)
         long hook = subscribe("registrar", "슬랙", "WEBHOOK", hookUrl(), null);
-        jdbc.sql("UPDATE digest_subscription SET last_sent_at = now() WHERE id = ?").param(hook).update();
+        OffsetDateTime lastSent = OffsetDateTime.now().minusSeconds(10);
+        jdbc.sql("UPDATE digest_subscription SET last_sent_at = ? WHERE id = ?").params(lastSent, hook).update();
         jdbc.sql("""
                 INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, observed_at, created_at)
-                VALUES (?, 'BIZ_STATUS', 'HIGH', '02', '휴업자', clock_timestamp(), clock_timestamp())
-                """).param(ga).update();
+                VALUES (?, 'BIZ_STATUS', 'HIGH', '02', '휴업자', ?, ?)
+                """).params(ga, lastSent.plusSeconds(5), lastSent.plusSeconds(5)).update();
         JsonNode run = read(post("registrar", "/api/v1/digests/" + hook + "/send-now", "").getBody());
         assertThat(run.get("status").asText()).isEqualTo("SENT");
         assertThat(run.get("documentCount").asInt()).isZero();
