@@ -176,7 +176,8 @@ public class ChatTools {
                                 + "낱말은 달라도 뜻이 가까운 문서(의미 검색이 켜져 있을 때)를 관련도순으로 준다. 사이트(site, 예: 정책브리핑은 "
                                 + "korea.kr, 동아일보)와 기사 종류(section, 예: 연설문·보도자료·정책뉴스, 언론사는 스포츠·경제 같은 섹션)로 거를 수 "
                                 + "있다. 사이트·종류 이름은 query에 넣지 말고 site·section으로 준다: 다른 주제어가 없으면 query는 비운다 (최신순). "
-                                + "site를 주면 결과의 site_sections에 그 사이트의 기사 종류 이름이 온다. 문서의 match가 "
+                                + "사용자가 종류·섹션을 말하면 정확한 이름이 아니어도 그 낱말을 section에 준다 (도구가 실제 이름에 맞춘다: "
+                                + "'브리핑' → '부처 브리핑'·'청와대 브리핑'). site를 주면 결과의 site_sections에 그 사이트의 기사 종류 이름이 온다. 문서의 match가 "
                                 + "'의미'면 검색어 낱말은 없고 뜻만 가까운 문서다. 각 문서의 ref 번호를 답에 [1]처럼 붙인다. "
                                 + "type이 '언론'인 문서는 제목·분류만 있고 내용은 없다.",
                         object(Map.of(
@@ -184,8 +185,9 @@ public class ChatTools {
                                         + "넣지 않는다. 비우면 다른 조건에 맞는 최신 문서"),
                                 "site", prop("string", "이 사이트의 문서만: 도메인 또는 사이트 이름 (예: 'korea.kr'(정책브리핑), "
                                         + "'yna.co.kr'(연합뉴스), '동아일보'). 도메인이 가장 정확하다"),
-                                "section", prop("string", "이 기사 종류의 문서만 (예: '연설문', '보도자료', '정책뉴스', '스포츠'). "
-                                        + "여럿이면 쉼표로. 정확한 이름을 모르면 site만 주고 결과의 site_sections에서 고른다"),
+                                "section", prop("string", "이 기사 종류의 문서만 (예: '연설문', '보도자료', '정책뉴스', '스포츠', '문화'). "
+                                        + "사용자가 말한 종류 낱말을 그대로 준다: 이름 일부면 그 낱말이 든 종류 모두, 없는 종류면 고를 수 있는 이름이 "
+                                        + "결과에 온다. 여럿이면 쉼표로"),
                                 "days", prop("integer", "최근 며칠 동안 수집한 문서만 (1~90)"),
                                 "since", prop("string", "이 날짜(YYYY-MM-DD, 한국 시각) 이후 수집한 문서만. days보다 우선"),
                                 "topic", enumProp("분류 (이 값 중 하나)", DigestComposer.TOPIC_ORDER),
@@ -373,6 +375,9 @@ public class ChatTools {
         result.put("documents", out);
         if (!siteSections.isEmpty()) {
             result.put("site_sections", top(siteSections, SECTION_HINTS));
+            if (sections.isEmpty()) {   // 실측: '브리핑 자료'를 묻고 site만 주어 종류와 상관없는 최신 문서로 답했다
+                notes.add("종류를 거르지 않은 최신 문서입니다. 질문이 기사 종류(site_sections)를 말했다면 그 이름을 section에 주어 다시 찾으세요.");
+            }
         }
         if (out.isEmpty()) {
             notes.add("조건에 맞는 문서가 없습니다.");
