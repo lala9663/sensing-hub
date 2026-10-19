@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>챗봇 · 외부정보 센싱 허브</title>
+  <link rel="stylesheet" href="app.css">
+  <!-- 챗봇만 있는 새 창 (대화창·전체 화면의 "새 창으로"). chat.html#12 는 대화 12, #new 는 새 대화. 사용자(X-User)는 원래 창과 같다 -->
+</head>
+<body class="chat-popup-page">
+<div id="error-banner" class="error-banner" hidden>
+  <span id="error-text"></span>
+  <button type="button" id="error-close" class="link">닫기</button>
+</div>
+<main id="chat-popup" class="chat-win popup" aria-label="챗봇"></main>
+<script src="app.js"></script>
+<script src="chat.js"></script>
+<script src="chat-dock.js"></script>
+<script>ChatDock.mountPopup(document.getElementById('chat-popup'));</script>
+</body>
+</html>

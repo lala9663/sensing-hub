@@ -286,6 +286,54 @@ a.btn.primary:hover { background: var(--primary-dark); }
 @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
 .chat-input { display: flex; gap: 8px; margin-top: 8px; align-items: flex-end; }
 .chat-input textarea { min-height: 44px; max-height: 160px; resize: vertical; flex: 1; }
+.chat-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.chat-loading, .chat-none { padding: 12px; }
+
+/* 떠 있는 챗봇 버튼과 작은 챗봇 창 (chat-dock.js): 화면 위 대화창(.floating)과 새 창(.popup, chat.html)이 같은 모양을 쓴다.
+   모달(확인 창, z-index 100)이 대화창 위에 뜬다. 버튼이 있으면 본문 아래에 여백을 두어 표의 마지막 줄·열을 버튼 위로 올려 볼 수 있다 */
+.chat-fab {
+  position: fixed; right: 20px; bottom: 20px; z-index: 80;
+  width: 52px; height: 52px; padding: 0; border: none; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--primary); color: #fff; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.3);
+}
+.chat-fab:hover { background: var(--primary-dark); }
+.chat-fab .dot { fill: var(--primary); }
+.chat-fab:hover .dot { fill: var(--primary-dark); }
+.chat-fab:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }
+body.has-chat-fab #content { padding-bottom: 96px; }
+.chat-win { display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+.chat-win.floating {
+  position: fixed; right: 20px; bottom: 20px; z-index: 90;
+  width: 400px; height: 600px; max-width: calc(100vw - 40px); max-height: calc(100vh - 40px);
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+  box-shadow: 0 10px 40px rgba(15, 23, 42, 0.28);
+}
+.chat-win.floating:focus { outline: none; }
+.chat-win-head { padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--border); background: #fafbfc; }
+.chat-win-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.chat-win-title strong { font-size: 15px; }
+.chat-win-title .conv-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-win-title .close { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 20px; line-height: 1; padding: 2px 8px; }
+.chat-win-title .close:hover { color: var(--text); background: var(--grey-bg); }
+.chat-win-tools { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.chat-win-tools button { padding: 2px 9px; font-size: 12px; }
+.chat-win-tools button[aria-pressed="true"] { background: var(--blue-bg); border-color: #bcd3f5; color: var(--primary-dark); }
+.chat-win .chat-warn { margin: 8px 10px 0; }
+.chat-win-notice { margin: 8px 10px 0; padding: 6px 10px; border-radius: 4px; background: var(--green-bg); color: var(--green); font-size: 13px; }
+.chat-win-notice.error { background: var(--red-bg); color: var(--red); }
+.chat-win-list { flex: 1; min-height: 0; overflow: auto; padding: 6px 0; }
+.chat-win-list-head { padding: 2px 14px 4px; }
+.chat-win-list .chat-sessions { border: none; border-radius: 0; padding: 0; overflow: visible; }
+.chat-win-list .chat-session:hover { background: #f7f9fc; }
+.chat-win .chat-log { border: none; border-radius: 0; padding: 8px 12px; }
+.chat-win .chat-input { margin: 0; padding: 8px 10px; border-top: 1px solid var(--border); }
+.chat-win .chat-input textarea { min-height: 40px; max-height: 120px; resize: none; }
+.chat-win .chat-msg .bubble { max-width: 92%; }
+.chat-win .chat-empty { padding: 12px 4px; }
+body.chat-popup-page { height: 100vh; display: flex; flex-direction: column; background: var(--panel); }
+body.chat-popup-page .error-banner { margin: 8px; }
+.chat-win.popup { flex: 1; }
 
 /* 좁은 화면: 메뉴는 위로 접고, 챗봇은 대화 목록을 위에 짧게 둔다 */
 @media (max-width: 760px) {
@@ -298,7 +346,13 @@ a.btn.primary:hover { background: var(--primary-dark); }
   #topbar .user-name { display: none; }
   .chat { flex-direction: column; height: auto; min-height: 0; }
   .chat-side { width: auto; }
-  .chat-sessions { max-height: 120px; }
-  .chat-log { flex: none; height: 58vh; }
+  .chat .chat-sessions { max-height: 120px; }
+  .chat .chat-log { flex: none; height: 58vh; }
   .chat-msg .bubble { max-width: 94%; }
+}
+/* 아주 좁은 화면(휴대폰): 대화창은 화면 전체를 쓴다 */
+@media (max-width: 600px) {
+  .chat-win.floating { inset: 0; width: auto; height: auto; max-width: none; max-height: none; border: none; border-radius: 0; }
+  .chat-fab { right: 14px; bottom: 14px; width: 48px; height: 48px; }
+  body.has-chat-fab #content { padding-bottom: 80px; }
 }
