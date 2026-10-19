@@ -1,21 +1,27 @@
 'use strict';
 
-/** 문서: 기간·토픽 칩, 검색어·소스 필터, 목록과 펼쳐 보는 상세(본문 일부·첨부). */
+/**
+ * 문서: 기간·토픽 칩, 검색어·소스 필터, 목록과 펼쳐 보는 상세(본문 일부·첨부).
+ * #/documents?watch=<감시 ID>(&keyword=<검색어>): 키워드 감시 화면에서 넘어온 "이 감시에 걸린 기사" 보기. 기간 기본값은 전체.
+ */
 App.route('/documents', async (view, params, query) => {
   const { api, esc, badge, tags } = App;
 
   const filter = {
-    period: query.get('period') || '7d',
+    watch: query.get('watch') || '',
+    period: query.get('period') || (query.get('watch') ? 'all' : '7d'),
     topic: query.get('topic') || '',
     q: query.get('q') || '',
     keyword: query.get('keyword') || '',
     sourceId: query.get('source_id') || '',
   };
   const PERIODS = [['today', '오늘'], ['3d', '3일'], ['7d', '7일'], ['all', '전체']];
+  let watchName = '';
 
   view.innerHTML = `
     <h1>문서</h1>
     <div class="panel">
+      <div id="watch-bar"></div>
       <div class="row">
         <span class="muted small">기간(수집 시각)</span>
         <div class="chips" id="period-chips" style="margin:0"></div>
@@ -39,6 +45,40 @@ App.route('/documents', async (view, params, query) => {
     if (filter.period === '3d') return new Date(Date.now() - 3 * 86400000).toISOString();
     if (filter.period === '7d') return new Date(Date.now() - 7 * 86400000).toISOString();
     return '';
+  }
+
+  /** 감시 필터 표시와 해제. 감시 이름은 내 감시(ADMIN은 전체)만 읽을 수 있어, 못 읽으면 번호로 보여 준다. */
+  function renderWatchBar() {
+    const el = view.querySelector('#watch-bar');
+    if (!filter.watch) {
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML = `<div class="filter-bar">
+      <span>감시: <b>${esc(watchName || '#' + filter.watch)}</b>${filter.keyword ? ` · 키워드: <b>${esc(filter.keyword)}</b>` : ''}</span>
+      <span class="muted small">이 감시에 걸린 기사</span>
+      <span style="flex:1"></span>
+      <a class="small" href="#/watches">← 키워드 감시</a>
+      <button type="button" id="watch-clear" class="small">감시 필터 해제</button></div>`;
+    el.querySelector('#watch-clear').addEventListener('click', () => {
+      filter.watch = '';
+      filter.keyword = '';
+      form.keyword.value = '';
+      history.replaceState(null, '', '#/documents' + App.qs({ period: filter.period }));
+      renderWatchBar();
+      App.guard(loadList);
+    });
+  }
+
+  async function loadWatchName() {
+    if (!filter.watch) return;
+    try {
+      const w = await api('GET', `/watches/${encodeURIComponent(filter.watch)}`);
+      watchName = w.name || '';
+    } catch (e) {
+      watchName = '';
+    }
+    renderWatchBar();
   }
 
   function renderPeriodChips() {
@@ -70,17 +110,20 @@ App.route('/documents', async (view, params, query) => {
 
   async function loadList() {
     const list = await api('GET', '/documents' + App.qs({
-      since: since(), topic: filter.topic, q: filter.q, keyword: filter.keyword, source_id: filter.sourceId, limit: 100,
+      since: since(), topic: filter.topic, q: filter.q, watch_id: filter.watch, keyword: filter.keyword,
+      source_id: filter.sourceId, limit: 100,
     }));
     const el = view.querySelector('#list');
     if (!list.length) {
-      el.innerHTML = '<div class="panel"><div class="empty">조건에 맞는 문서가 없습니다.</div></div>';
+      el.innerHTML = `<div class="panel"><div class="empty">조건에 맞는 문서가 없습니다.${filter.watch
+        ? ' 감시는 만든 뒤 새로 수집되는 기사부터 대조합니다.' : ''}</div></div>`;
       return;
     }
-    el.innerHTML = `<div class="panel"><div class="muted small">${list.length}건 (발행일 내림차순${list.length >= 100 ? ', 최대 100건' : ''})</div>
+    el.innerHTML = `<div class="panel"><div class="muted small">${list.length}건 (발행일 내림차순${list.length >= 100 ? ', 최대 100건' : ''})
+      · 제목을 누르면 원문이 새 창에서 열립니다</div>
       ${list.map(d => `
         <div class="doc-item" data-id="${d.id}">
-          <div class="title"><a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(d.title || d.url)}</a></div>
+          <div class="title"><a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer" title="원문 열기 (새 창)">${esc(d.title || d.url)}<span class="ext">원문 ↗</span></a></div>
           <div class="meta">${esc(d.domain)}${d.section ? ' · ' + esc(d.section) : ''} · 발행 ${App.fmtTime(d.publishedAt)} · 수집 ${App.fmtTime(d.collectedAt)}
             ${App.isAdmin() ? ` · <a href="#/admin/sources/${d.sourceId}">소스 #${d.sourceId}</a>` : ` · 소스 #${d.sourceId}`}
             ${d.issueId && d.issueDocCount >= 2 ? ` · <a href="#/issues/${d.issueId}" title="같은 사건을 다룬 기사 묶음">이슈 #${d.issueId} (${d.issueDocCount}건)</a>` : ''}</div>
@@ -126,17 +169,25 @@ App.route('/documents', async (view, params, query) => {
     filter.q = form.q.value.trim();
     filter.keyword = form.keyword.value.trim();
     filter.sourceId = form.sourceId.value.trim();
+    renderWatchBar();
     App.guard(loadList);
   });
   view.querySelector('#clear').addEventListener('click', () => {
+    if (filter.watch) history.replaceState(null, '', '#/documents' + App.qs({ period: filter.period }));
+    filter.watch = '';
     filter.q = '';
     filter.keyword = '';
     filter.sourceId = '';
     filter.topic = '';
     form.reset();
+    form.keyword.value = '';
+    form.q.value = '';
+    form.sourceId.value = '';
+    renderWatchBar();
     App.guard(reload);
   });
 
+  renderWatchBar();
   renderPeriodChips();
-  await App.guard(reload);
+  await Promise.all([loadWatchName(), App.guard(reload)]);
 });

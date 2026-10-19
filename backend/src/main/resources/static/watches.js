@@ -23,6 +23,13 @@ App.route('/watches', async (view) => {
       <div id="list"></div>
     </div>`;
 
+  /** 키워드 태그를 누르면 이 감시에서 그 키워드로 걸린 기사 목록으로 간다 (걸린 기사가 없으면 태그만). */
+  function watchKeywords(w) {
+    if (!(w.documentCount > 0)) return tags(w.keywords);
+    return (w.keywords || []).map(k =>
+      `<a class="tag" href="${esc('#/documents' + App.qs({ watch: w.id, keyword: k }))}" title="이 키워드로 걸린 기사 보기">${esc(k)}</a>`).join('');
+  }
+
   async function load() {
     const list = await api('GET', '/watches');
     const el = view.querySelector('#list');
@@ -36,10 +43,12 @@ App.route('/watches', async (view) => {
         <tbody>${list.map(w => `
           <tr data-id="${w.id}">
             <td><b>${esc(w.name)}</b><div class="muted small">#${w.id}${w.naver ? ` · 네이버 ${w.intervalMinutes}분` : ''} · 설정 v${w.configVersion || '-'}${w.requestedBy ? ' · ' + esc(w.requestedBy) : ''}</div></td>
-            <td>${tags(w.keywords)}</td>
+            <td>${watchKeywords(w)}</td>
             <td>${tags(w.exclude) || '<span class="muted">-</span>'}</td>
             <td>${App.watchBadge(w.status, w.naver)}${w.statusReason ? `<div class="muted small">${esc(w.statusReason)}</div>` : ''}</td>
-            <td class="right">${App.fmtNum(w.documentCount)}</td>
+            <td class="right">${w.documentCount > 0
+              ? `<a href="#/documents${App.qs({ watch: w.id })}" title="이 감시에 걸린 기사 보기">${App.fmtNum(w.documentCount)}</a>`
+              : App.fmtNum(w.documentCount)}</td>
             <td class="nowrap">${App.fmtTime(w.lastSuccessAt)}</td>
             <td>${w.registrationStatus ? badge(w.registrationStatus) : ''}${w.registrationMessage ? `<div class="muted small">${esc(w.registrationMessage)}</div>` : ''}</td>
             <td class="actions">

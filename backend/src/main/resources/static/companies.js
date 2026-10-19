@@ -191,6 +191,7 @@
             ${App.isAdmin() ? '<a class="small" href="#/admin/caidentia">연동 상태</a>' : ''}</dd>` : '<dt>외부 ID</dt><dd class="muted">-</dd>'}
           <dt>태그</dt><dd>${tags(c.tags) || '-'}</dd>
           <dt>감시</dt><dd>${App.watchBadge(c.watchStatus, c.watchNaver)} ${c.watchStatusReason ? `<span class="muted small">${esc(c.watchStatusReason)}</span>` : ''}
+            ${c.watchSourceId ? `<a class="small" href="#/documents${App.qs({ watch: c.watchSourceId })}">감시에 걸린 기사</a>` : ''}
             ${c.watchSourceId && App.isAdmin() ? `<a class="small" href="#/admin/sources/${c.watchSourceId}">소스 #${c.watchSourceId}</a>` : ''}</dd>
           <dt>신호 / HIGH</dt><dd>${App.fmtNum(c.signalCount)} / ${App.fmtNum(c.highSignalCount)}</dd>
           <dt>연결 문서</dt><dd>${App.fmtNum(c.documentCount)}</dd>

@@ -78,8 +78,12 @@ public class DocumentService {
             LEFT JOIN issue i ON i.id = idoc.issue_id
             """;
 
-    public List<DocumentRow> list(CurrentUser user, String since, Long sourceId, String topic, String keyword,
-                                  String q, Integer limit) {
+    /**
+     * watchId: 그 감시(document_watch.source_id)에 걸린 문서만. keyword와 함께 주면 그 감시에서 그 검색어로 걸린 문서만
+     * (document_watch 한 행이 둘 다 만족해야 한다). 문서 목록은 VIEWER 누구나 읽으므로 감시 소유자를 따지지 않는다.
+     */
+    public List<DocumentRow> list(CurrentUser user, String since, Long sourceId, String topic, Long watchId,
+                                  String keyword, String q, Integer limit) {
         user.require(Role.VIEWER);
         StringBuilder sql = new StringBuilder(ROW_SQL).append(" WHERE 1 = 1");
         List<Object> params = new ArrayList<>();
@@ -96,9 +100,18 @@ public class DocumentService {
             sql.append(" AND e.topics @> CAST(? AS jsonb)");
             params.add(toJson(List.of(topic.trim())));
         }
-        if (keyword != null && !keyword.isBlank()) {
-            sql.append(" AND EXISTS (SELECT 1 FROM document_watch w WHERE w.document_id = d.id AND w.keyword = ?)");
-            params.add(keyword.trim());
+        boolean hasKeyword = keyword != null && !keyword.isBlank();
+        if (watchId != null || hasKeyword) {
+            sql.append(" AND EXISTS (SELECT 1 FROM document_watch w WHERE w.document_id = d.id");
+            if (watchId != null) {
+                sql.append(" AND w.source_id = ?");
+                params.add(watchId);
+            }
+            if (hasKeyword) {
+                sql.append(" AND w.keyword = ?");
+                params.add(keyword.trim());
+            }
+            sql.append(")");
         }
         if (q != null && !q.isBlank()) {
             appendSearch(sql, params, q);
