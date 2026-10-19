@@ -227,7 +227,7 @@ POLICY_KINDS = (
     ("brief", "/briefing/pressReleaseView.do", "보도자료", 8, "good"),
     ("policy", "/news/policyNewsView.do", "정책뉴스", 6, "good"),
     ("briefing", "/briefing/presidentView.do", "청와대 브리핑", 4, "good"),
-    ("briefing", "/briefing/policyBriefingView.do", "부처 브리핑", 3, "good"),
+    ("briefing", "/briefing/policyBriefingView.do", "부처 브리핑", 3, "nodate"),   # 상세에 발행일이 없다 (사이트맵 lastmod뿐)
     ("speech", "/briefing/speechView.do", "연설문", 3, "thin"),       # 본문이 짧아 품질 검사에 떨어진다
     ("cartoon", "/multi/cartoonView.do", "카툰", 4, "good"),          # 기사가 아닌 종류 (기본 꺼짐)
 )
@@ -237,20 +237,24 @@ def policy_kind_ids(kind_index: int, count: int) -> list[int]:
     return [10000 * (kind_index + 1) + i for i in range(1, count + 1)]
 
 
-def multi_kind_routes(counts: dict[str, int] | None = None) -> dict:
+def multi_kind_routes(counts: dict[str, int] | None = None, nodate_lastmod: bool = True) -> dict:
     """사이트맵 색인이 기사 종류별 하위 사이트맵으로 나뉜 사이트. RSS는 없다. 하위 sitemap_briefing에는 두 모양이 섞여 있다.
-    상세 <title>은 "글 제목 - 종류 | 뉴스 | 사이트 이름" 꼴이다. counts로 종류(상세 경로)별 글 수를 바꾼다. 주소의 {base}는 호출자가 채운다."""
+    상세 <title>은 "글 제목 - 종류 | 뉴스 | 사이트 이름" 꼴이다. counts로 종류(상세 경로)별 글 수를 바꾼다. 주소의 {base}는 호출자가 채운다.
+    부처 브리핑 상세에는 발행일이 없어 사이트맵 lastmod가 유일한 날짜다. nodate_lastmod=False면 그 lastmod도 뺀다."""
     counts = counts or {}
+    no_lastmod: set[str] = set()
     children: dict[str, list[tuple[str, float]]] = {}
     pages: dict[str, str] = {}
     for k, (child, path, name, n, quality) in enumerate(POLICY_KINDS):
         for j, i in enumerate(policy_kind_ids(k, counts.get(path, n))):
             url = f"{path}?newsId={i}"
             children.setdefault(child, []).append((url, j * 0.1))
-            body = f"<p>{BODY}</p>" if quality == "good" else "<p>짧은 안내입니다.</p>"
+            body = "<p>짧은 안내입니다.</p>" if quality == "thin" else f"<p>{BODY}</p>"
+            date = "" if quality == "nodate" else f'<meta property="article:published_time" content="{_iso(1)}">'
+            if quality == "nodate" and not nodate_lastmod:
+                no_lastmod.add(url)
             pages[url] = f"""<html><head><title>{name} 글 {i}번 안내 - {name} | 뉴스 | 테스트 정책브리핑</title>
-            <meta property="og:title" content="{name} 글 {i}번 안내">
-            <meta property="article:published_time" content="{_iso(1)}"></head><body><article>{body}</article></body></html>"""
+            <meta property="og:title" content="{name} 글 {i}번 안내">{date}</head><body><article>{body}</article></body></html>"""
     children["list"] = [("/news/policyNewsList.do", 30), ("/briefing/pressReleaseList.do", 30)]
     # 정책뉴스 목록 화면: 정책뉴스 글(등록일 포함)과 옆 칸의 보도자료 링크 2개. 실제 사이트처럼 글 링크 절반에는 사이트 자체
     # 추적 파라미터(pWise·pWiseSub)가 붙어 있다
@@ -273,7 +277,8 @@ def multi_kind_routes(counts: dict[str, int] | None = None) -> dict:
               "/sitemapindex.xml": (200, "application/xml", index)}
     for child, entries in children.items():
         routes[f"/sitemap_{child}.xml"] = (200, "application/xml", "<?xml version='1.0'?><urlset>" + "".join(
-            f"<url><loc>{{base}}{u}</loc><lastmod>{_iso(age)}</lastmod></url>" for u, age in entries) + "</urlset>")
+            f"<url><loc>{{base}}{u}</loc>" + ("" if u in no_lastmod else f"<lastmod>{_iso(age)}</lastmod>") + "</url>"
+            for u, age in entries) + "</urlset>")
     for url, html in pages.items():
         routes[url] = (200, "text/html; charset=utf-8", html)
     return routes

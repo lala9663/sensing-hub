@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import Counter
+from collections import ChainMap, Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -20,7 +20,7 @@ from .discovery import (BOARD_PARAM, BOARD_VALUE, MAX_LISTED_KINDS, MIN_KIND_URL
                         Discoverer, DiscoveryResult, KindCandidate, article_kinds, board_value, canonical_article_url,
                         covered, hubs_for, is_non_article_kind, is_site_root, kind_entry, kind_name, looks_like_feed,
                         looks_like_sitemap, matches, page_title, parse_feed_entries, path_stem, rank_kinds, same_site,
-                        samples_with_dates, share_quota, sitemap_urls, split_by_board, unique_names, with_board)
+                        samples_with_dates, share_quota, sitemap_entries, split_by_board, unique_names, with_board)
 from .evidence import EvidenceStore
 from .extract import Article, extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, Page, PoliteFetcher
@@ -304,7 +304,9 @@ class JobRunner:
             pool = [u for u in links if matches(u, target)]
             if not pool:
                 hub_page = self.f.get(target["hubs"][0])
-                pool = [u for u, _ in page_entries(self.f, hub_page) if matches(u, target)]
+                hub_entries = [(u, d) for u, d in page_entries(self.f, hub_page) if matches(u, target)]
+                pool = [u for u, _ in hub_entries]
+                hints = {**{u: d for u, d in hub_entries if d}, **hints}   # 허브가 사이트맵이면 lastmod
             sample_urls, dates = samples_with_dates(pool, target, hints)
             trial = DiscoveryResult("STATIC", target["hubs"], target, sections, [], sample_urls[:10], [], domain, dates,
                                     selectors=config.get("selectors") or {}, date_format=config.get("date_format"))
@@ -488,6 +490,7 @@ class JobRunner:
 
         # 허브 열기
         entries_by_hub: dict[str, list[tuple[str, str | None]]] = {}
+        sitemap_hubs: set[str] = set()   # 날짜가 lastmod인 허브 (목록·피드 날짜보다 약한 힌트)
         first_hub_html: str | None = None
         hub_failures: list[CrawlFailure] = []  # 못 연 허브의 비차단 오류 (섹션 하나가 404여도 수집은 계속한다)
         for hub in hubs:
@@ -505,6 +508,8 @@ class JobRunner:
                 continue
             first_hub_html = first_hub_html if first_hub_html is not None else page.text
             entries_by_hub[hub] = page_entries(self.f, page, self.s.max_articles_per_run * 3)
+            if looks_like_sitemap(page.text):
+                sitemap_hubs.add(hub)
         if not entries_by_hub and hub_failures:
             # 허브를 하나도 못 열었다 → 마지막 오류로 실패 처리 (run()이 기록·반영). 앞의 오류는 여기서 남긴다
             for hf in hub_failures[:-1]:
@@ -516,21 +521,25 @@ class JobRunner:
 
         # 종류마다 자기 허브에서 자기 모양의 주소 (앞 종류가 가져간 주소는 뒤 종류에 넣지 않는다)
         groups: list[list[str]] = []
-        hints: dict[str, str] = {}  # 기사 URL → 목록·피드에 보인 날짜 (상세에 날짜가 없을 때 씀)
+        # 기사 URL → 목록·피드에 보인 날짜 / 사이트맵 lastmod. 상세 페이지에 날짜가 전혀 없을 때만 쓰고, 목록·피드 날짜를 먼저 쓴다
+        strong: dict[str, str] = {}
+        weak: dict[str, str] = {}
         taken: set[str] = set()
         for kind in kinds:
             group: list[str] = []
             for hub in kind["hubs"]:
+                into = weak if hub in sitemap_hubs else strong
                 for u, date in entries_by_hub.get(hub, ()):
                     if not (same_site(u, domain) and matches(u, kind)):
                         continue
                     c = canonical_article_url(u, kind)
-                    if date and c not in hints:
-                        hints[c] = date
+                    if date and c not in into:
+                        into[c] = date
                     if c not in taken:
                         taken.add(c)
                         group.append(c)
             groups.append(group)
+        hints = ChainMap(strong, weak)
         stats.found = len(taken)
 
         hub_evidence = (first_hub_html or "")[:EVIDENCE_CHARS] or None
@@ -982,11 +991,11 @@ def absolute_url(url: str) -> str:
 
 
 def page_entries(f: PoliteFetcher, page: Page, limit: int = 500) -> list[tuple[str, str | None]]:
-    """허브 한 장의 (주소, 목록·피드에 보인 날짜): 피드·사이트맵(색인이면 최신 하위 몇 개)·HTML 목록."""
+    """허브 한 장의 (주소, 목록·피드에 보인 날짜): 피드·사이트맵(색인이면 최신 하위 몇 개, 날짜는 lastmod)·HTML 목록."""
     if looks_like_feed(page.text):
         return parse_feed_entries(page.text)
     if looks_like_sitemap(page.text):
-        return [(u, None) for u in sitemap_urls(f.get, page.text)[:limit]]
+        return sitemap_entries(f.get, page.text)[:limit]
     return links_with_dates(page.text, page.url)
 
 

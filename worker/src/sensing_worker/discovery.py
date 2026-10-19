@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
-from collections.abc import Iterator
+from collections import ChainMap, Counter, defaultdict
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from html import unescape
 from urllib.parse import parse_qsl, urljoin, urlsplit
@@ -149,7 +149,8 @@ def canonical_article_url(url: str, pattern: dict) -> str:
     return f"{parts.scheme}://{parts.netloc}{path}" + (f"?{qs}" if qs else "")
 
 
-def samples_with_dates(urls: list[str], pattern: dict, hints: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+def samples_with_dates(urls: list[str], pattern: dict,
+                       hints: Mapping[str, str]) -> tuple[list[str], dict[str, str]]:
     """패턴에 맞는 후보(목록에 날짜가 보이는 것부터)와 그 날짜. hints: 원래 주소 → 목록·피드에서 본 날짜."""
     seen: set[str] = set()
     hinted, rest, dates = [], [], {}
@@ -235,6 +236,12 @@ def sitemap_urls(get, xml: str, max_children: int = 3) -> list[str]:
 
     get: url -> Page | None (탐색은 페이지 한도를 지키는 Discoverer._get, 수집은 fetcher.get)
     """
+    return [u for u, _ in sitemap_entries(get, xml, max_children)]
+
+
+def sitemap_entries(get, xml: str, max_children: int = 3) -> list[tuple[str, str | None]]:
+    """sitemap_urls와 같되 (주소, lastmod | None). lastmod는 상세 페이지에 발행일이 전혀 없을 때만 쓰는 약한 날짜 힌트다
+    (수정일이라 발행일보다 늦을 수 있다 — 정책브리핑 부처 브리핑처럼 상세에 날짜가 없는 종류를 위해)."""
     urls, children = parse_sitemap_entries(xml)
     out = list(urls)
     for child, _ in children[:max_children]:
@@ -242,7 +249,11 @@ def sitemap_urls(get, xml: str, max_children: int = 3) -> list[str]:
         if page:
             out += parse_sitemap_entries(page.text)[0]
     out.sort(key=lambda e: (e[1] == "", -_lastmod_key(e[1])))
-    return list(dict.fromkeys(u for u, _ in out))
+    first: dict[str, str | None] = {}
+    for u, lm in out:
+        if u not in first:
+            first[u] = lm or None
+    return list(first.items())
 
 
 def looks_like_feed(text: str) -> bool:
@@ -261,6 +272,7 @@ class Discoverer:
         self.pages = 0
         self.notes: list[str] = []
         self.hints: dict[str, str] = {}  # 후보 URL → 목록·피드에서 본 날짜
+        self.weak_hints: dict[str, str] = {}  # 후보 URL → 사이트맵 lastmod (목록·피드 날짜가 없을 때만 쓴다)
         self.home = None                  # 홈 페이지(Page). LLM 레시피 생성이 다시 받지 않고 쓴다
         self.sections: list[dict] = []
         self.excluded: list[str] = []
@@ -333,7 +345,9 @@ class Discoverer:
             page = self._get_sitemap(sm)
             if not page:
                 continue
-            urls = [u for u in sitemap_urls(self._get_sitemap, page.text) if same_site(u, self.domain)]
+            entries = [(u, lm) for u, lm in sitemap_entries(self._get_sitemap, page.text) if same_site(u, self.domain)]
+            self._remember(entries, weak=True)
+            urls = [u for u, _ in entries]
             # 최근 항목 안에서 패턴을 고른다: 오래된 대용량 카테고리가 최신 기사 패턴을 가리지 않게
             for pattern in self._ranked_patterns(urls[:500], 2):
                 yield self._result("SITEMAP", [sm], pattern, sections, excluded, urls)
@@ -354,10 +368,12 @@ class Discoverer:
             hubs = [home.url] + [s["url"] for s in kept[:15] if not matches(s["url"], pattern)]
             yield self._result("STATIC", hubs, pattern, sections, excluded, candidates)
 
-    def _remember(self, entries: list[tuple[str, str | None]]) -> None:
+    def _remember(self, entries: list[tuple[str, str | None]], weak: bool = False) -> None:
+        """목록·피드에 보인 날짜를 기억한다. weak: 사이트맵 lastmod — 목록·피드 날짜가 없는 주소에만 쓴다."""
+        target = self.weak_hints if weak else self.hints
         for url, date in entries:
-            if date and url not in self.hints:
-                self.hints[url] = date
+            if date and url not in target:
+                target[url] = date
 
     def kind_pools(self, result: DiscoveryResult) -> list[tuple[str, list[str], str]]:
         """result를 낸 입구 단계에서 본 (허브, 그 허브의 주소들, 이름표) 묶음. 기사 종류 후보의 재료다.
@@ -376,6 +392,7 @@ class Discoverer:
                 continue
             urls, children = parse_sitemap_entries(page.text)
             if not children:
+                self._remember(urls, weak=True)
                 pools.append((root, [u for u, _ in urls if same_site(u, self.domain)], ""))
                 continue
             groups: dict[str, list[str]] = {}
@@ -385,7 +402,9 @@ class Discoverer:
                 child_page = self._get_kind_sitemap(group[0])
                 if not child_page:
                     continue
-                entries = [u for u, _ in parse_sitemap_entries(child_page.text)[0] if same_site(u, self.domain)]
+                child_entries = parse_sitemap_entries(child_page.text)[0]
+                self._remember(child_entries, weak=True)
+                entries = [u for u, _ in child_entries if same_site(u, self.domain)]
                 single = len(group) == 1
                 pools.append((group[0] if single else root, entries, sitemap_label(group[0]) if single else ""))
         return pools
@@ -414,7 +433,7 @@ class Discoverer:
                                self.domain, dates)
 
     def _samples(self, urls: list[str], pattern: dict) -> tuple[list[str], dict[str, str]]:
-        return samples_with_dates(urls, pattern, self.hints)
+        return samples_with_dates(urls, pattern, ChainMap(self.hints, self.weak_hints))
 
     def _find_feeds(self, html: str, base: str) -> list[str]:
         found = [u for u in feed_links(html, base) if same_site(u, self.domain)]

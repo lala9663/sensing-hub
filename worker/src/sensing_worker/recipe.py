@@ -20,7 +20,7 @@ from .codes import Code, CrawlFailure
 from .config import Settings
 from .discovery import (SKIP_PATH, Discoverer, DiscoveryResult, canonical_article_url, has_identifier, looks_like_feed,
                         looks_like_sitemap, matches, parse_feed_entries, pattern_from_signature, same_site, signature,
-                        sitemap_urls)
+                        sitemap_entries)
 from .extract import links_with_dates
 from .fetcher import PoliteFetcher
 from .llm import Generation, LlmClient, describe, generate_recipe
@@ -268,7 +268,7 @@ def propose_recipe(f: PoliteFetcher, llm: LlmClient, settings: Settings, disc: D
             entries = parse_feed_entries(page.text)
         elif looks_like_sitemap(page.text):
             kinds.add("SITEMAP")
-            entries = [(u, None) for u in sitemap_urls(f.get, page.text)[:500]]
+            entries = sitemap_entries(f.get, page.text)[:500]
         else:
             kinds.add("STATIC")
             entries = links_with_dates(page.text, page.url)

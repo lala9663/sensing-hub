@@ -989,6 +989,66 @@ def test_discover_turns_on_only_top_kinds_and_can_skip_kind_search():
         site.close()
 
 
+def test_sitemap_lastmod_turns_on_a_kind_whose_detail_pages_have_no_date():
+    from fakesite import Site, multi_kind_routes, with_base
+    for lastmod, enabled in ((True, True), (False, False)):
+        site = Site({})
+        site.routes.update(with_base(multi_kind_routes(nodate_lastmod=lastmod), site.base))
+        f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+        try:
+            result, _ = discover(f, "127.0.0.1", site.base, "PUBLIC")
+            briefing = _kinds_by_path(result.kinds)["/briefing/policyBriefingView.do"]
+            assert briefing["enabled"] is enabled                     # 부처 브리핑 상세에는 발행일이 없다
+            if not enabled:
+                assert "품질 검사 불합격" in briefing["note"] and "0건만" in briefing["note"]
+        finally:
+            f.close()
+            site.close()
+
+
+def test_crawl_uses_sitemap_lastmod_only_when_nothing_better(tmp_path):
+    from fakesite import Site
+    from sensing_worker.db import Job
+    from sensing_worker.jobs import JobRunner
+
+    def detail(meta: str = "") -> tuple[int, str, str]:
+        return 200, "text/html; charset=utf-8", (f"<html><head><title>글</title><meta property='og:title' content='글 제목'>"
+                                                 f"{meta}</head><body><article><p>{'본문 ' * 120}</p></article></body></html>")
+    site = Site({})
+    site.routes.update({
+        "/robots.txt": (404, "text/plain", ""),
+        "/sitemap.xml": (200, "application/xml", "<?xml version='1.0'?><urlset>"
+                         f"<url><loc>{site.base}/a/1</loc><lastmod>2026-10-16</lastmod></url>"
+                         f"<url><loc>{site.base}/a/2</loc><lastmod>2026-10-18</lastmod></url>"
+                         f"<url><loc>{site.base}/a/3</loc></url>"
+                         f"<url><loc>{site.base}/a/4</loc><lastmod>2026-10-16</lastmod></url></urlset>"),
+        "/list": (200, "text/html; charset=utf-8", "<html><body><ul><li><a href='/a/1'>글 1</a><span>2026.10.15</span></li>"
+                                                   "</ul></body></html>"),
+        "/a/1": detail(), "/a/3": detail(), "/a/4": detail(),
+        "/a/2": detail("<meta property='article:published_time' content='2026-10-10T09:00:00+09:00'>"),
+    })
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True, evidence_dir=str(tmp_path))
+    store = MagicMock()
+    store.found_baseline.return_value = None
+    store.known_urls.return_value = set()
+    store.upsert_document.return_value = (1, "NEW")
+    runner = JobRunner(store, PoliteFetcher(s), s, llm=NoLlm())
+    job = Job(id=7, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=None, attempt=1)
+    config = {"method": "SITEMAP", "site_domain": "127.0.0.1", "hubs": [f"{site.base}/sitemap.xml", f"{site.base}/list"],
+              "article_pattern": pattern_from_signature("/a/{n}")}
+    kst = timezone(timedelta(hours=9))
+    try:
+        runner._crawl(job, {"domain": "127.0.0.1", "active_config_version_id": None}, config)
+        published = {c.kwargs["url"].rsplit("/", 1)[1]: c.kwargs["published_at"] for c in store.upsert_document.call_args_list}
+        assert published["1"] == datetime(2026, 10, 15, tzinfo=kst)       # 목록 행 날짜가 lastmod보다 먼저
+        assert published["2"] == datetime(2026, 10, 10, 9, tzinfo=kst)    # 상세의 발행일이 가장 먼저
+        assert published["3"] is None                                      # 날짜가 어디에도 없다
+        assert published["4"] == datetime(2026, 10, 16, tzinfo=kst)        # 상세에 날짜가 없으면 lastmod (한국 시간 자정)
+    finally:
+        runner.f.close()
+        site.close()
+
+
 def test_multi_kind_heuristic_result_skips_llm_recipe():
     site = _policy_site()
     llm = FakeLlm([portal_recipe(site.base)])
