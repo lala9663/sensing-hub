@@ -4,6 +4,7 @@ import static io.sensinghub.llm.MockLlmServer.vector;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
+import java.util.Map;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -20,6 +21,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
+import io.sensinghub.document.DocumentService.Filter;
 import io.sensinghub.document.HybridSearch.Hit;
 import io.sensinghub.document.HybridSearch.Mode;
 import io.sensinghub.document.HybridSearch.Result;
@@ -81,10 +83,33 @@ class HybridSearchIT {
     }
 
     private long siteSource(String domain, String siteType) {
+        return siteSource(domain, siteType, domain);
+    }
+
+    private long siteSource(String domain, String siteType, String name) {
         long siteId = jdbc.sql("INSERT INTO site (domain, base_url, site_type, name) VALUES (?, ?, ?, ?) RETURNING id")
-                .params(domain, "https://" + domain, siteType, domain).query(Long.class).single();
+                .params(domain, "https://" + domain, siteType, name).query(Long.class).single();
         return jdbc.sql("INSERT INTO source (site_id, name, status) VALUES (?, ?, 'ACTIVE') RETURNING id")
                 .params(siteId, domain).query(Long.class).single();
+    }
+
+    private static Filter since(String since) {
+        return new Filter(since, null, null, null, null, null, null);
+    }
+
+    private static Filter sections(String... sections) {
+        return new Filter(null, null, null, null, null, List.of(sections), null);
+    }
+
+    private static Filter site(String site) {
+        return new Filter(null, null, null, null, null, null, site);
+    }
+
+    /** 기사 종류(document.section)가 있는 문서. */
+    private long document(long sourceId, String url, String title, int daysAgo, String section) {
+        long id = document(sourceId, url, title, daysAgo);
+        jdbc.sql("UPDATE document SET section = ? WHERE id = ?").params(section, id).update();
+        return id;
     }
 
     /** 색인 전 문서(전문 검색은 제목 부분 일치)를 daysAgo일 전에 수집·발행한 것으로 넣는다. */
@@ -150,7 +175,7 @@ class HybridSearchIT {
         HybridSearch s = search(embedder(MODEL));
 
         // 낱말(최신순): a, b, f   의미(유사도순): g 0.95, c 0.9, b 0.8   → b(양쪽), a·g(1위 동점, 낱말 먼저), c, f
-        Result all = s.search(VIEWER, null, null, null, "반도체", 10);
+        Result all = s.search(VIEWER, Filter.NONE, "반도체", 10);
         assertThat(all.mode()).isEqualTo(Mode.HYBRID);
         assertThat(titles(all)).containsExactly("반도체 장비 국산화 지원사업 공고", "반도체 수출 사상 최대", "AI 칩 공급망 재편",
                 "안세영, 덴마크오픈 우승", "반도체 업황 전망");
@@ -161,34 +186,111 @@ class HybridSearchIT {
         assertThat(EMBED.requests().get(0).body().path("model").asText()).isEqualTo(MODEL);
 
         // 수집 시각 조건은 의미 후보에도 걸린다 (10일 전 g·f 제외)
-        Result recent = s.search(VIEWER, java.time.OffsetDateTime.now().minusDays(5).toString(), null, null, "반도체", 10);
+        Result recent = s.search(VIEWER, since(java.time.OffsetDateTime.now().minusDays(5).toString()), "반도체", 10);
         assertThat(titles(recent)).containsExactly("반도체 장비 국산화 지원사업 공고", "반도체 수출 사상 최대", "안세영, 덴마크오픈 우승");
 
-        Result top2 = s.search(VIEWER, null, null, null, "반도체", 2);
+        Result top2 = s.search(VIEWER, Filter.NONE, "반도체", 2);
         assertThat(titles(top2)).containsExactly("반도체 장비 국산화 지원사업 공고", "반도체 수출 사상 최대");
 
         // 검색어가 없으면 임베딩 없이 최신 문서
-        Result latest = s.search(VIEWER, null, null, null, "  ", 3);
+        Result latest = s.search(VIEWER, Filter.NONE, "  ", 3);
         assertThat(latest.mode()).isEqualTo(Mode.LATEST);
         assertThat(latest.hits()).hasSize(3).noneMatch(Hit::words);
         assertThat(EMBED.requests()).hasSize(3);
     }
 
+    /** 사이트 하나에 기사 종류 여럿(korea.kr처럼 사이트 이름이 비어 있다)과 이름이 비슷한 언론사들. */
+    private void kinds() {
+        long korea = siteSource("korea.kr", "PUBLIC", null);
+        long donga = siteSource("donga.com", "NEWS", "동아일보");
+        long hk = siteSource("hankyung.com", "NEWS", "한국경제");
+        long hktv = siteSource("wowtv.co.kr", "NEWS", "한국경제TV");
+        long s1 = document(korea, "https://korea.kr/s1", "제107회 전국체육대회 기념사", 3, "연설문");
+        chunk(s1, 0, "제107회 전국체육대회 기념사", vector(0, 0.7f, 1, 0.71414f), MODEL);
+        long s2 = document(korea, "https://korea.kr/s2", "제44기 대통령기 이북도민 체육대회 축사", 1, "연설문");
+        chunk(s2, 0, "제44기 대통령기 이북도민 체육대회 축사", vector(0, 0.6f, 1, 0.8f), MODEL);
+        long p = document(korea, "https://korea.kr/p", "체육대회 안전관리 강화", 2, "보도자료");
+        chunk(p, 0, "체육대회 안전관리 강화", vector(0, 0.8f, 1, 0.6f), MODEL);
+        document(korea, "https://korea.kr/n", "생활체육 지원 확대", 4, "정책뉴스");
+        long sports = document(donga, "https://donga.com/1", "전국체전 개막", 1, "스포츠");
+        chunk(sports, 0, "전국체전 개막", vector(0, 0.95f, 2, 0.31225f), MODEL);    // 가장 가깝지만 다른 사이트·종류
+        document(hk, "https://hankyung.com/1", "스포츠 산업 투자", 1, "경제");
+        document(hktv, "https://wowtv.co.kr/1", "스포츠 중계권", 1, null);
+    }
+
+    private List<String> listed(Filter filter, String q) {
+        return documents.list(VIEWER, filter, q, 20).stream().map(DocumentService.DocumentRow::title).toList();
+    }
+
+    @Test
+    void sectionAndSiteFilterTheListTheSemanticCandidatesAndTheSectionCounts() {
+        kinds();
+        // 기사 종류: 정확 일치, 여럿이면 그중 하나 (발행일 최신순)
+        assertThat(listed(sections("연설문"), null))
+                .containsExactly("제44기 대통령기 이북도민 체육대회 축사", "제107회 전국체육대회 기념사");
+        assertThat(listed(sections("연설문", "보도자료"), null)).hasSize(3);
+        assertThat(listed(sections("연설"), null)).isEmpty();
+        assertThat(listed(sections("연설문"), "체육대회")).hasSize(2);
+
+        // 사이트: 도메인(주소·www·대소문자 무시) 또는 이름(공백 무시), 통째로 같은 이름이 있으면 그것만, 없으면 부분 일치
+        assertThat(listed(site("korea.kr"), null)).hasSize(4);
+        assertThat(listed(site("https://www.KOREA.kr/news/policyNewsList.do"), null)).hasSize(4);
+        assertThat(listed(site("동아 일보"), null)).containsExactly("전국체전 개막");
+        assertThat(listed(site("한국경제"), null)).containsExactly("스포츠 산업 투자");
+        assertThat(listed(site("한국"), null)).containsExactlyInAnyOrder("스포츠 산업 투자", "스포츠 중계권");
+        assertThat(listed(site("정책브리핑"), null)).isEmpty();               // 이름이 없는 사이트는 도메인으로만
+        assertThat(documents.matchSites("kr")).extracting(DocumentService.SiteMatch::domain)
+                .containsExactly("gov.example.go.kr", "korea.kr", "wowtv.co.kr");
+        assertThat(listed(new Filter(null, null, null, null, null, List.of("연설문", "스포츠"), "korea.kr"), null))
+                .hasSize(2);
+
+        // 종류별 건수: 많은 순, 같으면 이름순. 조건(사이트)을 건다
+        assertThat(documents.sectionCounts(VIEWER, site("korea.kr")))
+                .containsExactly(Map.entry("연설문", 2L), Map.entry("보도자료", 1L), Map.entry("정책뉴스", 1L));
+        assertThat(documents.sectionCounts(VIEWER, Filter.NONE)).hasSize(5).doesNotContainKey(null);
+
+        // 하이브리드: 의미 후보에도 같은 조건 (가장 가까운 동아일보 '전국체전 개막'은 빠진다)
+        EMBED.then(Reply.ok(MockLlmServer.openAiEmbedding(vector(0, 1))))
+                .then(Reply.ok(MockLlmServer.openAiEmbedding(vector(0, 1))));
+        HybridSearch s = search(embedder(MODEL));
+        Result speeches = s.search(VIEWER, new Filter(null, null, null, null, null, List.of("연설문"), "korea.kr"), "개막", 10);
+        assertThat(speeches.mode()).isEqualTo(Mode.HYBRID);
+        assertThat(titles(speeches)).containsExactly("제107회 전국체육대회 기념사", "제44기 대통령기 이북도민 체육대회 축사");
+        assertThat(matches(speeches)).containsOnly("meaning");
+        Result korea = s.search(VIEWER, site("korea.kr"), "개막", 10);
+        assertThat(titles(korea)).containsExactly("체육대회 안전관리 강화", "제107회 전국체육대회 기념사",
+                "제44기 대통령기 이북도민 체육대회 축사");
+
+        // 검색어 없이 종류만: 임베딩 없이 최신순
+        Result latest = s.search(VIEWER, sections("연설문"), null, 1);
+        assertThat(latest.mode()).isEqualTo(Mode.LATEST);
+        assertThat(titles(latest)).containsExactly("제44기 대통령기 이북도민 체육대회 축사");
+        assertThat(EMBED.requests()).hasSize(2);
+    }
+
+    @Test
+    void siteKeyKeepsOnlyTheDomainOfAnAddress() {
+        assertThat(DocumentService.siteKey("https://www.korea.kr/news/x?id=1")).isEqualTo("korea.kr");
+        assertThat(DocumentService.siteKey(" WWW.Donga.com ")).isEqualTo("donga.com");
+        assertThat(DocumentService.siteKey("동아 일보")).isEqualTo("동아일보");
+        assertThat(DocumentService.siteKey("KBS/MBC")).isEqualTo("kbs/mbc");
+    }
+
     @Test
     void withoutEmbeddingsItIsTheSameFullTextSearchAsBefore() {
         corpus();
-        List<String> fullText = documents.list(VIEWER, null, null, null, null, null, "반도체", 10).stream()
+        List<String> fullText = documents.list(VIEWER, Filter.NONE, "반도체", 10).stream()
                 .map(DocumentService.DocumentRow::title).toList();
         assertThat(fullText).containsExactly("반도체 수출 사상 최대", "반도체 장비 국산화 지원사업 공고", "반도체 업황 전망");
 
         // 임베딩 미설정
-        Result off = search(new NotConfiguredEmbeddingClient()).search(VIEWER, null, null, null, "반도체", 10);
+        Result off = search(new NotConfiguredEmbeddingClient()).search(VIEWER, Filter.NONE, "반도체", 10);
         assertThat(off.mode()).isEqualTo(Mode.FULLTEXT);
         assertThat(titles(off)).isEqualTo(fullText);
         assertThat(off.hits()).allMatch(h -> h.words() && !h.meaning());
 
         // 설정은 있지만 그 모델로 임베딩된 조각이 아직 없다 → 질의를 임베딩하지 않는다
-        Result notYet = search(embedder("new-model")).search(VIEWER, null, null, null, "반도체", 10);
+        Result notYet = search(embedder("new-model")).search(VIEWER, Filter.NONE, "반도체", 10);
         assertThat(notYet.mode()).isEqualTo(Mode.FULLTEXT);
         assertThat(notYet.note()).contains("new-model/1024");
         assertThat(titles(notYet)).isEqualTo(fullText);
@@ -203,21 +305,21 @@ class HybridSearchIT {
 
         // 429(하루 한도): 다시 보내지 않고 전문 검색으로 답한다
         EMBED.then(Reply.status(429, MockLlmServer.GEMINI_DAILY_429));
-        Result limited = s.search(VIEWER, null, null, null, "반도체", 10);
+        Result limited = s.search(VIEWER, Filter.NONE, "반도체", 10);
         assertThat(limited.mode()).isEqualTo(Mode.FULLTEXT);
         assertThat(limited.note()).contains("RATE_LIMITED");
         assertThat(titles(limited)).isEqualTo(fullText);
         assertThat(EMBED.requests()).hasSize(1);
 
         // 멈춘 동안은 부르지도 않는다
-        Result paused = s.search(VIEWER, null, null, null, "반도체", 10);
+        Result paused = s.search(VIEWER, Filter.NONE, "반도체", 10);
         assertThat(paused.mode()).isEqualTo(Mode.FULLTEXT);
         assertThat(EMBED.requests()).hasSize(1);
 
         // 5xx는 한 번 다시 보내고, 그래도 실패하면 전문 검색
         s.clearPause();
         EMBED.then(Reply.status(500, "boom")).then(Reply.status(503, "boom"));
-        Result down = s.search(VIEWER, null, null, null, "반도체", 10);
+        Result down = s.search(VIEWER, Filter.NONE, "반도체", 10);
         assertThat(down.mode()).isEqualTo(Mode.FULLTEXT);
         assertThat(titles(down)).isEqualTo(fullText);
         assertThat(EMBED.requests()).hasSize(3);
@@ -225,12 +327,12 @@ class HybridSearchIT {
         // 차원이 다른 응답도 쓰지 않는다
         s.clearPause();
         EMBED.then(Reply.ok(MockLlmServer.openAiEmbedding(new float[768])));
-        assertThat(s.search(VIEWER, null, null, null, "반도체", 10).mode()).isEqualTo(Mode.FULLTEXT);
+        assertThat(s.search(VIEWER, Filter.NONE, "반도체", 10).mode()).isEqualTo(Mode.FULLTEXT);
 
         // 멈춤이 풀리면 다시 하이브리드
         s.clearPause();
         EMBED.then(Reply.ok(MockLlmServer.openAiEmbedding(vector(0, 1))));
-        assertThat(s.search(VIEWER, null, null, null, "반도체", 10).mode()).isEqualTo(Mode.HYBRID);
+        assertThat(s.search(VIEWER, Filter.NONE, "반도체", 10).mode()).isEqualTo(Mode.HYBRID);
         assertThat(EMBED.pending()).isZero();
     }
 }

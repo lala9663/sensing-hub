@@ -311,6 +311,97 @@ class ChatIT {
         assertThat(LLM.pending()).isZero();
     }
 
+    /** 기사 종류(document.section)가 있는 문서. */
+    private long document(long sourceId, String url, String title, String publishedAt, String section) {
+        long id = document(sourceId, url, title, publishedAt, null, "[]");
+        jdbc.sql("UPDATE document SET section = ? WHERE id = ?").params(section, id).update();
+        return id;
+    }
+
+    private static JsonNode lastTool(JsonNode request) {
+        List<JsonNode> tools = messages(request, "tool");
+        return parse(tools.get(tools.size() - 1).path("content").asText());
+    }
+
+    @Test
+    void searchToolFiltersBySiteAndArticleKindAndTellsTheNamesItCanUse() {
+        long korea = siteSource("korea.kr", "PUBLIC", null, false);       // 운영처럼 사이트 이름이 비어 있다
+        long donga = siteSource("donga.com", "NEWS", "동아일보", false);
+        long s1 = document(korea, "https://korea.kr/s1", "제44기 대통령기 이북도민 체육대회 축사", "2026-10-18T10:00:00+09:00", "연설문");
+        long s2 = document(korea, "https://korea.kr/s2", "제107회 전국체육대회 기념사", "2026-10-16T10:00:00+09:00", "연설문");
+        long s3 = document(korea, "https://korea.kr/s3", "국군의 날 기념사", "2026-10-01T10:00:00+09:00", "연설문");
+        document(korea, "https://korea.kr/s4", "현충일 추념사", "2026-06-06T10:00:00+09:00", "연설문");
+        document(korea, "https://korea.kr/p1", "체육대회 안전관리 강화", "2026-10-18T12:00:00+09:00", "보도자료");
+        document(korea, "https://korea.kr/n1", "생활체육 지원 확대", "2026-10-17T12:00:00+09:00", "정책뉴스");
+        document(donga, "https://donga.com/1", "전국체전 개막", "2026-10-18T13:00:00+09:00", "스포츠");
+
+        // 1) 사이트·종류 이름을 검색어에 넣으면 낱말이 맞지 않는다 → 종류 이름이라고 알려 준다
+        LLM.then(toolCall("k1", "search_documents", "{\"query\":\"정책브리핑 연설문\"}"))
+                .then(body -> {
+                    JsonNode r = lastTool(body);
+                    assertThat(r.path("count").asInt()).isZero();
+                    assertThat(r.path("note").asText()).contains("'연설문'은(는) 기사 종류 이름입니다").contains("section");
+                    // 2) 사이트 이름을 모른다 (korea.kr은 이름이 없다) → 고를 수 있는 사이트를 준다
+                    return toolCall("k2", "search_documents", "{\"site\":\"정책브리핑\",\"section\":\"연설문\"}");
+                })
+                .then(body -> {
+                    JsonNode r = lastTool(body);
+                    assertThat(r.path("ok").asBoolean()).isTrue();
+                    assertThat(r.path("documents")).isEmpty();
+                    assertThat(r.path("note").asText()).contains("맞는 수집 사이트가 없습니다");
+                    assertThat(r.path("sites").toString()).contains("korea.kr").contains("동아일보(donga.com)");
+                    // 3) 도메인 + 종류 이름 일부, 최근 3개
+                    return toolCall("k3", "search_documents", "{\"site\":\"korea.kr\",\"section\":\"연설\",\"limit\":3}");
+                })
+                .then(body -> {
+                    JsonNode r = lastTool(body);
+                    assertThat(r.path("sites").get(0).asText()).isEqualTo("korea.kr");
+                    assertThat(r.path("sections").get(0).asText()).isEqualTo("연설문");
+                    assertThat(r.path("note").asText()).contains("'연설'을(를) '연설문'(으)로 찾았습니다");
+                    assertThat(r.path("order").asText()).isEqualTo("최신순");
+                    JsonNode docs = r.path("documents");
+                    assertThat(docs).hasSize(3);
+                    assertThat(docs.get(0).path("title").asText()).isEqualTo("제44기 대통령기 이북도민 체육대회 축사");
+                    assertThat(docs.get(0).path("section").asText()).isEqualTo("연설문");
+                    assertThat(docs.get(0).path("source").asText()).isEqualTo("korea.kr");
+                    assertThat(docs.get(2).path("title").asText()).isEqualTo("국군의 날 기념사");
+                    assertThat(r.path("more").asText()).contains("더 있을 수 있습니다");
+                    List<String> kinds = new ArrayList<>();
+                    r.path("site_sections").forEach(k -> kinds.add(k.asText()));
+                    assertThat(kinds).containsExactly("연설문", "보도자료", "정책뉴스");
+                    return text("정책브리핑 최근 연설문입니다.\n- 이북도민 체육대회 축사 [1]\n- 전국체육대회 기념사 [2]\n- 국군의 날 기념사 [3]");
+                });
+        long s = session("viewer");
+        JsonNode answer = send("viewer", s, "정책브리핑에서 최근 올라온 연설문 3개만 알려 줘").get("assistant");
+
+        assertThat(answer.get("error").asBoolean()).isFalse();
+        assertThat(answer.get("tools")).hasSize(3);
+        List<Long> cited = new ArrayList<>();
+        answer.get("citations").forEach(c -> cited.add(c.get("documentId").asLong()));
+        assertThat(cited).containsExactly(s1, s2, s3);
+        assertThat(answer.get("citations").get(0).get("url").asText()).isEqualTo("https://korea.kr/s1");
+        assertThat(answer.get("citations").get(0).get("sourceLabel").asText()).isEqualTo("korea.kr");
+        assertThat(LLM.pending()).isZero();
+
+        // 시스템 프롬프트와 도구 정의가 사이트·종류 조건을 알려 준다
+        JsonNode first = LLM.requests().get(0).body();
+        assertThat(messages(first, "system").get(0).path("content").asText()).contains("site·section으로 거르고");
+        JsonNode searchTool = first.path("tools").get(0).path("function");
+        assertThat(searchTool.path("parameters").path("properties").has("site")).isTrue();
+        assertThat(searchTool.path("parameters").path("properties").has("section")).isTrue();
+        assertThat(searchTool.path("description").asText()).contains("연설문·보도자료·정책뉴스").contains("query는 비운다");
+
+        // 화면 API도 같은 조건: 종류는 여러 번 줄 수 있고(쉼표는 나누지 않는다), 사이트는 도메인·이름
+        JsonNode both = call("viewer", HttpMethod.GET, "/api/v1/documents?site=korea.kr&section=연설문&section=보도자료",
+                null).getBody();
+        assertThat(both).hasSize(5);
+        assertThat(call("viewer", HttpMethod.GET, "/api/v1/documents?site=동아일보", null).getBody()).hasSize(1);
+        assertThat(call("viewer", HttpMethod.GET, "/api/v1/documents?section=연설문,보도자료", null).getBody()).isEmpty();
+        JsonNode counts = call("viewer", HttpMethod.GET, "/api/v1/documents/sections?site=korea.kr", null).getBody();
+        assertThat(counts.path("연설문").asInt()).isEqualTo(4);
+        assertThat(counts.has("스포츠")).isFalse();
+    }
+
     @Test
     void sessionsAreVisibleOnlyToTheirOwner() {
         long s = session("registrar");

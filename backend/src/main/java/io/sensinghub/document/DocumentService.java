@@ -12,6 +12,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import org.springframework.http.HttpStatus;
@@ -51,6 +52,31 @@ public class DocumentService {
     public record AttachmentRow(String url, String fileName) {
     }
 
+    /**
+     * 목록·검색 조건 (모두 선택, 비면 걸지 않는다).
+     * <ul>
+     *   <li>since: 수집 시각 하한 ({@link #parseSince} 형식). topic: 분류 체계 값 포함. watchId·keyword: {@link #list} 참고.</li>
+     *   <li>sections: 기사 종류(document.section) 정확 일치, 여럿이면 그중 하나. 사이트 하나에 기사 종류가 여럿이면 워커가 종류 이름
+     *       ('정책뉴스'·'연설문'·'보도자료' …)을, 아니면 기사 페이지의 분류('스포츠'·'경제' …)를 적는다.</li>
+     *   <li>site: 도메인 또는 사이트 이름 ({@link #matchSites}).</li>
+     * </ul>
+     */
+    public record Filter(String since, Long sourceId, String topic, Long watchId, String keyword, List<String> sections,
+                         String site) {
+
+        public static final Filter NONE = new Filter(null, null, null, null, null, List.of(), null);
+
+        public Filter {
+            sections = sections == null ? List.of()
+                    : sections.stream().filter(s -> s != null && !s.isBlank()).map(String::strip).distinct().toList();
+            site = site == null || site.isBlank() ? null : site.strip();
+        }
+    }
+
+    /** 사이트 조건에 맞는 소스 하나. name은 사이트 표시 이름 (없을 수 있다). */
+    public record SiteMatch(long sourceId, String domain, String name) {
+    }
+
     public record DocumentDetail(long id, String url, String title, OffsetDateTime publishedAt,
                                  OffsetDateTime collectedAt, long sourceId, String domain, String section,
                                  String summary, List<String> topics, List<String> tags, List<String> keywords,
@@ -81,15 +107,14 @@ public class DocumentService {
             """;
 
     /**
-     * watchId: 그 감시(document_watch.source_id)에 걸린 문서만. keyword와 함께 주면 그 감시에서 그 검색어로 걸린 문서만
-     * (document_watch 한 행이 둘 다 만족해야 한다). 문서 목록은 VIEWER 누구나 읽으므로 감시 소유자를 따지지 않는다.
+     * 조건({@link Filter})에 맞는 문서. watchId: 그 감시(document_watch.source_id)에 걸린 문서만. keyword와 함께 주면 그 감시에서
+     * 그 검색어로 걸린 문서만 (document_watch 한 행이 둘 다 만족해야 한다). 문서 목록은 VIEWER 누구나 읽으므로 감시 소유자를 따지지 않는다.
      */
-    public List<DocumentRow> list(CurrentUser user, String since, Long sourceId, String topic, Long watchId,
-                                  String keyword, String q, Integer limit) {
+    public List<DocumentRow> list(CurrentUser user, Filter filter, String q, Integer limit) {
         user.require(Role.VIEWER);
         StringBuilder sql = new StringBuilder(ROW_SQL).append(" WHERE 1 = 1");
         List<Object> params = new ArrayList<>();
-        appendFilters(sql, params, since, sourceId, topic, watchId, keyword);
+        appendFilters(sql, params, filter);
         if (q != null && !q.isBlank()) {
             appendSearch(sql, params, q);
         }
@@ -98,35 +123,117 @@ public class DocumentService {
         return jdbc.sql(sql.toString()).params(params).query(this::mapRow).list();
     }
 
-    /** 목록·의미 검색이 함께 쓰는 조건. 별칭 d(document)·e(document_enrichment)가 있어야 한다. */
-    private void appendFilters(StringBuilder sql, List<Object> params, String since, Long sourceId, String topic,
-                               Long watchId, String keyword) {
-        OffsetDateTime from = parseSince(since);
+    /** 목록·의미 검색·종류별 건수가 함께 쓰는 조건. 별칭 d(document)·e(document_enrichment)가 있어야 한다. */
+    private void appendFilters(StringBuilder sql, List<Object> params, Filter f) {
+        OffsetDateTime from = parseSince(f.since());
         if (from != null) {
             sql.append(" AND d.collected_at >= ?");
             params.add(from);
         }
-        if (sourceId != null) {
+        if (f.sourceId() != null) {
             sql.append(" AND d.source_id = ?");
-            params.add(sourceId);
+            params.add(f.sourceId());
         }
-        if (topic != null && !topic.isBlank()) {
+        if (f.site() != null) {
+            List<Long> ids = matchSites(f.site()).stream().map(SiteMatch::sourceId).toList();
+            if (ids.isEmpty()) {
+                sql.append(" AND FALSE");
+            } else {
+                sql.append(" AND d.source_id IN (").append(marks(ids.size())).append(")");
+                params.addAll(ids);
+            }
+        }
+        if (!f.sections().isEmpty()) {
+            sql.append(" AND d.section IN (").append(marks(f.sections().size())).append(")");
+            params.addAll(f.sections());
+        }
+        if (f.topic() != null && !f.topic().isBlank()) {
             sql.append(" AND e.topics @> CAST(? AS jsonb)");
-            params.add(toJson(List.of(topic.trim())));
+            params.add(toJson(List.of(f.topic().trim())));
         }
-        boolean hasKeyword = keyword != null && !keyword.isBlank();
-        if (watchId != null || hasKeyword) {
+        boolean hasKeyword = f.keyword() != null && !f.keyword().isBlank();
+        if (f.watchId() != null || hasKeyword) {
             sql.append(" AND EXISTS (SELECT 1 FROM document_watch w WHERE w.document_id = d.id");
-            if (watchId != null) {
+            if (f.watchId() != null) {
                 sql.append(" AND w.source_id = ?");
-                params.add(watchId);
+                params.add(f.watchId());
             }
             if (hasKeyword) {
                 sql.append(" AND w.keyword = ?");
-                params.add(keyword.trim());
+                params.add(f.keyword().trim());
             }
             sql.append(")");
         }
+    }
+
+    /**
+     * 사이트 조건(도메인 또는 사이트 표시 이름)에 맞는 소스. 대소문자·공백을 무시하고, 주소를 주면 도메인만 본다
+     * ('https://www.korea.kr/news' → 'korea.kr'). 도메인이나 이름이 통째로 같은 사이트가 있으면 그것만('한국경제'는 한국경제TV를 빼고),
+     * 없으면 부분 일치하는 사이트 모두('kbs' → news.kbs.co.kr, world.kbs.co.kr).
+     */
+    public List<SiteMatch> matchSites(String site) {
+        String key = siteKey(site);
+        if (key.isEmpty()) {
+            return List.of();
+        }
+        List<SiteMatch> exact = new ArrayList<>();
+        List<SiteMatch> partial = new ArrayList<>();
+        jdbc.sql("""
+                SELECT s.id, t.domain, t.name, (t.domain = ? OR lower(replace(t.name, ' ', '')) = ?) AS exact
+                FROM source s JOIN site t ON t.id = s.site_id
+                WHERE t.domain LIKE ? OR lower(replace(t.name, ' ', '')) LIKE ?
+                ORDER BY s.id
+                """).params(key, key, SearchTerms.likePattern(key), SearchTerms.likePattern(key)).query(rs -> {
+                    SiteMatch m = new SiteMatch(rs.getLong("id"), rs.getString("domain"), rs.getString("name"));
+                    (rs.getBoolean("exact") ? exact : partial).add(m);
+                });
+        return exact.isEmpty() ? partial : exact;
+    }
+
+    /** 문서가 하나라도 있는 소스의 사이트 (이름순, 이름이 없으면 도메인으로). 챗봇이 사이트를 못 찾았을 때 고를 이름으로 준다. */
+    public List<SiteMatch> sitesWithDocuments() {
+        return jdbc.sql("""
+                SELECT s.id, t.domain, t.name FROM source s JOIN site t ON t.id = s.site_id
+                WHERE EXISTS (SELECT 1 FROM document d WHERE d.source_id = s.id)
+                ORDER BY COALESCE(NULLIF(t.name, ''), t.domain), s.id
+                """).query((rs, n) -> new SiteMatch(rs.getLong("id"), rs.getString("domain"), rs.getString("name"))).list();
+    }
+
+    /** 사이트 조건 비교 키: 소문자, 공백 없음, 주소면 도메인(www. 뗌)만. */
+    static String siteKey(String site) {
+        if (site == null) {
+            return "";
+        }
+        String s = site.strip().toLowerCase(Locale.ROOT).replaceFirst("^[a-z]+://", "");
+        if (s.contains(".") && s.indexOf('/') > 0) {
+            s = s.substring(0, s.indexOf('/'));
+        }
+        return s.replaceFirst("^www\\.", "").replaceAll("\\s+", "");
+    }
+
+    /**
+     * 기사 종류(document.section)별 문서 수 (많은 순, 같으면 이름순). 조건은 목록과 같다 — 챗봇이 사이트의 종류 이름을 알려 주고
+     * 문서 화면이 종류 입력 후보로 쓴다.
+     */
+    public Map<String, Long> sectionCounts(CurrentUser user, Filter filter) {
+        user.require(Role.VIEWER);
+        StringBuilder sql = new StringBuilder("""
+                SELECT d.section, count(*) AS c
+                FROM document d LEFT JOIN document_enrichment e ON e.document_id = d.id
+                WHERE d.section IS NOT NULL
+                """);
+        List<Object> params = new ArrayList<>();
+        appendFilters(sql, params, filter);
+        sql.append(" GROUP BY d.section ORDER BY c DESC, d.section");
+        Map<String, Long> counts = new LinkedHashMap<>();
+        jdbc.sql(sql.toString()).params(params).query(rs -> {
+            counts.put(rs.getString(1), rs.getLong(2));
+        });
+        return counts;
+    }
+
+    private static String marks(int n) {
+        return String.join(", ", Collections.nCopies(n, "?"));
     }
 
     /** 의미 검색 후보 한 건: 문서와 그 문서에서 질의에 가장 가까운 조각의 코사인 유사도. */
@@ -135,12 +242,12 @@ public class DocumentService {
 
     /**
      * 의미 검색 후보 (챗봇 2단계, {@link HybridSearch}). 질의 벡터와 조각 벡터({@code chunk.embedding})의 코사인 유사도로
-     * 문서마다 가장 가까운 조각을 고르고, 유사도 하한 이상을 높은 순으로 limit건 준다. 목록과 같은 조건(수집 시각·분류·감시)을 건다.
+     * 문서마다 가장 가까운 조각을 고르고, 유사도 하한 이상을 높은 순으로 limit건 준다. 목록과 같은 조건({@link Filter})을 건다.
      * <p>{@code embed_model}이 질의를 만든 모델과 같은 조각만 비교한다. 조건을 건 채 문서마다 묶어야 하므로 HNSW 색인 대신 해당
      * 조각을 모두 계산한다 (조각 수만 건에서 수십 ms). 수십만 건을 넘으면 pgvector 0.8의 반복 탐색(hnsw.iterative_scan)으로 바꾼다.
      */
-    List<SemanticMatch> semanticMatches(CurrentUser user, String since, String topic, Long watchId, float[] vector,
-                                        String model, int limit, double minSimilarity) {
+    List<SemanticMatch> semanticMatches(CurrentUser user, Filter filter, float[] vector, String model, int limit,
+                                        double minSimilarity) {
         user.require(Role.VIEWER);
         StringBuilder sql = new StringBuilder("""
                 SELECT id, similarity FROM (
@@ -154,7 +261,7 @@ public class DocumentService {
         List<Object> params = new ArrayList<>();
         params.add(vectorLiteral(vector));
         params.add(model);
-        appendFilters(sql, params, since, null, topic, watchId, null);
+        appendFilters(sql, params, filter);
         sql.append("""
                     GROUP BY d.id
                 ) s
@@ -180,8 +287,7 @@ public class DocumentService {
         if (ids.isEmpty()) {
             return List.of();
         }
-        String marks = String.join(", ", Collections.nCopies(ids.size(), "?"));
-        return jdbc.sql(ROW_SQL + " WHERE d.id IN (" + marks + ")").params(new ArrayList<Object>(ids))
+        return jdbc.sql(ROW_SQL + " WHERE d.id IN (" + marks(ids.size()) + ")").params(new ArrayList<Object>(ids))
                 .query(this::mapRow).list();
     }
 
