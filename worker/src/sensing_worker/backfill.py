@@ -53,6 +53,7 @@ MAX_SITEMAP_DEPTH = 3      # 색인 → 색인 → 사이트맵
 ARTICLE_BATCH = 10         # 한 번에 꺼내 여는 주소 수 (주소마다 양보·취소를 확인한다)
 RECORDED_ERRORS = 3        # 묶음 하나에서 crawl_error로 남기는 기사 실패 수 (나머지는 수만 센다)
 MAX_NOTES = 8
+CANCELLED = "취소됨"        # 묶음을 멈춘 이유: 사용자가 취소 (나머지 이유는 양보·상한)
 
 
 # ---------------------------------------------------------------------- 기사 판정 (평소 수집과 같은 규칙)
@@ -361,13 +362,14 @@ class BackfillChunk:
         if self._used() >= self.s.backfill_chunk:
             return "BUDGET"
         if self.db.backfill_status(self.bf_id) != "RUNNING":
-            return "취소됨"
+            return CANCELLED
         return self.db.backfill_yield_reason(self.job.source_id)
 
     def _finish(self, stop: str | None, done: bool) -> str:
         pending = self.db.pending_backfill_count(self.bf_id)
-        self.db.save_backfill(self.bf_id, method=self.method, cursor=self.cursor, requests=self._used(),
-                              message=None if done else self._progress(stop))
+        # 취소됐으면 백엔드가 남긴 취소 메시지를 덮지 않는다
+        message = None if done or stop == CANCELLED else self._progress(stop)
+        self.db.save_backfill(self.bf_id, method=self.method, cursor=self.cursor, requests=self._used(), message=message)
         if done and pending == 0:
             row = self.db.load_backfill(self.job.id, self.job.source_id) or {}
             self.db.finish_backfill(self.bf_id, "DONE", done_message(row, self.cursor))

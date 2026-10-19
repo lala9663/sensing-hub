@@ -270,7 +270,8 @@ def test_cancel_stops_the_running_chunk_and_no_more_chunks_are_queued(env):
     def get_and_cancel(url):
         page = get(url)
         if "articleView" in url:   # 백엔드 BackfillService.cancel과 같은 갱신
-            store.conn.execute("UPDATE backfill SET status = 'CANCELLED', finished_at = now() WHERE id = %s", (backfill_id,))
+            store.conn.execute("UPDATE backfill SET status = 'CANCELLED', finished_at = now(), message = '취소했습니다 (관리자).' "
+                               "WHERE id = %s", (backfill_id,))
         return page
 
     runner.f.get = get_and_cancel
@@ -281,6 +282,7 @@ def test_cancel_stops_the_running_chunk_and_no_more_chunks_are_queued(env):
         runner.f.get = get
     b = backfill_row(store, backfill_id)
     assert b["status"] == "CANCELLED" and b["saved_count"] == 1 and len(article_hits(site)) == 1
+    assert b["message"] == "취소했습니다 (관리자)."        # 워커가 진행 메시지로 덮지 않는다
     assert "취소" in q(store, "SELECT note FROM crawl_job ORDER BY id DESC LIMIT 1")["note"]
     assert store.enqueue_backfill_chunk() is None
     assert len(saved_ids(store)) == 1                     # 이미 저장한 문서는 그대로

@@ -294,6 +294,23 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 이것을 돌려주지 않으면 도구 결과를 담은 요청을 거절한다), `ToolCall.providerData`로 보관해 돌려준 후속 턴이 모두 성공했습니다. 처음엔 도구 이름
 ("`get_source_status` 도구로 확인")을 말하거나 등록 답에 엉뚱한 `[1]`을 붙여 프롬프트·도구 안내문을 보강했습니다.
 
+### 과거 기사 채우기 (백필)
+
+평소 수집은 입구에 지금 보이는 기사만 모읍니다(RSS 50건 안팎, 뉴스 사이트맵 이틀 안팎). 등록 전 기사는 관리자·등록 담당자가
+관리자 → 소스 상세의 **과거 기사 채우기**에서 기간을 정해 요청합니다(기본 최근 3개월, 최대 1년, ACTIVE 사이트 소스만, 소스당 하나씩).
+워커가 ① 보관 사이트맵(파일 이름의 날짜·`lastmod`로 기간에 걸치는 것만, `.xml.gz` 포함) → ② 목록 페이지를 쪽 번호로 거꾸로 넘기며
+기간 시작보다 오래된 글이 나오면 멈추는 순서로 주소를 모으고, 평소 수집과 같은 기사 판정·추출·저장(언론사는 제목·링크·발행일만)·감시 대조를 합니다.
+이미 있는 문서는 열지 않고, 새 문서의 수집 시각은 발행 시각으로 둡니다(다이제스트·"오늘" 필터에 옛 기사가 끼지 않게).
+진행률(찾은 주소·새로 저장·이미 있음·기간 밖·실패·남은 수)은 소스 상세에 10초마다 갱신되고, 취소하면 다음 기사 전에 멈춥니다.
+원리·속도·한계는 [docs/how-collection-works.md](docs/how-collection-works.md) 6-1절.
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `SENSING_BACKFILL_ENABLED` | `true` | 큐가 빌 때 진행 중인 채우기의 다음 묶음(`crawl_job` BACKFILL)을 넣는다. 다른 작업이 하나라도 대기하면 넣지 않고, 묶음 도중에도 기사마다 확인해 평소 작업·이 소스의 주기 수집 차례에 양보한다 |
+| `SENSING_BACKFILL_CHUNK` | `100` | 한 묶음에 보내는 요청 수(사이트맵·목록·기사·robots 포함). 묶음마다 진행 위치를 남기고 끝난다 |
+| `SENSING_BACKFILL_MAX_SITEMAPS` | `60` | 채우기 하나가 여는 사이트맵 수 상한(색인 포함) |
+| `SENSING_BACKFILL_MAX_PAGES` | `300` | 목록 페이지를 거꾸로 넘길 때 허브 하나에서 볼 쪽 수 상한 |
+
 ### API 맛보기
 
 PoC 인증은 `X-User` 헤더의 login_id로 합니다 (`admin`, `registrar`, `viewer` 기본 계정). SSO 연동 시 `CurrentUserResolver`만 교체합니다.
@@ -347,6 +364,11 @@ curl localhost:8080/api/v1/review-queue -H 'X-User: admin'
 curl localhost:8080/api/v1/review-queue/counts -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'      -H 'Content-Type: application/json' -d '{"reason":"업무와 관련 없는 사이트"}'
 
+# 과거 기사 채우기 (REGISTRAR 이상, ACTIVE 사이트 소스만, 소스당 하나씩). 본문을 비우면 최근 3개월, 길이 최대 1년 · 진행률 · 취소
+curl -X POST localhost:8080/api/v1/sources/1/backfills -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"from":"2026-07-19","to":"2026-10-19"}'
+curl localhost:8080/api/v1/sources/1/backfills -H 'X-User: registrar'   # found·saved·skipped·outOfRange·failed·remaining·requests·chunks·message
+curl -X POST localhost:8080/api/v1/sources/1/backfills/1/cancel -H 'X-User: registrar'
+
 # 관리자: 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"dart","secret":"<발급받은 키>","label":"공시 API"}'
 curl -X POST localhost:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"naver_news","secret":"<client_id>:<client_secret>","label":"네이버 검색"}'
@@ -371,6 +393,7 @@ worker/    Python 수집 워커
     apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록·네이버 뉴스 검색·국세청 사업자 상태 커넥터
     company.py    회사 레이어 규칙: 태그 → 회사 정확 일치, 회사 신호(BIZ_STATUS·NEWS)의 심각도·fingerprint
     jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록, CHECK 소스는 회사 상태 점검)
+    backfill.py   과거 기사 채우기(BACKFILL 한 묶음): 보관 사이트맵 고르기·목록 역순·양보·취소·진행 위치
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전, 회사 연결·신호
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
 docs/      설계 메모 — 수집 원리는 docs/how-collection-works.md (사이트를 등록하면 기사를 어떻게 찾아 가져오나)
@@ -421,8 +444,9 @@ LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 
 
 **진행 중 (10-19)** — 각각 별도 브랜치에서 작업하고 끝나면 main에 합친다.
 
-- 과거 기사 채우기(백필): 현업 필수 요구로 확인. 사이트·기간(기본 최근 3개월)을 정하면 보관 사이트맵 → 목록 페이지 역순으로
-  등록 이전 기사를 평소 수집이 쉬는 틈에 천천히 채운다 (`docs/how-collection-works.md` "입구 파일이 보여 주는 범위와 과거 기사").
+- 과거 기사 채우기(백필): **10-19 구현 완료, main 병합 대기**. 소스 상세에서 기간(기본 최근 3개월, 최대 1년)을 정하면 보관 사이트맵(`.xml.gz` 포함)
+  → 목록 페이지 역순으로 등록 이전 기사를 평소 수집이 쉬는 틈에 요청 100건씩 끊어 채운다. 평소 수집·등록이 기다리면 양보하고, 취소할 수 있다
+  (`docs/how-collection-works.md` 6-1절, 아래 "과거 기사 채우기"). 실측: 동아일보 석 달 ≈ 기사 주소 3.1만 건, 이 사이트만 채우면 약 22시간.
 - 사이트 하나에 기사 종류 여러 개: korea.kr이 보도자료만 모이는 문제(정책뉴스·브리핑·연설문 누락). 종류별 품질 검사·켜고 끄기,
   특정 목록 주소로 등록하면 그 종류만, 이미 있는 사이트에 다른 목록 주소를 넣으면 종류 추가.
 - 챗봇 2단계: 임베딩 의미 검색 (1단계 — 도구 호출·대화 저장·근거 링크·화면 — 은 10-19 완료, 아래 M5 체크리스트).

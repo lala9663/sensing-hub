@@ -381,7 +381,7 @@
         });
       });
       view.querySelectorAll('[data-bf-cancel]').forEach(btn => btn.addEventListener('click', () => App.guard(async () => {
-        if (!await App.confirm(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 취소할까요? 이미 저장한 문서는 그대로 둡니다.`, '취소')) return;
+        if (!await App.confirm(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 멈출까요? 이미 저장한 문서는 그대로 둡니다.`, '채우기 취소')) return;
         await api('POST', `/sources/${s.id}/backfills/${btn.dataset.bfCancel}/cancel`);
         App.notice(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 취소했습니다.`);
         await refreshBackfills(true);
