@@ -159,7 +159,7 @@
             + '설정해 주세요 (README "챗봇").';
           warn.hidden = false;
         } else {
-          view.querySelector('.llm-status').textContent = `모델: ${s.provider}`;
+          view.querySelector('.llm-status').textContent = `모델: ${s.provider}` + (s.search ? ` · 문서 검색: ${s.search}` : '');
         }
       } catch (e) { /* 상태는 안내용 */ }
     }

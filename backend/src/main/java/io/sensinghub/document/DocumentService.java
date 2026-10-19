@@ -8,6 +8,8 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -87,6 +89,18 @@ public class DocumentService {
         user.require(Role.VIEWER);
         StringBuilder sql = new StringBuilder(ROW_SQL).append(" WHERE 1 = 1");
         List<Object> params = new ArrayList<>();
+        appendFilters(sql, params, since, sourceId, topic, watchId, keyword);
+        if (q != null && !q.isBlank()) {
+            appendSearch(sql, params, q);
+        }
+        sql.append(" ORDER BY d.published_at DESC NULLS LAST, d.id DESC LIMIT ?");
+        params.add(clampLimit(limit));
+        return jdbc.sql(sql.toString()).params(params).query(this::mapRow).list();
+    }
+
+    /** 목록·의미 검색이 함께 쓰는 조건. 별칭 d(document)·e(document_enrichment)가 있어야 한다. */
+    private void appendFilters(StringBuilder sql, List<Object> params, String since, Long sourceId, String topic,
+                               Long watchId, String keyword) {
         OffsetDateTime from = parseSince(since);
         if (from != null) {
             sql.append(" AND d.collected_at >= ?");
@@ -113,12 +127,74 @@ public class DocumentService {
             }
             sql.append(")");
         }
-        if (q != null && !q.isBlank()) {
-            appendSearch(sql, params, q);
+    }
+
+    /** 의미 검색 후보 한 건: 문서와 그 문서에서 질의에 가장 가까운 조각의 코사인 유사도. */
+    public record SemanticMatch(long documentId, double similarity) {
+    }
+
+    /**
+     * 의미 검색 후보 (챗봇 2단계, {@link HybridSearch}). 질의 벡터와 조각 벡터({@code chunk.embedding})의 코사인 유사도로
+     * 문서마다 가장 가까운 조각을 고르고, 유사도 하한 이상을 높은 순으로 limit건 준다. 목록과 같은 조건(수집 시각·분류·감시)을 건다.
+     * <p>{@code embed_model}이 질의를 만든 모델과 같은 조각만 비교한다. 조건을 건 채 문서마다 묶어야 하므로 HNSW 색인 대신 해당
+     * 조각을 모두 계산한다 (조각 수만 건에서 수십 ms). 수십만 건을 넘으면 pgvector 0.8의 반복 탐색(hnsw.iterative_scan)으로 바꾼다.
+     */
+    List<SemanticMatch> semanticMatches(CurrentUser user, String since, String topic, Long watchId, float[] vector,
+                                        String model, int limit, double minSimilarity) {
+        user.require(Role.VIEWER);
+        StringBuilder sql = new StringBuilder("""
+                SELECT id, similarity FROM (
+                    SELECT d.id, max(1 - (c.embedding <=> q.v)) AS similarity
+                    FROM (SELECT CAST(? AS vector) AS v) q
+                    JOIN chunk c ON c.embed_model = ? AND c.embedding IS NOT NULL
+                    JOIN document d ON d.id = c.document_id
+                    LEFT JOIN document_enrichment e ON e.document_id = d.id
+                    WHERE 1 = 1
+                """);
+        List<Object> params = new ArrayList<>();
+        params.add(vectorLiteral(vector));
+        params.add(model);
+        appendFilters(sql, params, since, null, topic, watchId, null);
+        sql.append("""
+                    GROUP BY d.id
+                ) s
+                WHERE similarity >= ?
+                ORDER BY similarity DESC, id DESC
+                LIMIT ?
+                """);
+        params.add(minSimilarity);
+        params.add(Math.max(1, limit));
+        return jdbc.sql(sql.toString()).params(params)
+                .query((rs, n) -> new SemanticMatch(rs.getLong("id"), rs.getDouble("similarity"))).list();
+    }
+
+    /** 이 모델로 만든 조각 벡터가 하나라도 있는가 (없으면 질의를 임베딩하지 않는다 — 호출 한도를 아낀다). */
+    boolean hasEmbeddings(String model) {
+        return Boolean.TRUE.equals(jdbc.sql(
+                "SELECT EXISTS (SELECT 1 FROM chunk WHERE embed_model = ? AND embedding IS NOT NULL)")
+                .param(model).query(Boolean.class).single());
+    }
+
+    /** 문서 id들의 목록 행 (순서는 보장하지 않는다). */
+    List<DocumentRow> rows(Collection<Long> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
         }
-        sql.append(" ORDER BY d.published_at DESC NULLS LAST, d.id DESC LIMIT ?");
-        params.add(clampLimit(limit));
-        return jdbc.sql(sql.toString()).params(params).query(this::mapRow).list();
+        String marks = String.join(", ", Collections.nCopies(ids.size(), "?"));
+        return jdbc.sql(ROW_SQL + " WHERE d.id IN (" + marks + ")").params(new ArrayList<Object>(ids))
+                .query(this::mapRow).list();
+    }
+
+    /** pgvector 입력 형식 '[0.1,0.2,...]'. */
+    static String vectorLiteral(float[] vector) {
+        StringBuilder sb = new StringBuilder(vector.length * 10).append('[');
+        for (int i = 0; i < vector.length; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(vector[i]);
+        }
+        return sb.append(']').toString();
     }
 
     /**
