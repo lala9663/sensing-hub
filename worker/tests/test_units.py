@@ -965,6 +965,16 @@ def test_discover_finds_article_kinds_per_child_sitemap():
         site.close()
 
 
+def test_kind_limits_default_to_seven_on_and_eight_checks(monkeypatch):
+    # 정책브리핑: 기사 종류 6개(보도자료·정책뉴스·사실은 이렇습니다·부처 브리핑·국민이 말하는 정책·연설문) 다음의 청와대 브리핑까지 켠다
+    monkeypatch.delenv("SENSING_MAX_KINDS", raising=False)
+    monkeypatch.delenv("SENSING_MAX_KIND_CHECKS", raising=False)
+    s = Settings()
+    assert (s.max_kinds, s.max_kind_checks) == (7, 8)
+    monkeypatch.setenv("SENSING_MAX_KINDS", "6")
+    assert Settings().max_kinds == 6
+
+
 def test_discover_turns_on_only_top_kinds_and_can_skip_kind_search():
     site = _policy_site()
     f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
