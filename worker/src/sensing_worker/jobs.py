@@ -1,4 +1,5 @@
-"""작업 실행: ONBOARD(등록 자동 처리)와 CRAWL(주기 수집). 점검 소스(kind CHECK)의 CRAWL은 회사 단위 상태 확인이다."""
+"""작업 실행: ONBOARD(등록 자동 처리)와 CRAWL(주기 수집). 점검 소스(kind CHECK)의 CRAWL은 회사 단위 상태 확인이다.
+BACKFILL(과거 기사 채우기 한 묶음)은 backfill.py가 한다."""
 
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from .extract import Article, extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, Page, PoliteFetcher
 from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
 from . import portal
+from .backfill import run_backfill
 from .policy import defaults_for, guess_site_type, is_routine_notice, next_interval, passes_quality
 from .recipe import propose_recipe
 from .watchmatch import WatchKeywords, from_configs, match_keywords
@@ -85,7 +87,10 @@ class JobRunner:
         try:
             if job.job_type == "ONBOARD":
                 return self._onboard(job, source)
-            if job.job_type in ("CRAWL", "BACKFILL"):
+            if job.job_type == "BACKFILL":
+                # 과거 기사 채우기 한 묶음. 실패·차단은 backfill.py가 채우기 행에 남기고 작업을 끝낸다
+                return run_backfill(self, job, source)
+            if job.job_type == "CRAWL":
                 return self._crawl_job(job, source)
             raise CrawlFailure(Code.UNEXPECTED, f"지원하지 않는 작업 유형: {job.job_type}")
         except CrawlFailure as failure:

@@ -116,3 +116,10 @@ class Settings:
     embed_per_minute: float = field(default_factory=lambda: float(os.getenv("SENSING_EMBED_PER_MINUTE", "80")))
     embed_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_EMBED_TIMEOUT", "30")))
     embed_backoff_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_EMBED_BACKOFF", "60")))
+    # 과거 기사 채우기(BACKFILL). 큐가 빌 때만 한 묶음씩 돈다 — 한 묶음에 보내는 요청 수(사이트맵·목록·기사·robots 포함)
+    backfill_enabled: bool = field(default_factory=lambda: _bool("SENSING_BACKFILL_ENABLED", True))
+    backfill_chunk: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_CHUNK", "100")))
+    # 채우기 하나가 읽는, 이름에 날짜가 없는 사이트맵 파일 수 상한(이름에 날짜가 있는 파일·번호 묶음의 이분 탐색은 묶음에 필요한 만큼)과,
+    # 목록 페이지를 거꾸로 넘길 때 허브 하나에서 볼 쪽 수 상한
+    backfill_max_sitemaps: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_MAX_SITEMAPS", "60")))
+    backfill_max_pages: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_MAX_PAGES", "300")))

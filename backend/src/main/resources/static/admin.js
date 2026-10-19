@@ -9,6 +9,9 @@
     approve: '승인', reject: '반려', set_api_key: 'API 키 등록', recheck: '재점검', rediscover: '다시 탐색',
     pause: '일시정지', resume: '재개', run: '지금 수집', exclude: '제외',
   };
+  // 과거 기사 채우기: 묶음 단위 이름("두 달 더")과 칩으로 바로 보여 줄 묶음 수 (나머지는 접는다)
+  const UNIT_WORDS = { 1: '한 달', 2: '두 달', 3: '석 달' };
+  const SEGMENT_SHOWN = 8;
 
   /** API 키 등록 모달. 저장 결과(SaveResult)를 돌려주거나 취소하면 null. */
   function apiKeyModal(provider) {
@@ -197,10 +200,13 @@
   // ================================================================ 소스 상세
   App.route('/admin/sources/:id', async (view, params) => {
     const id = params.id;
+    let bfSource = null;   // 과거 기사 채우기 패널이 쓰는 소스 (load가 채운다)
 
     async function load() {
       const d = await api('GET', `/sources/${encodeURIComponent(id)}`);
       const s = d.source;
+      const backfills = s.kind === 'SITE' ? await api('GET', `/sources/${s.id}/backfills`) : null;
+      bfSource = s;
       const actions = {
         ACTIVE: ['run', 'pause', 'rediscover', 'exclude'],
         PAUSED: ['resume', 'rediscover', 'exclude'],
@@ -245,6 +251,7 @@
                   <td class="small">${esc(j.note || '')}</td></tr>`).join('')}
             </tbody></table>` : '<div class="muted small">작업 기록이 없습니다.</div>'}
         </div>
+        ${backfills ? `<div class="panel" id="backfill-panel">${backfillPanel(s, backfills)}</div>` : ''}
         <div class="panel">
           <h2>최근 오류</h2>
           ${d.recentErrors.length ? `<table>
@@ -305,6 +312,7 @@
           pre.hidden = !pre.hidden;
         });
       });
+      bindBackfill();
     }
 
     await App.guard(load);
@@ -351,6 +359,129 @@
       s = String(s || '');
       return s.length > n ? s.slice(0, n) + '…' : s;
     }
+
+    // ---------------------------------------------------------------- 과거 기사 채우기
+
+    /** 채우기 요청 폼(진행 중인 것이 없을 때)과 기록 표. 진행 중이면 10초마다 이 패널만 다시 그린다. */
+    function backfillPanel(s, list) {
+      const open = list.find(b => b.status === 'QUEUED' || b.status === 'RUNNING');
+      const today = kstDate(0);
+      const form = !open && s.status === 'ACTIVE' ? `
+          <form id="backfill-form" class="row mt">
+            <label>시작 <input type="date" name="from" value="${twoMonthStart(kstDate(-3))}" max="${today}"></label>
+            <label>끝 <input type="date" name="to" value="${today}" max="${today}"></label>
+            <button type="submit" class="small primary">과거 기사 채우기 요청</button>
+            <span class="muted small">기본 최근 3개월 · 시작은 기간 묶음(2개월)의 첫날로 맞춤 · 등록 담당자는 최대 1년, 관리자는 더 길게</span>
+          </form>` : (!open ? '<div class="muted small mt">수집 중(ACTIVE)인 소스만 요청할 수 있습니다.</div>' : '');
+      // 더 늘릴 수 있는 것: 진행 중인 것, 진행 중인 것이 없으면 가장 최근 기록 (취소·완료한 것을 다시 연다)
+      const extendable = open ? open.id : (list[0] && list[0].status !== 'FAILED' && s.status === 'ACTIVE' ? list[0].id : null);
+      return `
+          <h2>과거 기사 채우기</h2>
+          <p class="muted small">등록 전에 나온 기사를 기간 묶음(기본 2개월, 보관 사이트맵이 월·두 달 단위면 그 단위)으로 나눠 <b>가장 최근 묶음부터</b> 과거로 천천히 가져옵니다.
+            보관 사이트맵을 먼저 찾고, 없거나 모자라면 목록 페이지를 쪽 번호로 거꾸로 넘깁니다. 끊겨도 남은 묶음부터 잇고, "더" 단추로 묶음을 뒤로 늘립니다.
+            평소 수집·등록이 기다리면 멈추고 양보하며, 도메인당 2초 간격과 robots.txt를 지킵니다. 언론사는 제목·링크·발행일만 저장합니다.</p>
+          ${form}
+          ${list.length ? `<table class="mt" ${open ? 'data-bf-open="1"' : ''}>
+            <thead><tr><th>#</th><th>기간</th><th>상태</th><th>수</th><th>진행</th><th></th></tr></thead>
+            <tbody>${list.map(b => `
+              <tr>
+                <td>#${b.id}</td>
+                <td class="nowrap">${esc(b.from)} ~ ${esc(b.to)}<div class="muted small">${b.unitMonths}개월 묶음 ${b.segments.length}개</div></td>
+                <td>${badge(b.status)}</td>
+                <td class="small nowrap">찾은 주소 ${App.fmtNum(b.found)} · 새로 저장 ${App.fmtNum(b.saved)}<br>
+                  이미 있음 ${App.fmtNum(b.skipped)} · 기간 밖 ${App.fmtNum(b.outOfRange)} · 실패 ${App.fmtNum(b.failed)} · 남은 ${App.fmtNum(b.remaining)}</td>
+                <td class="small">${esc(b.message || '')}
+                  <div class="muted">${backfillEta(b)}요청 ${App.fmtNum(b.requests)}회 · 작업 ${App.fmtNum(b.chunks)}번 · ${esc(b.requestedBy || '-')} ${App.fmtTime(b.createdAt)}${b.finishedAt ? ` → ${App.fmtTime(b.finishedAt)}` : ''}</div></td>
+                <td class="nowrap">${b.id === extendable ? `<button type="button" class="small" data-bf-extend="${b.id}" data-unit="${b.unitMonths}">${UNIT_WORDS[b.unitMonths] || b.unitMonths + '개월'} 더</button>` : ''}
+                  ${b.status === 'QUEUED' || b.status === 'RUNNING' ? `<button type="button" class="small danger" data-bf-cancel="${b.id}">취소</button>` : ''}</td>
+              </tr>
+              <tr><td></td><td colspan="5">${segmentChips(b)}</td></tr>`).join('')}
+            </tbody></table>` : '<div class="muted small mt">요청 기록이 없습니다.</div>'}`;
+    }
+
+    /** 묶음 칩: "2026-09~10 완료 21,096건", "2026-07~08 진행 40%", "2026-05~06 대기". 많으면 뒤쪽은 접는다. */
+    function segmentChips(b) {
+      if (!b.segments.length) return '<span class="muted small">사이트맵 색인을 읽은 뒤 기간 묶음을 나눕니다.</span>';
+      const chip = g => {
+        const handled = g.saved + g.skipped + g.outOfRange + g.failed;
+        const text = g.status === 'DONE' ? `완료 ${App.fmtNum(g.found)}건`
+          : g.status === 'RUNNING' ? `진행 ${g.percent}%${g.found ? ` (${App.fmtNum(handled)}/${App.fmtNum(g.found)})` : ''}`
+          : g.status === 'FAILED' ? '실패' : '대기';
+        const color = { DONE: 'green', RUNNING: 'blue', FAILED: 'red' }[g.status] || 'grey';
+        const title = `${g.from} ~ ${g.to} · 찾은 주소 ${g.found} · 새로 저장 ${g.saved} · 이미 있음 ${g.skipped} · 기간 밖 ${g.outOfRange} · 실패 ${g.failed}`
+          + (g.method ? ` · ${g.method}` : '') + (g.message ? ` · ${g.message}` : '');
+        return `<span class="badge badge-${color}" title="${esc(title)}">${esc(g.label)} ${esc(text)}</span>`;
+      };
+      const head = b.segments.slice(0, SEGMENT_SHOWN).map(chip).join(' ');
+      const rest = b.segments.slice(SEGMENT_SHOWN);
+      return `<div class="row" style="gap:4px;flex-wrap:wrap">${head}</div>`
+        + (rest.length ? `<details class="small mt"><summary>더 오래된 묶음 ${rest.length}개</summary><div class="row" style="gap:4px;flex-wrap:wrap">${rest.map(chip).join(' ')}</div></details>` : '');
+    }
+
+    function backfillEta(b) {
+      if (!(b.status === 'QUEUED' || b.status === 'RUNNING')) return '';
+      // 기사 1건 ≈ 도메인 간격 2초 + 응답 시간 0.5초. 평소 수집에 양보하는 시간은 빼지 않은 하한이다
+      const fmt = n => { const h = n * 2.5 / 3600; return h < 1 ? Math.max(1, Math.round(h * 60)) + '분' : h.toFixed(1) + '시간'; };
+      const running = b.segments.find(g => g.status === 'RUNNING');
+      const left = running ? running.found - running.saved - running.skipped - running.outOfRange - running.failed : 0;
+      const parts = [];
+      if (running && left > 0) parts.push(`이번 묶음 남은 주소만 빨라도 약 ${fmt(left)}`);
+      else if (b.remaining) parts.push(`남은 주소만 빨라도 약 ${fmt(b.remaining)}`);
+      return parts.length ? parts.join(' · ') + ' · ' : '';
+    }
+
+    /** KST 오늘에서 months개월 전(음수)의 날짜 "YYYY-MM-DD". */
+    function kstDate(months) {
+      const d = new Date(Date.now() + 9 * 3600 * 1000);
+      if (months) d.setUTCMonth(d.getUTCMonth() + months);
+      return d.toISOString().slice(0, 10);
+    }
+
+    /** 기본 묶음(2개월: 1~2월, 3~4월 …)의 첫날. 백엔드가 시작 날짜를 이렇게 맞추므로 폼에도 맞춘 값을 보여 준다. */
+    function twoMonthStart(iso) {
+      const y = Number(iso.slice(0, 4)), m = Number(iso.slice(5, 7)) - 1;
+      const start = m - (m % 2);
+      return `${y}-${String(start + 1).padStart(2, '0')}-01`;
+    }
+
+    function bindBackfill() {
+      const s = bfSource;
+      const form = view.querySelector('#backfill-form');
+      if (form) form.addEventListener('submit', e => {
+        e.preventDefault();
+        App.guard(async () => {
+          const from = form.from.value, to = form.to.value;
+          if (!await App.confirm(`${s.domain}의 ${from} ~ ${to} 기사를 채울까요? 워커가 한가할 때 조금씩 가져오므로 몇 시간~며칠 걸릴 수 있습니다.`, '요청')) return;
+          const b = await api('POST', `/sources/${s.id}/backfills`, { from, to });
+          App.notice(`과거 기사 채우기 #${b.id}를 요청했습니다 (${b.from} ~ ${b.to}).`);
+          await refreshBackfills(true);
+        });
+      });
+      view.querySelectorAll('[data-bf-extend]').forEach(btn => btn.addEventListener('click', () => App.guard(async () => {
+        const words = UNIT_WORDS[Number(btn.dataset.unit)] || `${btn.dataset.unit}개월`;
+        if (!await App.confirm(`과거 기사 채우기 #${btn.dataset.bfExtend}의 기간을 ${words} 앞으로 늘릴까요? 지금 묶음을 마친 뒤 더 오래된 묶음을 채웁니다.`, `${words} 더`)) return;
+        const b = await api('POST', `/sources/${s.id}/backfills/${btn.dataset.bfExtend}/extend`, { segments: 1 });
+        App.notice(`과거 기사 채우기 #${b.id}: 기간을 ${b.from}부터로 늘렸습니다.`);
+        await refreshBackfills(true);
+      })));
+      view.querySelectorAll('[data-bf-cancel]').forEach(btn => btn.addEventListener('click', () => App.guard(async () => {
+        if (!await App.confirm(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 멈출까요? 이미 저장한 문서는 그대로 둡니다.`, '채우기 취소')) return;
+        await api('POST', `/sources/${s.id}/backfills/${btn.dataset.bfCancel}/cancel`);
+        App.notice(`과거 기사 채우기 #${btn.dataset.bfCancel}을(를) 취소했습니다.`);
+        await refreshBackfills(true);
+      })));
+    }
+
+    /** 채우기 패널만 다시 그린다. 자동 갱신은 진행 중인 채우기가 보일 때만 한다. */
+    async function refreshBackfills(force) {
+      const panel = view.querySelector('#backfill-panel');
+      if (!panel || !bfSource || (!force && !panel.querySelector('[data-bf-open]'))) return;
+      const list = await api('GET', `/sources/${bfSource.id}/backfills`);
+      panel.innerHTML = backfillPanel(bfSource, list);
+      bindBackfill();
+    }
+
+    return App.every(10000, () => refreshBackfills(false));
   }, { admin: true });
 
   // ================================================================ API 키

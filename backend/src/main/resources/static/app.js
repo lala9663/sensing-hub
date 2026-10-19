@@ -31,7 +31,7 @@ const App = (() => {
     SITE: '사이트', WATCH: '키워드 감시', CHECK: '회사 점검',
     BIZ_STATUS: '사업자 상태', DEBARMENT: '부정당업자', DISCLOSURE: '공시', NEWS: '뉴스', FINANCIAL: '재무',
     PROBE: '사전 점검', DISCOVERY: '자동 탐색', FIRST_CRAWL: '첫 수집', DONE: '완료',
-    ONBOARD: '등록', CRAWL: '수집',
+    ONBOARD: '등록', CRAWL: '수집', BACKFILL: '과거 기사', CANCELLED: '취소',
   };
   const STATUS_COLORS = {
     ACTIVE: 'green', COMPLETED: 'green', SUCCESS: 'green', SENT: 'green', VERIFIED: 'green', DONE: 'green',

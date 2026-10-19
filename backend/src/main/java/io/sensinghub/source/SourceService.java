@@ -346,12 +346,28 @@ public class SourceService {
     }
 
     private void enqueue(long sourceId, String jobType, String trigger) {
+        // 과거 기사 채우기(BACKFILL) 묶음이 소스의 작업 자리를 잡고 있으면 양보시킨다: 대기 중이면 거둔다
+        jdbc.sql("""
+                UPDATE crawl_job SET status = 'SUCCESS', finished_at = now(), note = '관리자 작업에 양보'
+                WHERE source_id = ? AND job_type = 'BACKFILL' AND status = 'QUEUED'
+                """).param(sourceId).update();
         int inserted = jdbc.sql("""
                 INSERT INTO crawl_job (source_id, job_type, config_version_id, trigger)
                 SELECT id, ?, active_config_version_id, ? FROM source WHERE id = ?
                 ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
                 """).params(jobType, trigger, sourceId).update();
         if (inserted == 0) {
+            boolean backfillRunning = jdbc.sql("""
+                    SELECT EXISTS (SELECT 1 FROM crawl_job WHERE source_id = ? AND job_type = 'BACKFILL' AND status = 'RUNNING')
+                    """).param(sourceId).query(Boolean.class).single();
+            if (backfillRunning && "CRAWL".equals(jobType)) {
+                // 실행 중인 묶음: 주기 수집 차례를 지금으로 당긴다. 워커가 이것을 보고 묶음을 멈추면 스케줄러가 곧 CRAWL을 넣는다
+                jdbc.sql("UPDATE source SET next_run_at = now(), updated_at = now() WHERE id = ?").param(sourceId).update();
+                return;
+            }
+            if (backfillRunning) {
+                throw ApiException.conflict("과거 기사 채우기가 실행 중입니다. 소스 상세에서 채우기를 취소한 뒤 다시 시도해 주세요.");
+            }
             throw ApiException.conflict("이미 실행 중이거나 대기 중인 작업이 있습니다.");
         }
     }

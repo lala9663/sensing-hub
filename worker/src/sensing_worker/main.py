@@ -101,6 +101,21 @@ def embed_idle(store: Store, embedder, settings: Settings, pacer: Pacer) -> None
         pacer.sent(out.embedded)
 
 
+def backfill_idle(store: Store, settings: Settings) -> bool:
+    """큐가 비었을 때 진행 중인 과거 기사 채우기의 다음 묶음(BACKFILL 작업)을 넣는다. 넣었으면 True (다음 루프가 바로 집는다).
+    평소 작업이 하나라도 대기하면 넣지 않는다 — 채우기는 언제나 맨 뒤다."""
+    if not settings.backfill_enabled:
+        return False
+    try:
+        job_id = store.enqueue_backfill_chunk()
+    except Exception:   # DB 오류 등. 다음 루프에 다시 시도한다
+        log.exception("backfill enqueue failed")
+        return False
+    if job_id is not None:
+        log.info("backfill chunk queued: job %s", job_id)
+    return job_id is not None
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="sensing-hub 수집 워커")
     parser.add_argument("--once", action="store_true", help="대기 작업 하나만 처리하고 종료")
@@ -129,6 +144,8 @@ def main(argv: list[str] | None = None) -> None:
                 index_idle(store, settings)         # 작업이 없을 때만 색인·이슈 묶기,
                 embed_idle(store, embedder, settings, embed_pacer)     # 색인된 조각의 임베딩,
                 enrich_idle(store, llm, settings)   # 요약·분류를 한 묶음씩 돌린다
+                if backfill_idle(store, settings):  # 그리고 과거 기사 채우기를 한 묶음 넣는다 (쉬지 않고 바로 집는다)
+                    continue
                 time.sleep(settings.poll_seconds)
     finally:
         alive.stop()

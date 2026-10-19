@@ -79,6 +79,11 @@ sensing:
     mock:
       # 가짜 케이던시아 서버를 띄운다 (실제 케이던시아를 보게 되면 끈다)
       enabled: ${SENSING_CAIDENTIA_MOCK_ENABLED:true}
+  backfill:
+    # 과거 기사 채우기: 등록 담당자가 요청할 수 있는 기간 길이 상한(일). 관리자는 더 길게(1990년부터) 정할 수 있다
+    max-days: ${SENSING_BACKFILL_MAX_DAYS:366}
+    # 기간 묶음 기본 길이(개월). 워커가 보관 사이트맵의 단위(한 달·두 달·석 달 파일)를 보면 그 단위로 바꾼다
+    segment-months: ${SENSING_BACKFILL_SEGMENT_MONTHS:2}
   registration:
     # VIEWER가 등록하면 관리자 승인 대기로 접수한다
     viewer-needs-approval: true
