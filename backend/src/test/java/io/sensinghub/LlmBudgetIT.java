@@ -148,7 +148,7 @@ class LlmBudgetIT {
             assertThat(body.path("model").asText()).isEqualTo(CHAT_MODEL);
             return Reply.ok(MockLlmServer.openAiText("안녕하세요."));
         });
-        JsonNode answer = ask(session(), "안녕");
+        JsonNode answer = ask(session(), "안녕하세요, 오늘 뭐 할 수 있어?");
         assertThat(answer.get("error").asBoolean()).isFalse();
         Map<String, Object> row = usage(CHAT_MODEL, "chat");
         assertThat(((Number) row.get("calls")).intValue()).isEqualTo(1);
@@ -194,7 +194,7 @@ class LlmBudgetIT {
             assertThat(body.path("messages").toString()).doesNotContain("주요 이슈 알려 줘").doesNotContain("어제 이슈");
             return Reply.ok(MockLlmServer.openAiText("다시 됩니다."));
         });
-        assertThat(ask(s, "다시 해 볼게").get("error").asBoolean()).isFalse();
+        assertThat(ask(s, "다시 해 볼게, 오늘 소식 알려 줘").get("error").asBoolean()).isFalse();
         assertThat(LLM.requests()).hasSize(2);
     }
 
@@ -202,13 +202,13 @@ class LlmBudgetIT {
     void minuteQuota429PausesOnlyBriefly() {
         long s = session();
         LLM.then(Reply.status(429, MockLlmServer.GEMINI_MINUTE_429));
-        assertThat(ask(s, "질문").get("content").asText()).contains("약 42초 뒤");
+        assertThat(ask(s, "이번 주 이슈 알려 줘").get("content").asText()).contains("약 42초 뒤");
         Map<String, Object> c = cooldown(CHAT_MODEL);
         assertThat(c.get("reason")).isEqualTo("MINUTE");
         long left = java.time.Duration.between(OffsetDateTime.now(), at(c.get("until_at"))).getSeconds();
         assertThat(left).isBetween(25L, 42L);
 
-        JsonNode waiting = ask(s, "다시 질문");
+        JsonNode waiting = ask(s, "다시 이슈 알려 줘");
         assertThat(waiting.get("content").asText()).containsPattern("약 \\d{1,2}초 뒤에 다시 시도해 주세요");
         assertThat(LLM.requests()).hasSize(1);
     }
@@ -220,13 +220,13 @@ class LlmBudgetIT {
         jdbc.sql("INSERT INTO llm_cooldown (model, until_at, reason, quota_id, purpose) VALUES (?, now() + interval '5 hours', 'DAILY', 'q', 'enrich')")
                 .param(WORKER_MODEL).update();
         LLM.then(Reply.ok(MockLlmServer.openAiText("요약 모델과 한도를 따로 씁니다.")));
-        assertThat(ask(s, "첫 질문").get("error").asBoolean()).isFalse();
+        assertThat(ask(s, "첫 번째 질문이야, 이슈 알려 줘").get("error").asBoolean()).isFalse();
         assertThat(LLM.requests()).hasSize(1);
 
         // 같은 모델이면 (챗봇 모델을 워커도 쓰다 429를 받았다) 챗봇도 부르지 않는다
         jdbc.sql("INSERT INTO llm_cooldown (model, until_at, reason, purpose) VALUES (?, now() + interval '2 hours', 'DAILY', 'enrich')")
                 .param(CHAT_MODEL).update();
-        JsonNode paused = ask(s, "두 번째 질문");
+        JsonNode paused = ask(s, "두 번째 질문이야, 이슈 알려 줘");
         assertThat(paused.get("error").asBoolean()).isTrue();
         assertThat(paused.get("content").asText()).contains("한국 시간");
         assertThat(LLM.requests()).hasSize(1);
