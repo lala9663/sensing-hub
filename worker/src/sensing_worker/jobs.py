@@ -21,7 +21,7 @@ from .extract import extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, Page, PoliteFetcher
 from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
 from . import portal
-from .policy import defaults_for, guess_site_type, next_interval, passes_quality
+from .policy import defaults_for, guess_site_type, is_routine_notice, next_interval, passes_quality
 from .recipe import propose_recipe
 from .watchmatch import WatchKeywords, from_configs, match_keywords
 
@@ -716,17 +716,25 @@ def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site
 
     언론사가 아니면 본문 대신 첨부(보도자료 HWP·PDF)가 있어도 샘플로 인정한다.
     후보에 셀렉터(LLM 레시피)가 있으면 수집 때와 똑같이 그 셀렉터로 뽑아 검사한다.
+    정형 단신([부고]·[인사] 등, policy.is_routine_notice)은 표본에서 빼고 다음 후보 주소(최대 10건까지)로 채운다.
+    단신만 있으면 단신으로 검사한다 (그래서 대개 불합격이다).
     """
-    samples = []
-    for url in result.sample_urls[:5]:
+    samples, notices = [], []
+    for i, url in enumerate(result.sample_urls[:10]):
+        if i >= 5 + len(notices):   # 단신 한 건마다 한 주소씩 더 연다 (단신이 없으면 예전처럼 5건)
+            break
         try:
             page = f.get(url)
-            samples.append(extract_article(page.text, page.url, result.selectors, date_hint=result.sample_dates.get(url),
-                                           date_format=result.date_format))
+            art = extract_article(page.text, page.url, result.selectors, date_hint=result.sample_dates.get(url),
+                                  date_format=result.date_format)
         except CrawlFailure as e:
             if e.blocking:
                 raise
-    ok, detail = passes_quality(samples, attachments_ok=site_type != "NEWS")
+            continue
+        (notices if is_routine_notice(art) else samples).append(art)
+    ok, detail = passes_quality(samples or notices, attachments_ok=site_type != "NEWS")
+    if samples and notices:
+        detail += f" (부고·인사 등 단신 {len(notices)}건은 표본에서 뺌)"
     if not ok:
         raise CrawlFailure(Code.QUALITY_FAILED, f"{MESSAGES[Code.QUALITY_FAILED]} ({detail})",
                            url=base_url, stage="DISCOVERY")

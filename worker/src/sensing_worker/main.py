@@ -16,6 +16,7 @@ from .config import Settings
 from .db import Store
 from .enrich import enrich_pending
 from .fetcher import PoliteFetcher
+from .heartbeat import WorkerHeartbeat
 from .indexer import index_pending
 from .jobs import JobRunner
 from .llm import NoLlm, describe, make_llm
@@ -24,11 +25,14 @@ from .throttle import DbThrottle
 log = logging.getLogger("sensing_worker")
 
 
-def process_one(store: Store, runner: JobRunner, settings: Settings) -> str | None:
+def process_one(store: Store, runner: JobRunner, settings: Settings,
+                alive: WorkerHeartbeat | None = None) -> str | None:
     job = store.claim_job(settings.worker_id, settings.lease_minutes)
     if job is None:
         return None
     log.info("job %s claimed: %s source=%s attempt=%s", job.id, job.job_type, job.source_id, job.attempt)
+    if alive is not None:
+        alive.set_job(job.id)
 
     stop = threading.Event()
 
@@ -52,6 +56,8 @@ def process_one(store: Store, runner: JobRunner, settings: Settings) -> str | No
         status = "FAILED"
     finally:
         stop.set()
+        if alive is not None:
+            alive.set_job(None)
     log.info("job %s finished: %s", job.id, status)
     return status
 
@@ -90,9 +96,11 @@ def main(argv: list[str] | None = None) -> None:
     runner = JobRunner(store, fetcher, settings, llm=llm)
     pruned = runner.evidence.prune()
     log.info("worker %s started (llm: %s, evidence dirs pruned: %s)", settings.worker_id, describe(llm), pruned)
+    alive = WorkerHeartbeat(settings.db_url, settings.worker_id, settings.heartbeat_seconds)
+    alive.start()   # 큐가 비어도 운영 지표에 살아 있는 워커로 보이게 30초마다 신호를 남긴다
     try:
         while True:
-            status = process_one(store, runner, settings)
+            status = process_one(store, runner, settings, alive)
             if args.once:
                 break
             if status is None:
@@ -100,6 +108,7 @@ def main(argv: list[str] | None = None) -> None:
                 enrich_idle(store, llm, settings)   # 요약·분류를 한 묶음씩 돌린다
                 time.sleep(settings.poll_seconds)
     finally:
+        alive.stop()
         fetcher.close()
         store.close()
 

@@ -23,6 +23,8 @@ class Settings:
     # 작업 임대 시간. 워커가 죽으면 스케줄러가 이 시간이 지난 작업을 회수한다.
     lease_minutes: int = field(default_factory=lambda: int(os.getenv("SENSING_LEASE_MINUTES", "30")))
     poll_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_POLL_SECONDS", "5")))
+    # 생존 신호(worker_heartbeat) 간격. 운영 지표는 2분 안에 신호가 있는 워커를 살아 있다고 센다
+    heartbeat_seconds: float = field(default_factory=lambda: float(os.getenv("SENSING_HEARTBEAT_SECONDS", "30")))
     user_agent: str = field(default_factory=lambda: os.getenv(
         "SENSING_USER_AGENT", "SensingHubBot/0.1 (+contact: sensing-hub admin)"))
     # 같은 도메인에 대한 최소 요청 간격(초)

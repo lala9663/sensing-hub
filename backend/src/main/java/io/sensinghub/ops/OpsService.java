@@ -14,7 +14,8 @@ import io.sensinghub.review.ReviewQueueService;
 
 /**
  * 대량 소스 운영 지표 (M3, ADMIN). 소스가 수십~수백 개가 되면 개별 상세가 아니라 "워커가 모자라는가", "큐가 밀리는가",
- * "조용히 멈춘 소스가 어디인가"를 한 화면에서 봐야 한다. 모두 DB에 이미 있는 것(source·crawl_job·crawl_error)만 집계한다.
+ * "조용히 멈춘 소스가 어디인가"를 한 화면에서 봐야 한다. 모두 DB에 이미 있는 것(source·crawl_job·crawl_error와 워커가 남기는
+ * 생존 신호 worker_heartbeat)만 집계한다.
  */
 @Service
 public class OpsService {
@@ -25,9 +26,19 @@ public class OpsService {
      * @param queued                 대기 중 작업 수
      * @param oldestQueuedWaitSeconds 가장 오래 기다린 대기 작업의 대기 시간 (없으면 null)
      * @param running                실행 중 작업 수
-     * @param workers                최근 5분 안에 작업을 잡았거나 끝낸 워커 수 (crawl_job.locked_by 고유 수)
+     * @param workers                살아 있는 워커 수: 최근 2분 안에 생존 신호(worker_heartbeat)를 남긴 워커. 큐가 비어 쉬는 워커도 센다
      */
     public record JobQueue(long queued, Long oldestQueuedWaitSeconds, long running, long workers) {
+    }
+
+    /**
+     * 워커 한 대 (worker_heartbeat). 최근 24시간 안에 신호를 남긴 워커를 마지막 신호가 최근인 순으로 준다.
+     * @param alive          최근 2분 안에 신호가 있음 (jobQueue.workers에 센다). 아니면 멈췄거나 DB에 닿지 못하는 워커
+     * @param currentJobId   처리 중인 작업 (쉬는 중이면 null). currentJobType·currentSourceId·currentDomain은 그 작업의 유형·소스·사이트
+     */
+    public record WorkerStatus(String workerId, String host, String version, OffsetDateTime startedAt,
+                               OffsetDateTime lastSeenAt, long secondsSinceSeen, boolean alive,
+                               Long currentJobId, String currentJobType, Long currentSourceId, String currentDomain) {
     }
 
     /** 최근 24시간에 끝난 작업: 결과별 건수와 평균 소요 시간(초). */
@@ -56,8 +67,11 @@ public class OpsService {
 
     public record Overview(OffsetDateTime generatedAt, Map<String, Long> sources, Map<String, Long> reviewQueue,
                            JobQueue jobQueue, JobResults24h jobs24h, Documents24h documents24h,
-                           List<ErrorCount> topErrors24h, Throughput throughput) {
+                           List<ErrorCount> topErrors24h, Throughput throughput, List<WorkerStatus> workers) {
     }
+
+    /** 이 시간(초) 안에 생존 신호가 있어야 살아 있는 워커로 센다. 워커는 30초마다 신호를 남긴다 (SENSING_HEARTBEAT_SECONDS). */
+    static final int WORKER_ALIVE_SECONDS = 120;
 
     /**
      * 소스 건강 상태 한 줄. "조용히 멈춘 소스"를 찾기 위한 것이라 마지막 성공이 오래된 순(없는 것이 먼저)으로 준다.
@@ -83,7 +97,7 @@ public class OpsService {
     public Overview overview(CurrentUser user) {
         user.require(Role.ADMIN);
         return new Overview(OffsetDateTime.now(), sourceCounts(), reviewQueue.counts(user), jobQueue(), jobs24h(),
-                documents24h(), topErrors24h(), throughput());
+                documents24h(), topErrors24h(), throughput(), workers());
     }
 
     public List<SourceHealth> sourceHealth(CurrentUser user, String status, int limit) {
@@ -136,18 +150,37 @@ public class OpsService {
     }
 
     private JobQueue jobQueue() {
+        long workers = jdbc.sql("SELECT count(*) FROM worker_heartbeat WHERE last_seen_at >= now() - make_interval(secs => ?)")
+                .param(WORKER_ALIVE_SECONDS).query(Long.class).single();
         return jdbc.sql("""
                 SELECT count(*) FILTER (WHERE status = 'QUEUED') AS queued,
                        EXTRACT(EPOCH FROM now() - min(created_at) FILTER (WHERE status = 'QUEUED'))::bigint AS oldest_wait,
-                       count(*) FILTER (WHERE status = 'RUNNING') AS running,
-                       count(DISTINCT locked_by) FILTER (WHERE locked_by IS NOT NULL
-                            AND (status = 'RUNNING' OR started_at >= now() - interval '5 minutes'
-                                 OR finished_at >= now() - interval '5 minutes')) AS workers
-                FROM crawl_job
-                WHERE status IN ('QUEUED', 'RUNNING') OR finished_at >= now() - interval '5 minutes'
-                      OR started_at >= now() - interval '5 minutes'
+                       count(*) FILTER (WHERE status = 'RUNNING') AS running
+                FROM crawl_job WHERE status IN ('QUEUED', 'RUNNING')
                 """).query((rs, n) -> new JobQueue(rs.getLong("queued"), rs.getObject("oldest_wait", Long.class),
-                        rs.getLong("running"), rs.getLong("workers"))).single();
+                        rs.getLong("running"), workers)).single();
+    }
+
+    private List<WorkerStatus> workers() {
+        return jdbc.sql("""
+                SELECT w.worker_id, w.host, w.version, w.started_at, w.last_seen_at,
+                       EXTRACT(EPOCH FROM now() - w.last_seen_at)::bigint AS seconds_since_seen,
+                       w.last_seen_at >= now() - make_interval(secs => ?) AS alive,
+                       w.current_job_id, j.job_type, j.source_id, t.domain
+                FROM worker_heartbeat w
+                LEFT JOIN crawl_job j ON j.id = w.current_job_id
+                LEFT JOIN source s ON s.id = j.source_id
+                LEFT JOIN site t ON t.id = s.site_id
+                WHERE w.last_seen_at >= now() - interval '24 hours'
+                ORDER BY w.last_seen_at DESC, w.worker_id
+                LIMIT 100
+                """).param(WORKER_ALIVE_SECONDS).query((rs, n) -> new WorkerStatus(
+                        rs.getString("worker_id"), rs.getString("host"), rs.getString("version"),
+                        rs.getObject("started_at", OffsetDateTime.class), rs.getObject("last_seen_at", OffsetDateTime.class),
+                        Math.max(0, rs.getLong("seconds_since_seen")), rs.getBoolean("alive"),
+                        rs.getObject("current_job_id", Long.class), rs.getString("job_type"),
+                        rs.getObject("source_id", Long.class), rs.getString("domain")))
+                .list();
     }
 
     private JobResults24h jobs24h() {
