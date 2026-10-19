@@ -122,7 +122,25 @@ SENSING_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... sensing-worker
 SENSING_LLM_PROVIDER=openai SENSING_LLM_BASE_URL=http://localhost:11434/v1 SENSING_LLM_MODEL=qwen2.5:14b sensing-worker
 # vLLM (사내 서버)
 SENSING_LLM_PROVIDER=openai SENSING_LLM_BASE_URL=http://vllm:8000/v1 SENSING_LLM_MODEL=Qwen/Qwen2.5-32B-Instruct SENSING_LLM_API_KEY=... sensing-worker
+# Google Gemini 무료 등급 (OpenAI 호환 주소, 키는 aistudio.google.com)
+SENSING_LLM_PROVIDER=openai SENSING_LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai SENSING_LLM_MODEL=gemini-3.5-flash-lite SENSING_LLM_API_KEY=... sensing-worker
 ```
+
+로컬 개발에서는 키를 명령줄 대신 git에 올라가지 않는 `scripts/dev/worker.local.env`에 둡니다
+(`run-worker.ps1`이 읽는다, 예시: [`worker.local.env.example`](scripts/dev/worker.local.env.example)). 바꾼 뒤에는 워커를 재시작합니다.
+
+**실측 (2026-10-19, Gemini 무료 등급)** — 코드 변경 없이 `openai` 제공자로 붙었고, 쌓여 있던 문서 7,967건을 모두 분류·요약했습니다
+(실패 0, 비용 0). 언론 기사는 제목만 보내므로 30건 묶음 한 번이 입력 약 3천 토큰입니다. 공공기관 문서 요약은 두 문장으로 수치까지
+정확했고, 분류는 정치 발언 기사를 "사건·사고"·"산업동향"에 넣는 식의 오분류가 가끔 있습니다.
+
+| 모델 | 무료 한도 | 판단 |
+| --- | --- | --- |
+| `gemini-3.5-flash-lite` | 하루 약 500회 (모델별) | 권장. `SENSING_ENRICH_BATCH=30`이면 하루 약 1만5천 건 |
+| `gemini-3.8-flash` | 하루 20회 | 분류가 조금 더 정확하지만 밀린 문서를 처리하면 곧 HTTP 429 (워커는 아무것도 쓰지 않고 다음에 다시) |
+| `gemini-2.5-flash` 등 옛 모델 | — | 신규 사용자에게 404. 쓸 수 있는 모델은 `{BASE_URL}/models`로 확인 |
+
+무료 등급은 보낸 내용이 Google 모델 개선에 쓰일 수 있어(수집 기사는 공개 뉴스) 운영 전에 회사 규정을 확인해야 합니다.
+Claude API 키는 `sk-ant-api03-`로 시작하는 Console 키여야 합니다(다른 형식의 서비스 키는 401).
 
 JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`json_schema`)를 지원하면 힌트로 쓰되, 응답은 항상 우리 쪽에서 JSON을 꺼내
 스키마를 검증하고, 실패하면 오류 메시지를 붙여 한 번만 다시 요청합니다. OpenAI 호환 서버가 `response_format`을 400으로 거부하면
@@ -336,6 +354,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 수집 시점 요약·분류, 일간 다이제스트, 거래처 마스터와 위험 신호(국세청·DART 공시·조달청), 케이던시아 연동(목업), 링크 모음 페이지의
 언론사 자동 확장, 운영 지표, 그리고 이 모든 것을 다루는 브라우저 화면. 실측: 표본 10곳 중 9곳 자동 등록(10-19 재측정 10/10),
 주간지 8곳 중 6곳 자동 등록(REVIEW였던 한겨레21·주간한국은 10-19 규칙 보강 뒤 자동 등록), 뉴스스탠드 → 언론사 50곳 자동 등록.
+LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 문서 7,967건 전체를 실패 없이 처리(위 "워커 환경 변수 (LLM 레시피)").
 수집 원리는 [docs/how-collection-works.md](docs/how-collection-works.md).
 
 **남은 것 (순서대로)**
@@ -343,7 +362,7 @@ GitHub Actions(`.github/workflows/ci.yml`)가 push마다 두 모듈을 pgvector 
 1. M3 마무리: DART 재무 신호(FINANCIAL), 회사별 다이제스트 구독 화면, 실제 케이던시아 API 연결(SDS가 API를 주면 base-url·매핑 교체).
 2. 관리자 확인으로 가는 사이트 줄이기: ~~한겨레21·주간한국~~ 10-19 일반 규칙으로 해결(비표준 발행일 메타·구분자 없는 날짜, 꼬리 날짜 무시,
    본문을 품은 `<header>` 보존, `[부고]` 단신 표본 제외 — `docs/how-collection-works.md` 4절). 남은 것: 규칙이 못 잡는 다음 사례가
-   나오면 LLM 레시피로 붙이는 실측(키 필요).
+   나오면 LLM 레시피로 붙이는 실측(Gemini 무료 키로 가능).
 3. M4 동적·첨부: Playwright 동적 수집, HWP/PDF 첨부 텍스트 추출(공공기관 보도자료 본문), 원문 삭제 감지, (합의 시) 회사 계정 로그인 수집.
 4. M5 검색·챗봇: 임베딩·하이브리드 검색, 챗봇(도구 호출), 대화 저장 (전문 검색 색인과 이슈 묶기는 2026-10-19 완료).
 5. M6 관리자·운영: 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면. (워커 하트비트 기반 지표는 10-19 완료: `worker_heartbeat`,

@@ -23,6 +23,13 @@ spring:
       mail.smtp.connectiontimeout: 10000
       mail.smtp.timeout: 10000
       mail.smtp.writetimeout: 10000
+  web:
+    resources:
+      cache:
+        cachecontrol:
+          # 정적 화면(JS·CSS)은 매번 서버에 새 버전인지 묻는다 (바뀌지 않았으면 304라 가볍다).
+          # 이게 없으면 브라우저가 옛 화면 파일을 한동안 그대로 써서 배포 뒤 Ctrl+F5가 필요하다
+          no-cache: true
 
 server:
   port: ${SENSING_PORT:8080}
