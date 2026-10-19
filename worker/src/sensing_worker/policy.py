@@ -14,6 +14,10 @@ NEWS_NAME_HINT = re.compile(r"(신문|일보|뉴스|경제|데일리|투데이|�
 NEWS_MARKUP = ("newsmediaorganization", '"newsarticle"', 'og:type" content="article', "ndsoft", "newspaper")
 ARTICLE_HREF = re.compile(r"""href=["'][^"']*/(?:article|news|articleview)[s/.?]""", re.I)
 SITE_NAME_RE = re.compile(r"""<meta[^>]+(?:og:site_name|application-name)[^>]+content=["']([^"']+)""", re.I)
+# 본문이 한두 줄인 정형 단신 ("[부고] 김OO씨 부친상", "[인사] OO은행"). 언론사가 몇 건씩 몰아 올리므로 최신 글 5건이
+# 이것뿐일 수 있다. 품질 검사 표본에서는 빼고 다음 후보로 채운다 (수집은 그대로 한다)
+ROUTINE_NOTICE_TITLE = re.compile(r"^\s*[\[【〈<(]\s*(부고|부음|인사|동정|게시판|알림|모집|결혼|화촉|포토|사진|화보|오늘의\s*운세|운세|날씨)"
+                                  r"\s*[\]】〉>)]")
 
 
 def guess_site_type(domain: str, home_html: str) -> str:
@@ -58,6 +62,11 @@ def next_interval(current: int, base: int, new_counts: list[int], *, window: int
     if avg > max_articles / 2 and current > base:
         return base, f"주기 자동 조정 {current}→{base}분 (최근 {len(recent)}회 평균 새 문서 {avg:.1f}건, 기본값으로)"
     return current, None
+
+
+def is_routine_notice(article: Article) -> bool:
+    """정형 단신(부고·인사·포토 등)인지. 제목 머리의 말머리로만 판단한다."""
+    return bool(article.title and ROUTINE_NOTICE_TITLE.match(article.title))
 
 
 def passes_quality(samples: list[Article], *, now: datetime | None = None, need: int = 4,

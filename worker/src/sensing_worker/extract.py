@@ -2,7 +2,7 @@
 
 사이트별 셀렉터 없이 공통으로 처리한다.
 1. 메타: og:title, article:published_time, JSON-LD(NewsArticle 등), <time datetime>
-2. 본문: trafilatura(설치 시) → <article>·본문 컨테이너 → 가장 긴 문단 묶음
+2. 본문: trafilatura(설치 시) → <article>·본문 컨테이너 → 가장 긴 문단 묶음 (본문을 품은 <header>·<form>은 지우지 않는다)
 설정(selectors)이 있으면 그 값을 우선한다.
 """
 
@@ -31,7 +31,14 @@ TITLE_CANDIDATES = (".detail-tit", ".view_head h2", ".board_view h2", ".view_tit
                     "[class*=subject]", "[class*=view-tit]", "[class*=view_tit]", "[class*=detail-tit]",
                     "article h1", "article h2", "article h3", "h1")
 TITLE_SEPARATORS = (" < ", " | ", " - ", " :: ", " : ", " > ")
-DATE_LABELS = ("입력", "등록일", "작성일", "게시일", "게재일", "승인", "발행일", "보도일", "배포일", "일자", "날짜")
+# "등록"은 맨 뒤: "등록 2026-10-16 08:49"(한겨레 계열)처럼 '일' 없이 쓰는 곳이 있지만 "회원등록" 같은 메뉴에도 걸리므로 다른 라벨이 없을 때만
+DATE_LABELS = ("입력", "등록일", "작성일", "게시일", "게재일", "승인", "발행일", "보도일", "배포일", "일자", "날짜", "등록")
+# 표준 키(article:published_time 등)가 없을 때 보는 메타 키: "h:published_time", "dable:published_time", "publish_date",
+# "DC.date.issued"처럼 매체마다 접두어·표기가 다르다. 수정 시각(modified·updated)은 고르지 않는다
+META_DATE_KEY = re.compile(r"(^|[:._-])(publish(ed)?([._-]?(time|date|at))?|pub_?date|date[._]?issued|regdate)$")
+# 사이트 아래쪽 발행 정보("등록·발행일자 : 2011년 7월 19일")가 있는 자리의 id·class (footer, footer-box, site-footer, copyright).
+# 날짜 라벨을 여기서 찾지 않는다. "article-footer"처럼 기사 안의 꼬리는 해당하지 않는다
+FOOTER_HINT = re.compile(r"^(site[-_]?)?(footer|copyright)([-_]|$)", re.I)
 ROW_TAGS = ("li", "tr", "dl", "article", "div")
 BODY_CANDIDATES = ("article", "[itemprop=articleBody]", "#article-view-content-div", "#articleBody",
                    "#articeBody", ".article_body", ".article-body", ".news_body", ".view_con", ".bbs_view",
@@ -80,7 +87,7 @@ def extract_article(html: str, url: str, selectors: dict | None = None, date_hin
     date_raw = (_select_text(soup, selectors.get("date"))
                 or meta.get("article:published_time") or ld.get("datePublished")
                 or meta.get("og:article:published_time") or meta.get("pubdate") or meta.get("date")
-                or _time_tag(soup) or _date_in_text(soup) or date_hint)
+                or _meta_date(meta) or _time_tag(soup) or _date_in_text(soup) or date_hint)
     art.published_at = _parse_date(date_raw, date_format)
 
     author = meta.get("article:author") or meta.get("author") or ld.get("author")
@@ -192,23 +199,34 @@ def _select_text(soup: BeautifulSoup, selector: str | None, joiner: str = " ") -
     return text or None
 
 
+def _meta_date(meta: dict[str, str]) -> str | None:
+    """표준이 아닌 발행일 메타 키(META_DATE_KEY) 중 날짜로 읽히는 첫 값."""
+    for key, val in meta.items():
+        if META_DATE_KEY.search(key) and _parse_date(val) is not None:
+            return val
+    return None
+
+
 def _time_tag(soup: BeautifulSoup) -> str | None:
     t = soup.find("time", attrs={"datetime": True})
     return t["datetime"] if t else None
 
 
 _DATE_RE = re.compile(r"(20\d{2})[.\-/년]\s?(\d{1,2})[.\-/월]\s?(\d{1,2})일?(?:\s+(\d{1,2}):(\d{2}))?")
+# 구분자 없는 메타 값 "202610160849"(연월일시분), "20261016", "20261016084900"
+_COMPACT_DATE_RE = re.compile(r"^(20\d{2})(\d{2})(\d{2})(?:(\d{2})(\d{2})(\d{2})?)?$")
 
 
 def _date_in_text(soup: BeautifulSoup) -> str | None:
     """"등록일 2026.10.15" 또는 <li><em>등록일</em><span>2026-10-15</span></li> 형태.
 
     라벨이 든 요소와 그 부모까지만 본다. 목록 페이지의 표 머리글 "등록일"이 아래 행의 날짜를 집어
-    게시판 페이지를 기사로 오인하지 않게 하려는 것이다.
+    게시판 페이지를 기사로 오인하지 않게 하려는 것이다. 사이트 아래쪽(<footer>)의 "등록·발행일자"는 매체의
+    정기간행물 등록일이라 건너뛴다.
     """
     for label in DATE_LABELS:
         for node in soup.find_all(string=re.compile(label))[:5]:
-            if isinstance(node, Comment) or node.parent is None:
+            if isinstance(node, Comment) or node.parent is None or _in_footer(node):
                 continue
             for scope in (node.parent, node.parent.parent):
                 if scope is None:
@@ -220,6 +238,19 @@ def _date_in_text(soup: BeautifulSoup) -> str | None:
                 if m:
                     return m.group(0)
     return None
+
+
+def _in_footer(node) -> bool:
+    """사이트 꼬리(<footer>·id/class footer…) 안인지. <article> 안의 <footer>는 기사 꼬리라 아니다."""
+    for parent in node.parents:
+        if parent.name == "article":
+            return False
+        if parent.name == "footer":
+            return not any(p.name == "article" for p in parent.parents)
+        tokens = [parent.get("id") or ""] + list(parent.get("class") or []) if parent.name else []
+        if any(FOOTER_HINT.search(t) for t in tokens if t):
+            return True
+    return False
 
 
 def _links_to_children(soup: BeautifulSoup, url: str) -> int:
@@ -274,8 +305,12 @@ def _parse_date(raw, date_format: str | None = None) -> datetime | None:
     if dt is not None:
         return _to_utc(dt)
     m = _DATE_RE.search(raw)
+    compact = _COMPACT_DATE_RE.match(raw)
     try:
-        if m and not re.match(r"^\d{4}-\d{2}-\d{2}T", raw):
+        if compact:
+            y, mo, d, hh, mm, ss = compact.groups()
+            dt = datetime(int(y), int(mo), int(d), int(hh or 0), int(mm or 0), int(ss or 0))
+        elif m and not re.match(r"^\d{4}-\d{2}-\d{2}T", raw):
             y, mo, d, hh, mm = m.groups()
             dt = datetime(int(y), int(mo), int(d), int(hh or 0), int(mm or 0))
         else:
@@ -322,8 +357,14 @@ def _trafilatura(html: str) -> str | None:
 
 
 def _body_fallback(soup: BeautifulSoup) -> str:
-    for bad in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
+    for bad in soup(["script", "style", "noscript"]):
         bad.decompose()
+    # 머리·꼬리·메뉴는 지우되 본문 컨테이너를 품은 것은 남긴다: 기사 전체를 <header class="article-view-header"> 안에
+    # 두는 CMS(ndsoft 일부)나 페이지 전체를 <form>으로 감싼 ASP.NET 사이트에서 본문까지 지워지지 않게
+    body_selector = ", ".join(BODY_CANDIDATES)
+    for chrome in soup(["nav", "header", "footer", "aside", "form"]):
+        if not chrome.decomposed and chrome.select_one(body_selector) is None:
+            chrome.decompose()
     for sel in BODY_CANDIDATES:
         node = soup.select_one(sel)
         if node:

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import codecs
 import ipaddress
 import os
 import re
@@ -325,20 +326,56 @@ def _root(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
+# EUC-KR로 선언해도 실제로는 확장 완성형(cp949: 똠·햏 등)을 쓰는 곳이 많다
+_CHARSET_ALIASES = {"euc-kr": "cp949", "euc_kr": "cp949", "ks_c_5601-1987": "cp949", "ksc5601": "cp949", "x-windows-949": "cp949"}
+_META_CHARSET_RE = re.compile(r"""<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_.:-]+)""", re.I)
+
+
 def _decode(body: bytes, resp: httpx.Response) -> str:
-    if resp.encoding:
-        try:
-            return body.decode(resp.encoding, errors="replace")
-        except LookupError:
-            pass
-    head = body[:2048].decode("ascii", errors="ignore").lower()
-    m = re.search(r"charset=[\"']?([a-z0-9_-]+)", head)
-    for enc in ([m.group(1)] if m else []) + ["utf-8", "cp949"]:
+    """응답 본문의 문자 인코딩 판정. 순서: BOM → 올바른 UTF-8 → 헤더 charset → <meta charset> → (선언이 없으면) CP949.
+
+    - 비 ASCII 글자를 담은 바이트열이 UTF-8 규칙에 맞으면 사실상 UTF-8이다 (CP949·Latin-1 한글 바이트는 UTF-8로 풀리지
+      않는다). 그래서 선언보다 먼저 본다. 헤더는 Latin-1(Tomcat·PHP 기본값)인데 본문은 UTF-8인 서버에서 "카드뉴스"가
+      "ì¹´ëë´ì¤"로 깨지거나, 헤더와 meta가 서로 다른 인코딩을 말하는 서버에서 틀린 쪽을 고르는 일을 막는다.
+    - 헤더에 charset이 없으면 httpx의 resp.encoding은 UTF-8을 기본값으로 돌려주므로 쓰지 않는다 (meta를 못 보게 된다).
+    - 선언이 모두 맞지 않으면 첫 선언으로 읽고 깨진 글자만 바꾼다 — UTF-8 페이지에 잘못된 바이트 하나가 섞였다고
+      CP949로 통째로 잘못 읽지 않게. 아무 선언이 없을 때만 CP949로 추측한다.
+    """
+    if body.startswith(b"\xef\xbb\xbf"):
+        return body[3:].decode("utf-8", errors="replace")
+    head = body[:4096].decode("ascii", errors="ignore")
+    meta = _META_CHARSET_RE.search(head)
+    declared = [enc for enc in (_charset(resp.charset_encoding), _charset(meta.group(1) if meta else None))
+                if enc and _known(enc)]
+    for enc in dict.fromkeys(["utf-8"] + declared):
         try:
             return body.decode(enc)
-        except (UnicodeDecodeError, LookupError):
+        except UnicodeDecodeError:
             continue
-    return body.decode("utf-8", errors="replace")
+    if declared:
+        return body.decode(declared[0], errors="replace")
+    loose = body.decode("utf-8", errors="replace")
+    if loose.count("�") * 10 < sum(1 for ch in loose if ord(ch) > 127):
+        return loose   # 대부분 UTF-8이고 몇 바이트만 깨졌다
+    try:
+        return body.decode("cp949")
+    except UnicodeDecodeError:
+        return loose
+
+
+def _known(enc: str) -> bool:
+    try:
+        codecs.lookup(enc)
+        return True
+    except LookupError:
+        return False
+
+
+def _charset(name: str | None) -> str | None:
+    if not name:
+        return None
+    name = name.strip().strip("\"'").lower()
+    return _CHARSET_ALIASES.get(name, name) or None
 
 
 def client_redirect_target(page: Page) -> str | None:

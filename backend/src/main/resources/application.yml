@@ -26,6 +26,12 @@ spring:
 
 server:
   port: ${SENSING_PORT:8080}
+  servlet:
+    encoding:
+      # JSON 응답에도 "charset=UTF-8"을 붙인다. Spring은 application/json에 charset을 붙이지 않는데, 그러면 Windows PowerShell 5.1의
+      # Invoke-RestMethod 같은 클라이언트가 ISO-8859-1로 읽어 한글이 "ì¹´ëë´ì¤"("카드뉴스")처럼 깨져 보인다 (저장된 값은 정상)
+      charset: UTF-8
+      force-response: true
 
 management:
   endpoints:
