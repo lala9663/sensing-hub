@@ -1,7 +1,8 @@
 'use strict';
 
 /**
- * 문서: 기간·토픽 칩, 검색어·소스 필터, 목록과 펼쳐 보는 상세(본문 일부·첨부).
+ * 문서: 기간·토픽 칩, 검색어·사이트·기사 종류·소스 필터, 목록과 펼쳐 보는 상세(본문 일부·첨부).
+ * 기사 종류 입력 후보는 그 사이트(없으면 전체)의 종류 이름이다 (/documents/sections). 목록의 종류 이름을 누르면 그 사이트의 그 종류로 거른다.
  * #/documents?watch=<감시 ID>(&keyword=<검색어>): 키워드 감시 화면에서 넘어온 "이 감시에 걸린 기사" 보기. 기간 기본값은 전체.
  */
 App.route('/documents', async (view, params, query) => {
@@ -14,6 +15,8 @@ App.route('/documents', async (view, params, query) => {
     q: query.get('q') || '',
     keyword: query.get('keyword') || '',
     sourceId: query.get('source_id') || '',
+    site: query.get('site') || '',
+    section: query.get('section') || '',
   };
   const PERIODS = [['today', '오늘'], ['3d', '3일'], ['7d', '7일'], ['all', '전체']];
   let watchName = '';
@@ -32,6 +35,9 @@ App.route('/documents', async (view, params, query) => {
       </div>
       <form id="filter-form" class="row mt">
         <input type="search" name="q" placeholder="제목·본문 검색 (예: 반도체 수출 — 낱말 모두 포함)" value="${esc(filter.q)}" style="min-width:220px">
+        <input type="text" name="site" placeholder="사이트 (도메인·이름)" value="${esc(filter.site)}" style="width:150px;min-width:0">
+        <input type="text" name="section" list="section-options" placeholder="기사 종류 (정확히 일치)" value="${esc(filter.section)}" style="width:160px;min-width:0">
+        <datalist id="section-options"></datalist>
         <input type="text" name="keyword" placeholder="감시 검색어 (정확히 일치)" value="${esc(filter.keyword)}">
         <input type="number" name="sourceId" placeholder="소스 ID" value="${esc(filter.sourceId)}" style="width:110px;min-width:0">
         <button type="submit">적용</button>
@@ -111,7 +117,7 @@ App.route('/documents', async (view, params, query) => {
   async function loadList() {
     const list = await api('GET', '/documents' + App.qs({
       since: since(), topic: filter.topic, q: filter.q, watch_id: filter.watch, keyword: filter.keyword,
-      source_id: filter.sourceId, limit: 100,
+      source_id: filter.sourceId, site: filter.site, section: filter.section, limit: 100,
     }));
     const el = view.querySelector('#list');
     if (!list.length) {
@@ -124,7 +130,7 @@ App.route('/documents', async (view, params, query) => {
       ${list.map(d => `
         <div class="doc-item" data-id="${d.id}">
           <div class="title"><a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer" title="원문 열기 (새 창)">${esc(d.title || d.url)}<span class="ext">원문 ↗</span></a></div>
-          <div class="meta">${esc(d.domain)}${d.section ? ' · ' + esc(d.section) : ''} · 발행 ${App.fmtTime(d.publishedAt)} · 수집 ${App.fmtTime(d.collectedAt)}
+          <div class="meta">${esc(d.domain)}${d.section ? ` · <button type="button" class="link small section" data-site="${esc(d.domain)}" data-section="${esc(d.section)}" title="이 사이트의 이 종류만 보기">${esc(d.section)}</button>` : ''} · 발행 ${App.fmtTime(d.publishedAt)} · 수집 ${App.fmtTime(d.collectedAt)}
             ${App.isAdmin() ? ` · <a href="#/admin/sources/${d.sourceId}">소스 #${d.sourceId}</a>` : ` · 소스 #${d.sourceId}`}
             ${d.issueId && d.issueDocCount >= 2 ? ` · <a href="#/issues/${d.issueId}" title="같은 사건을 다룬 기사 묶음">이슈 #${d.issueId} (${d.issueDocCount}건)</a>` : ''}</div>
           <div class="meta">${(d.topics || []).map(t => badge(t)).join(' ')} ${tags(d.tags)}
@@ -157,10 +163,24 @@ App.route('/documents', async (view, params, query) => {
         btn.textContent = '접기';
       }));
     });
+    el.querySelectorAll('button.section').forEach(b => b.addEventListener('click', () => {
+      filter.site = b.dataset.site;
+      filter.section = b.dataset.section;
+      form.site.value = filter.site;
+      form.section.value = filter.section;
+      App.guard(() => Promise.all([loadSections(), loadList()]));
+    }));
+  }
+
+  /** 기사 종류 입력 후보: 사이트·소스 조건(없으면 전체)의 종류 이름, 많은 순. */
+  async function loadSections() {
+    const counts = await api('GET', '/documents/sections' + App.qs({ site: filter.site, source_id: filter.sourceId }));
+    view.querySelector('#section-options').innerHTML = Object.entries(counts).slice(0, 100)
+      .map(([s, c]) => `<option value="${esc(s)}">${c}건</option>`).join('');
   }
 
   async function reload() {
-    await Promise.all([loadTopics(), loadList()]);
+    await Promise.all([loadTopics(), loadSections(), loadList()]);
   }
 
   const form = view.querySelector('#filter-form');
@@ -169,8 +189,10 @@ App.route('/documents', async (view, params, query) => {
     filter.q = form.q.value.trim();
     filter.keyword = form.keyword.value.trim();
     filter.sourceId = form.sourceId.value.trim();
+    filter.site = form.site.value.trim();
+    filter.section = form.section.value.trim();
     renderWatchBar();
-    App.guard(loadList);
+    App.guard(() => Promise.all([loadSections(), loadList()]));
   });
   view.querySelector('#clear').addEventListener('click', () => {
     if (filter.watch) history.replaceState(null, '', '#/documents' + App.qs({ period: filter.period }));
@@ -179,10 +201,14 @@ App.route('/documents', async (view, params, query) => {
     filter.keyword = '';
     filter.sourceId = '';
     filter.topic = '';
+    filter.site = '';
+    filter.section = '';
     form.reset();
     form.keyword.value = '';
     form.q.value = '';
     form.sourceId.value = '';
+    form.site.value = '';
+    form.section.value = '';
     renderWatchBar();
     App.guard(reload);
   });

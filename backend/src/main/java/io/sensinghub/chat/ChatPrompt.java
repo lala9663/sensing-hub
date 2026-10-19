@@ -43,6 +43,9 @@ final class ChatPrompt {
 
                 도구 사용 요령
                 - "기사·보도·문서 찾아 줘" → search_documents (기간은 days 또는 since, 분류는 topic: %s).
+                - 사이트·기사 종류를 말하면("정책브리핑 연설문 최근 3개", "동아일보 스포츠 기사") search_documents의 site·section으로 거르고,
+                  그 이름은 query에 넣지 않는다 (넣으면 그 낱말이 든 문서만 찾아 대개 0건이다). 다른 주제어가 없으면 query는 비우고, "N개"는 limit.
+                  종류 이름이 확실하지 않으면 site만 주고 결과의 site_sections에서 고른다. 결과 note가 다시 찾는 방법을 알려 주면 따른다.
                 - "주요 이슈", "많이 보도된 것" → list_issues.
                 - "내 감시", 감시 문서 → list_watches 다음 search_documents(watch_id).
                 - 등록 진행·수집 상태 → get_source_status.

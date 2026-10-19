@@ -17,6 +17,7 @@ import org.springframework.stereotype.Service;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.document.DocumentService.DocumentRow;
+import io.sensinghub.document.DocumentService.Filter;
 import io.sensinghub.document.DocumentService.SemanticMatch;
 import io.sensinghub.llm.EmbeddingClient;
 import io.sensinghub.llm.LlmException;
@@ -84,19 +85,19 @@ public class HybridSearch {
     }
 
     /**
-     * @param since 수집 시각 하한 ({@link DocumentService#parseSince} 형식)
+     * @param filter 목록과 같은 조건 (기간·분류·감시·기사 종류·사이트) — 전문·의미 후보 모두에 건다
      * @param limit 돌려줄 문서 수
      */
-    public Result search(CurrentUser user, String since, String topic, Long watchId, String q, int limit) {
+    public Result search(CurrentUser user, Filter filter, String q, int limit) {
         int n = Math.max(1, limit);
         if (q == null || q.isBlank()) {
-            List<Hit> latest = documents.list(user, since, null, topic, watchId, null, null, n).stream()
+            List<Hit> latest = documents.list(user, filter, null, n).stream()
                     .map(r -> new Hit(r, false, false)).toList();
             return new Result(latest, Mode.LATEST, null);
         }
         int pool = Math.max(n, candidates);
-        List<DocumentRow> words = documents.list(user, since, null, topic, watchId, null, q, pool);
-        Semantic semantic = semantic(user, since, topic, watchId, q.strip(), pool);
+        List<DocumentRow> words = documents.list(user, filter, q, pool);
+        Semantic semantic = semantic(user, filter, q.strip(), pool);
         if (semantic.matches() == null) {
             List<Hit> hits = words.stream().limit(n).map(r -> new Hit(r, true, false)).toList();
             return new Result(hits, Mode.FULLTEXT, semantic.note());
@@ -115,7 +116,7 @@ public class HybridSearch {
         return new Result(hits, Mode.HYBRID, null);
     }
 
-    private Semantic semantic(CurrentUser user, String since, String topic, Long watchId, String q, int pool) {
+    private Semantic semantic(CurrentUser user, Filter filter, String q, int pool) {
         if (!embeddings.configured()) {
             return new Semantic(null, "의미 검색 꺼짐");
         }
@@ -128,7 +129,7 @@ public class HybridSearch {
         }
         try {
             float[] vector = embeddings.embed(q);
-            return new Semantic(documents.semanticMatches(user, since, topic, watchId, vector, model, pool, minSimilarity),
+            return new Semantic(documents.semanticMatches(user, filter, vector, model, pool, minSimilarity),
                     null);
         } catch (LlmException e) {
             pause();

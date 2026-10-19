@@ -3,9 +3,11 @@ package io.sensinghub.chat;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import org.slf4j.Logger;
@@ -21,7 +23,10 @@ import io.sensinghub.auth.Role;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.common.UrlNormalizer;
 import io.sensinghub.digest.DigestComposer;
+import io.sensinghub.document.DocumentService;
 import io.sensinghub.document.DocumentService.DocumentRow;
+import io.sensinghub.document.DocumentService.Filter;
+import io.sensinghub.document.DocumentService.SiteMatch;
 import io.sensinghub.document.HybridSearch;
 import io.sensinghub.issue.IssueService;
 import io.sensinghub.issue.IssueService.IssueRow;
@@ -41,6 +46,9 @@ import io.sensinghub.watch.WatchService.WatchView;
  *   <li>도구 오류(권한·중복·형식)는 예외가 아니라 {@code {"ok": false, "error": "..."}} 결과로 돌려 LLM이 그대로 전하게 한다.</li>
  *   <li>문서 검색은 2단계부터 하이브리드({@link HybridSearch}: 낱말 일치 + 의미 유사도, RRF)다. 문서마다 match(낱말·의미·낱말+의미)를
  *       붙여 LLM이 '뜻만 가까운' 문서를 가려 쓰게 한다. 임베딩이 없거나 실패하면 1단계와 같은 전문 검색(최신순)이다.</li>
+ *   <li>사이트(site)·기사 종류(section)는 검색어가 아니라 조건이다. LLM이 이름을 정확히 모를 수 있어 종류 이름은 그 사이트의 실제 이름에
+ *       맞추고(같은 이름, 없으면 포함하는 이름), 못 맞추면 문서 대신 고를 수 있는 이름(sites·site_sections)을 준다. 검색어 낱말이 하나도
+ *       맞지 않았는데 검색어에 사이트·종류 이름이 있으면 site·section으로 거르라고 note로 알려 준다.</li>
  * </ul>
  */
 @Component
@@ -58,6 +66,7 @@ public class ChatTools {
     static final int DEFAULT_ISSUES = 10;
     static final int MAX_ISSUES = 20;
     static final int SUMMARY_CHARS = 300;
+    static final int SECTION_HINTS = 20;
     static final int MAX_WATCHES = 30;
     static final String CREDENTIALS_PATH = "#/admin/credentials";
     static final String CREDENTIALS_GUIDE = "API 키는 채팅으로 받지 않습니다. 관리자가 관리자 메뉴의 'API 키' 화면에서 등록하면 "
@@ -131,15 +140,17 @@ public class ChatTools {
     }
 
     private final HybridSearch search;
+    private final DocumentService documents;
     private final IssueService issues;
     private final WatchService watches;
     private final RegistrationService registrations;
     private final JdbcClient jdbc;
     private final ObjectMapper json;
 
-    public ChatTools(HybridSearch search, IssueService issues, WatchService watches,
+    public ChatTools(HybridSearch search, DocumentService documents, IssueService issues, WatchService watches,
                      RegistrationService registrations, JdbcClient jdbc, ObjectMapper json) {
         this.search = search;
+        this.documents = documents;
         this.issues = issues;
         this.watches = watches;
         this.registrations = registrations;
@@ -162,11 +173,19 @@ public class ChatTools {
         return List.of(
                 new LlmClient.Tool(SEARCH_DOCUMENTS,
                         "수집한 문서(언론 기사·공공기관 문서)를 찾는다. 검색어의 낱말을 모두 포함하는 문서(조사는 무시, 낱말 앞부분 일치)와 "
-                                + "낱말은 달라도 뜻이 가까운 문서(의미 검색이 켜져 있을 때)를 관련도순으로 준다. 문서의 match가 "
+                                + "낱말은 달라도 뜻이 가까운 문서(의미 검색이 켜져 있을 때)를 관련도순으로 준다. 사이트(site, 예: 정책브리핑은 "
+                                + "korea.kr, 동아일보)와 기사 종류(section, 예: 연설문·보도자료·정책뉴스, 언론사는 스포츠·경제 같은 섹션)로 거를 수 "
+                                + "있다. 사이트·종류 이름은 query에 넣지 말고 site·section으로 준다: 다른 주제어가 없으면 query는 비운다 (최신순). "
+                                + "site를 주면 결과의 site_sections에 그 사이트의 기사 종류 이름이 온다. 문서의 match가 "
                                 + "'의미'면 검색어 낱말은 없고 뜻만 가까운 문서다. 각 문서의 ref 번호를 답에 [1]처럼 붙인다. "
                                 + "type이 '언론'인 문서는 제목·분류만 있고 내용은 없다.",
                         object(Map.of(
-                                "query", prop("string", "검색어 (예: '반도체 수출', '가정폭력 피해자 보호'). 비우면 다른 조건에 맞는 최신 문서"),
+                                "query", prop("string", "주제 검색어 (예: '반도체 수출', '가정폭력 피해자 보호'). 사이트·기사 종류 이름은 "
+                                        + "넣지 않는다. 비우면 다른 조건에 맞는 최신 문서"),
+                                "site", prop("string", "이 사이트의 문서만: 도메인 또는 사이트 이름 (예: 'korea.kr'(정책브리핑), "
+                                        + "'yna.co.kr'(연합뉴스), '동아일보'). 도메인이 가장 정확하다"),
+                                "section", prop("string", "이 기사 종류의 문서만 (예: '연설문', '보도자료', '정책뉴스', '스포츠'). "
+                                        + "여럿이면 쉼표로. 정확한 이름을 모르면 site만 주고 결과의 site_sections에서 고른다"),
                                 "days", prop("integer", "최근 며칠 동안 수집한 문서만 (1~90)"),
                                 "since", prop("string", "이 날짜(YYYY-MM-DD, 한국 시각) 이후 수집한 문서만. days보다 우선"),
                                 "topic", enumProp("분류 (이 값 중 하나)", DigestComposer.TOPIC_ORDER),
@@ -256,6 +275,8 @@ public class ChatTools {
         Integer days = integer(args, "days");
         String topic = str(args, "topic");
         Long watchId = longValue(args, "watch_id");
+        String siteArg = str(args, "site");
+        List<String> askedSections = strings(args, "section");
         int limit = clamp(integer(args, "limit"), DEFAULT_DOCUMENTS, 1, MAX_DOCUMENTS);
         List<String> notes = new ArrayList<>();
         if (topic != null && !DigestComposer.TOPIC_ORDER.contains(topic)) {
@@ -265,7 +286,35 @@ public class ChatTools {
         String from = since != null ? since
                 : days != null ? OffsetDateTime.now(DigestComposer.KST).minusDays(clamp(days, 7, 1, 90)).toString() : null;
 
-        HybridSearch.Result found = search.search(user, from, topic, watchId, query, limit);
+        // 사이트·기사 종류: 이름을 실제 값으로 맞추고, 못 맞추면 고를 수 있는 이름을 돌려준다 (LLM이 이름을 정확히 모를 수 있다)
+        Map<String, Object> scope = new LinkedHashMap<>();
+        Map<String, Long> siteSections = Map.of();
+        if (siteArg != null) {
+            List<SiteMatch> matched = documents.matchSites(siteArg);
+            if (matched.isEmpty()) {
+                return noMatch("'" + siteArg + "'과(와) 맞는 수집 사이트가 없습니다. sites의 도메인으로 다시 찾으세요.",
+                        "sites", siteLabels(documents.sitesWithDocuments()));
+            }
+            scope.put("sites", siteLabels(matched));
+            siteSections = documents.sectionCounts(user, siteOnly(siteArg));
+        }
+        List<String> sections = List.of();
+        if (!askedSections.isEmpty()) {
+            Map<String, Long> known = siteArg != null ? siteSections : documents.sectionCounts(user, Filter.NONE);
+            sections = matchSections(askedSections, known.keySet());
+            if (sections.isEmpty()) {
+                return noMatch("기사 종류 '" + String.join("', '", askedSections) + "'이(가) " + (siteArg != null ? "이 사이트에 " : "")
+                        + "없습니다. site_sections의 이름으로 다시 찾으세요.", "site_sections", top(known, SECTION_HINTS));
+            }
+            scope.put("sections", sections);
+            if (!sections.equals(askedSections)) {
+                notes.add("기사 종류 '" + String.join("', '", askedSections) + "'을(를) '" + String.join("', '", sections)
+                        + "'(으)로 찾았습니다.");
+            }
+        }
+
+        Filter filter = new Filter(from, null, topic, watchId, null, sections, siteArg);
+        HybridSearch.Result found = search.search(user, filter, query, limit);
         boolean hybrid = found.mode() == HybridSearch.Mode.HYBRID;
         Map<Long, SiteInfo> sites = sites(found.hits().stream().map(h -> h.row().sourceId()).distinct().toList());
         List<Map<String, Object>> out = new ArrayList<>();
@@ -283,6 +332,9 @@ public class ChatTools {
             }
             doc.put("type", typeLabel(site.siteType()));
             doc.put("source", source);
+            if (d.section() != null) {
+                doc.put("section", d.section());
+            }
             doc.put("title", d.title());
             doc.put("published", kst(d.publishedAt() != null ? d.publishedAt() : d.collectedAt()));
             if (!d.topics().isEmpty()) {
@@ -308,6 +360,7 @@ public class ChatTools {
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("ok", true);
+        result.putAll(scope);
         result.put("count", out.size());
         result.put("order", switch (found.mode()) {
             case HYBRID -> "관련도순 (낱말 일치와 의미 유사도를 합친 순위)";
@@ -318,8 +371,17 @@ public class ChatTools {
             result.put("more", "더 있을 수 있습니다 (최대 " + limit + "건만 보냄)");
         }
         result.put("documents", out);
+        if (!siteSections.isEmpty()) {
+            result.put("site_sections", top(siteSections, SECTION_HINTS));
+        }
         if (out.isEmpty()) {
             notes.add("조건에 맞는 문서가 없습니다.");
+        }
+        if (query != null && found.hits().stream().noneMatch(HybridSearch.Hit::words)) {
+            String hint = namesInQuery(user, query, siteArg, sections, siteSections);
+            if (hint != null) {
+                notes.add(hint);
+            }
         }
         if (meaningOnly) {
             notes.add("match가 '의미'인 문서는 검색어 낱말은 없고 뜻만 가까운 문서입니다. 질문과 실제로 관련 있는 것만 답에 쓰세요.");
@@ -328,6 +390,78 @@ public class ChatTools {
             result.put("note", String.join(" ", notes));
         }
         return success(result, null, null);
+    }
+
+    /**
+     * 검색어 낱말과 맞는 문서가 없을 때, 검색어에 기사 종류·사이트 이름이 들어 있으면 site·section으로 거르라고 알려 준다.
+     * "정책브리핑 연설문"을 query로 찾으면 그 낱말이 모두 든 문서만 찾으므로 대개 0건이다 (종류 이름은 본문 낱말이 아니다).
+     */
+    private String namesInQuery(CurrentUser user, String query, String siteArg, List<String> sections,
+                                Map<String, Long> siteSections) {
+        String q = compact(query);
+        List<String> hints = new ArrayList<>();
+        if (sections.isEmpty()) {
+            Map<String, Long> known = siteArg != null ? siteSections : documents.sectionCounts(user, Filter.NONE);
+            List<String> names = known.keySet().stream().filter(s -> compact(s).length() >= 2 && q.contains(compact(s)))
+                    .limit(3).toList();
+            if (!names.isEmpty()) {
+                hints.add("'" + String.join("', '", names) + "'은(는) 기사 종류 이름입니다: query에서 빼고 section으로 거르세요.");
+            }
+        }
+        if (siteArg == null) {
+            List<String> names = siteLabels(documents.sitesWithDocuments().stream()
+                    .filter(m -> q.contains(m.domain()) || compact(m.name()).length() >= 2 && q.contains(compact(m.name())))
+                    .limit(3).toList());
+            if (!names.isEmpty()) {
+                hints.add("'" + String.join("', '", names) + "'은(는) 사이트입니다: query에서 빼고 site로 거르세요.");
+            }
+        }
+        return hints.isEmpty() ? null : String.join(" ", hints);
+    }
+
+    /** 기사 종류·사이트를 찾지 못했을 때: 문서 없이 고를 수 있는 이름(choices)을 준다. */
+    private Outcome noMatch(String note, String key, List<String> choices) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("count", 0);
+        result.put("documents", List.of());
+        result.put(key, choices);
+        result.put("note", note);
+        return success(result, null, null);
+    }
+
+    /**
+     * 요청한 기사 종류 이름을 실제 이름으로 맞춘다: 공백·대소문자를 무시하고 같은 이름, 없으면 그 이름을 포함하는 이름 모두
+     * ('연설' → '연설문', '브리핑' → '부처 브리핑'·'청와대 브리핑'). 한 글자는 같은 이름만 본다.
+     */
+    static List<String> matchSections(List<String> asked, Collection<String> known) {
+        List<String> out = new ArrayList<>();
+        for (String a : asked) {
+            String key = compact(a);
+            List<String> same = known.stream().filter(k -> compact(k).equals(key)).toList();
+            List<String> hits = !same.isEmpty() || key.length() < 2 ? same
+                    : known.stream().filter(k -> compact(k).contains(key)).toList();
+            hits.stream().filter(h -> !out.contains(h)).forEach(out::add);
+        }
+        return out;
+    }
+
+    private static Filter siteOnly(String site) {
+        return new Filter(null, null, null, null, null, List.of(), site);
+    }
+
+    /** '중부매일(jbnews.com)', 이름이 없으면 도메인. 소스가 여럿인 사이트는 한 번. */
+    private static List<String> siteLabels(List<SiteMatch> sites) {
+        return sites.stream().map(m -> m.name() == null || m.name().isBlank() ? m.domain() : m.name() + "(" + m.domain() + ")")
+                .distinct().toList();
+    }
+
+    private static List<String> top(Map<String, Long> counts, int n) {
+        return counts.keySet().stream().limit(n).toList();
+    }
+
+    private static String compact(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
     }
 
     private Outcome listIssues(CurrentUser user, Map<String, Object> args, Refs refs) {

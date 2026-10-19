@@ -264,7 +264,7 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 
 | 도구 | 하는 일 | 부르는 코드 |
 | --- | --- | --- |
-| `search_documents` | 하이브리드 검색(낱말 모두 포함 + 뜻이 가까운 문서, RRF 관련도순)·기간(`days`·`since`)·토픽·감시로 문서 찾기, 최대 20건. 문서마다 `match`(낱말·의미·낱말+의미). 임베딩이 없으면 전문 검색(최신순) | `HybridSearch.search` |
+| `search_documents` | 하이브리드 검색(낱말 모두 포함 + 뜻이 가까운 문서, RRF 관련도순)·기간(`days`·`since`)·토픽·감시·사이트(`site`: 도메인 또는 이름)·기사 종류(`section`: 연설문·보도자료·정책뉴스, 언론사 섹션)로 문서 찾기, 최대 20건. 문서마다 `match`(낱말·의미·낱말+의미)와 `section`. 검색어 없이 사이트·종류만 주면 최신순. 임베딩이 없으면 전문 검색(최신순) | `HybridSearch.search` |
 | `list_issues` | 최근 주요 이슈 (언론사 많은 순, 기본 최근 3일·2곳 이상) | `IssueService.list` |
 | `list_watches` | 내 키워드 감시 (관리자는 전체) | `WatchService.list` |
 | `create_watch` | 키워드 감시 만들기 — 화면과 같은 규칙 (VIEWER는 승인 대기), 등록 요청 채널 `CHAT` | `WatchService.create(..., Channel.CHAT)` |
@@ -272,6 +272,13 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 | `get_source_status` | 등록·감시 요청 진행 상태와 소스 상태. API 키 대기면 발급 안내(등록 메시지)와 관리자 'API 키' 화면 링크 | `RegistrationService` + 소스 상태 |
 
 - **사실은 도구 결과에서만**: 시스템 프롬프트가 도구 결과에 없는 기사·숫자·상태를 지어내지 말고, 등록·수집 상태는 결과 문장 그대로 전하게 합니다.
+- **사이트·기사 종류는 검색어가 아니라 조건**: "정책브리핑 연설문 최근 3개"는 `site=korea.kr, section=연설문, limit=3`(검색어 없음)으로 찾습니다.
+  종류 이름(`document.section`)과 사이트 이름은 본문 낱말이 아니어서 검색어에 넣으면 0건이 되기 쉽습니다. 그래서 도구 설명·시스템 프롬프트가 이름을
+  조건으로 주라고 하고, LLM이 이름을 정확히 모를 때를 위해 ① 종류 이름은 그 사이트의 실제 이름에 맞추고(같은 이름, 없으면 포함하는 이름: '연설' → '연설문'),
+  ② `site`를 주면 결과 `site_sections`에 그 사이트의 종류 이름(많은 순 20개)을, ③ 사이트·종류를 못 찾으면 문서 대신 고를 수 있는 이름(`sites`·`site_sections`)을,
+  ④ 검색어 낱말이 하나도 맞지 않았는데 검색어에 종류·사이트 이름이 있으면 "query에서 빼고 section(site)으로 거르라"는 `note`를 돌려줍니다.
+  사이트는 도메인(주소를 주면 도메인만, `www.`·대소문자 무시) 또는 사이트 이름(공백 무시)으로 맞추며, 통째로 같은 사이트가 있으면 그것만('한국경제'는
+  한국경제TV를 빼고), 없으면 부분 일치하는 사이트 모두입니다. 사이트 이름이 비어 있는 사이트(korea.kr·yna.co.kr 등 초기 등록분)는 도메인으로만 찾습니다.
 - **언론 기사는 제목·링크로만**: 언론 기사와 AI 봇을 막은 사이트(`ai_restricted`)의 문서는 제목·분류만 LLM에 보내고, 기사 내용을 요약·추측하지 않게 합니다.
   공공기관·기타 문서는 저장된 요약(300자까지)을 보냅니다. URL은 LLM에 보내지 않고 화면이 번호에 붙입니다 (LLM이 주소를 지어낼 수 없다).
 - **근거**: 답이 쓴 `[n]`만 `chat_citation`에 제목·링크 스냅숏으로 남깁니다 (번호를 안 쓰면 그 턴 도구 결과를 근거로). 도구 없이 답한 후속 질문
@@ -403,7 +410,10 @@ curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watche
 
 # 수집 문서 (요약·분류·감시 검색어 포함, 발행일 내림차순). since는 수집 시각 기준, topic·keyword·source_id로 거르고 limit 기본 50·최대 200
 curl 'localhost:8080/api/v1/documents?since=2026-10-15T00:00:00Z&topic=정책·규제&keyword=메타넷' -H 'X-User: viewer'
+# site: 도메인 또는 사이트 이름, section: 기사 종류 정확 일치 (여러 번 주면 그중 하나, 값 안의 쉼표는 나누지 않음)
+curl 'localhost:8080/api/v1/documents?site=korea.kr&section=연설문&section=보도자료&limit=3' -H 'X-User: viewer'
 curl localhost:8080/api/v1/documents/1 -H 'X-User: viewer'      # 본문·첨부 포함. GET /api/v1/documents/topics?since=... 는 토픽별 건수
+curl 'localhost:8080/api/v1/documents/sections?site=korea.kr' -H 'X-User: viewer'   # 기사 종류별 건수 (since·source_id·site·topic)
 
 # 일간 다이제스트 구독 (매일 hourKst시 KST에 지난 다이제스트 이후 새 문서를 감시별·토픽별로 묶어 메일 또는 웹훅으로) · 내 구독 · 미리보기·즉시 전송
 curl -X POST localhost:8080/api/v1/digests -H 'X-User: viewer' -H 'Content-Type: application/json' -d '{"name":"아침 보고","channel":"EMAIL","target":"me@example.com","hourKst":8,"filters":{"watchIds":[1],"topics":["정책·규제","입찰·공고"]}}'
