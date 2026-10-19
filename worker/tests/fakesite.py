@@ -220,3 +220,55 @@ def sectioned_news_routes(sections=("economy", "society"), per_section=4) -> dic
             <meta property="article:published_time" content="{_iso(1)}"></head>
             <body><article><p>{BODY}</p><p>{BODY}</p></article></body></html>""")
     return routes
+
+
+# 정책브리핑(korea.kr)형: (하위 사이트맵, 상세 경로, 종류 이름, 글 수, 상세 품질)
+POLICY_KINDS = (
+    ("brief", "/briefing/pressReleaseView.do", "보도자료", 8, "good"),
+    ("policy", "/news/policyNewsView.do", "정책뉴스", 6, "good"),
+    ("briefing", "/briefing/presidentView.do", "청와대 브리핑", 4, "good"),
+    ("briefing", "/briefing/policyBriefingView.do", "부처 브리핑", 3, "good"),
+    ("speech", "/briefing/speechView.do", "연설문", 3, "thin"),       # 본문이 짧아 품질 검사에 떨어진다
+    ("cartoon", "/multi/cartoonView.do", "카툰", 4, "good"),          # 기사가 아닌 종류 (기본 꺼짐)
+)
+
+
+def policy_kind_ids(kind_index: int, count: int) -> list[int]:
+    return [10000 * (kind_index + 1) + i for i in range(1, count + 1)]
+
+
+def multi_kind_routes(counts: dict[str, int] | None = None) -> dict:
+    """사이트맵 색인이 기사 종류별 하위 사이트맵으로 나뉜 사이트. RSS는 없다. 하위 sitemap_briefing에는 두 모양이 섞여 있다.
+    상세 <title>은 "글 제목 - 종류 | 뉴스 | 사이트 이름" 꼴이다. counts로 종류(상세 경로)별 글 수를 바꾼다. 주소의 {base}는 호출자가 채운다."""
+    counts = counts or {}
+    children: dict[str, list[tuple[str, float]]] = {}
+    pages: dict[str, str] = {}
+    for k, (child, path, name, n, quality) in enumerate(POLICY_KINDS):
+        for j, i in enumerate(policy_kind_ids(k, counts.get(path, n))):
+            url = f"{path}?newsId={i}"
+            children.setdefault(child, []).append((url, j * 0.1))
+            body = f"<p>{BODY}</p>" if quality == "good" else "<p>짧은 안내입니다.</p>"
+            pages[url] = f"""<html><head><title>{name} 글 {i}번 안내 - {name} | 뉴스 | 테스트 정책브리핑</title>
+            <meta property="og:title" content="{name} 글 {i}번 안내">
+            <meta property="article:published_time" content="{_iso(1)}"></head><body><article>{body}</article></body></html>"""
+    children["list"] = [("/news/policyNewsList.do", 30), ("/briefing/pressReleaseList.do", 30)]
+    child_age = {"brief": 0.1, "policy": 0.2, "briefing": 0.3, "speech": 2, "cartoon": 5, "list": 30}
+    index = ("<?xml version='1.0'?><sitemapindex>"
+             + "".join(f"<sitemap><loc>{{base}}/sitemap_{c}.xml</loc><lastmod>{_iso(child_age[c])}</lastmod></sitemap>"
+                       for c in children) + "</sitemapindex>")
+    home = ('<html><head><title>테스트 정책브리핑</title></head><body><nav>'
+            '<a href="/news/policyNewsList.do">뉴스</a><a href="/briefing/pressReleaseList.do">브리핑룸</a>'
+            '<a href="/briefing/speechList.do">연설문</a></nav><p>정책 소식</p></body></html>')
+    routes = {"/": (200, "text/html; charset=utf-8", home),
+              "/robots.txt": (200, "text/plain", "User-agent: *\nAllow: /\nSitemap: {base}/sitemapindex.xml\n"),
+              "/sitemapindex.xml": (200, "application/xml", index)}
+    for child, entries in children.items():
+        routes[f"/sitemap_{child}.xml"] = (200, "application/xml", "<?xml version='1.0'?><urlset>" + "".join(
+            f"<url><loc>{{base}}{u}</loc><lastmod>{_iso(age)}</lastmod></url>" for u, age in entries) + "</urlset>")
+    for url, html in pages.items():
+        routes[url] = (200, "text/html; charset=utf-8", html)
+    return routes
+
+
+def with_base(routes: dict, base: str) -> dict:
+    return {k: (s, t, b.replace("{base}", base)) for k, (s, t, b) in routes.items()}

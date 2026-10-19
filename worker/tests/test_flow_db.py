@@ -1323,3 +1323,76 @@ def test_crawled_articles_are_matched_against_keyword_watches(env):
         (watch_id,)).fetchall()
     assert [(h["keyword"], h["title"]) for h in hits] == [("기사 제목 103번", "기사 제목 103번 소식")]
     assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "ACTIVE"
+
+
+# ---------------------------------------------------------------------- 사이트 하나에 기사 종류 여러 개
+
+def policy_site(sites: list[Site], counts: dict[str, int] | None = None) -> Site:
+    """사이트맵 색인이 종류별 하위로 나뉜 정책브리핑(korea.kr)형 사이트."""
+    from fakesite import multi_kind_routes, with_base
+    site = Site({}); sites.append(site)
+    site.routes.update(with_base(multi_kind_routes(counts), site.base))
+    return site
+
+
+def sections_count(store: Store) -> dict:
+    rows = store.conn.execute("SELECT section, count(*) AS c FROM document GROUP BY section").fetchall()
+    return {r["section"]: r["c"] for r in rows}
+
+
+def test_multi_kind_site_collects_every_enabled_kind_with_kind_sections(env):
+    from fakesite import multi_kind_routes, with_base
+    store, runner, settings, sites = env
+    site = policy_site(sites)
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    src = q(store, "SELECT s.method, v.config, v.version, v.change_note FROM source s "
+                   "JOIN source_config_version v ON v.id = s.active_config_version_id WHERE s.id = %s", source_id)
+    assert src["method"] == "SITEMAP" and src["version"] == 1
+    assert {k["name"]: k["enabled"] for k in src["config"]["article_patterns"]} == {
+        "보도자료": True, "정책뉴스": True, "청와대 브리핑": True, "부처 브리핑": True, "연설문": False, "cartoon": False}
+    assert "기사 종류 6개 중 4개 켬" in src["change_note"]
+    # 첫 수집이 켜진 종류를 모두 가져오고, 문서 section에 종류 이름을 남긴다
+    assert sections_count(store) == {"보도자료": 8, "정책뉴스": 6, "청와대 브리핑": 4, "부처 브리핑": 3}
+    assert "21건" in q(store, "SELECT result_message FROM registration_request")["result_message"]
+
+    # 다음 수집: 새 글이 생긴 종류(정책뉴스 2건)만 새로 받는다
+    site.routes.update(with_base(multi_kind_routes({"/news/policyNewsView.do": 8}), site.base))
+    site.hits.clear()
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    job = q(store, "SELECT found_count, new_count FROM crawl_job ORDER BY id DESC LIMIT 1")
+    assert job["found_count"] == 23 and job["new_count"] == 2
+    assert sum("View.do" in h for h in site.hits) == 2
+    assert sections_count(store)["정책뉴스"] == 8
+
+
+def test_legacy_single_pattern_source_keeps_working_and_rediscover_adds_kinds(env):
+    from sensing_worker.discovery import pattern_from_signature
+    store, runner, settings, sites = env
+    site = policy_site(sites)
+    source_id = register(store, site.base)
+    store.conn.execute("DELETE FROM crawl_job WHERE source_id = %s", (source_id,))
+    # 예전 워커가 만든 설정: 종류 목록 없이 보도자료 패턴 하나 (korea.kr 설정 v1과 같은 모양)
+    legacy = {"method": "SITEMAP", "hubs": [f"{site.base}/sitemapindex.xml"], "site_domain": "127.0.0.1",
+              "article_pattern": pattern_from_signature("/briefing/pressReleaseView.do?newsId={n}"),
+              "sections": [], "excluded_sections": [], "selectors": {}, "date_format": None,
+              "store_scope": "FULL", "collect_attachments": True}
+    store.activate_new_config(source_id, legacy, "자동 탐색으로 생성", 360)
+
+    # 설정 버전을 다시 쓰지 않아도 예전과 똑같이 수집한다 (보도자료만, section은 상세 메타 그대로)
+    assert crawl(store, runner, settings, source_id) == "SUCCESS"
+    assert sections_count(store) == {None: 8}
+
+    # 관리자 '다시 탐색'(백엔드 REDISCOVER가 넣는 작업) → 새 설정 버전에 종류가 잡히고 나머지 종류를 가져온다
+    store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'ONBOARD', 'MANUAL')", (source_id,))
+    assert process_one(store, runner, settings) == "SUCCESS"
+    versions = store.conn.execute("SELECT version, status, change_note FROM source_config_version WHERE source_id = %s "
+                                  "ORDER BY version", (source_id,)).fetchall()
+    assert [(v["version"], v["status"]) for v in versions] == [(1, "RETIRED"), (2, "ACTIVE")]
+    assert versions[1]["change_note"].startswith("자동 탐색 다시 실행")
+    config = q(store, "SELECT v.config FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id "
+                      "WHERE s.id = %s", source_id)["config"]
+    assert len([k for k in config["article_patterns"] if k["enabled"]]) == 4
+    counts = sections_count(store)
+    assert counts == {None: 8, "정책뉴스": 6, "청와대 브리핑": 4, "부처 브리핑": 3}   # 이미 받은 보도자료는 다시 받지 않는다

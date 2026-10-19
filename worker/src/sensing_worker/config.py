@@ -40,6 +40,10 @@ class Settings:
     # 실행 1회당 상한
     max_pages_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_PAGES", "60")))
     max_articles_per_run: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_ARTICLES", "40")))
+    # 사이트 하나에 기사 종류(상세 URL 모양) 여러 개: 등록 때 켜 둘 종류 수 상한(대표 종류 포함)과, 대표 종류 말고 품질 검사할
+    # 후보 수 상한. 후보 하나에 표본 5건을 더 연다. 0이면 종류를 늘리지 않는다 (대표 종류 하나)
+    max_kinds: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_KINDS", "6")))
+    max_kind_checks: int = field(default_factory=lambda: int(os.getenv("SENSING_MAX_KIND_CHECKS", "8")))
     # 수집량 급감 감지: 기사 후보 수가 평소(같은 설정 버전의 최근 정상 실행 평균)의 이 비율 미만이면 이상으로 본다
     anomaly_drop_ratio: float = field(default_factory=lambda: float(os.getenv("SENSING_ANOMALY_RATIO", "0.3")))
     # 이상이 이 횟수만큼 연속되면 소스를 BROKEN으로 바꾼다

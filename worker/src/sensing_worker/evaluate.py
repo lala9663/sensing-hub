@@ -51,6 +51,7 @@ class SiteResult:
     recipe_source: str = "heuristic"      # heuristic | llm (LLM 설정이 없으면 항상 heuristic)
     sample_url: str | None = None         # 목록 파일에 적은 샘플 기사 주소
     sample_match: bool | None = None      # 고른 패턴이 샘플 기사를 잡는가 (샘플이 없거나 실패하면 None)
+    kinds: list[dict] | None = None       # 기사 종류가 둘 이상이면 [{name, signature, enabled, count, hubs, quality, note}]
 
 
 def evaluate_site(url: str, settings: Settings, llm: LlmClient | None = None,
@@ -76,7 +77,12 @@ def evaluate_site(url: str, settings: Settings, llm: LlmClient | None = None,
         result.pattern = found.article_pattern.get("signature") or found.article_pattern.get("path")
         result.recipe_source = found.recipe_source
         if sample_url:
-            result.sample_match = matches(sample_url, found.article_pattern)
+            # 켜진 종류 가운데 하나라도 샘플 기사를 잡으면 적중
+            on = [k for k in found.kinds if k["enabled"]] or [found.article_pattern]
+            result.sample_match = any(matches(sample_url, k) for k in on)
+        if len(found.kinds) > 1:
+            result.kinds = [{k: kind.get(k) for k in ("name", "signature", "enabled", "count", "hubs", "quality", "note")}
+                            for kind in found.kinds]
         result.outcome = "OK"
     except CrawlFailure as e:
         result.code, result.message = e.code.value, str(e)
@@ -128,6 +134,9 @@ def summarize(results: list[SiteResult], target: int | None = None) -> str:
         sample = "-" if r.sample_match is None else "O" if r.sample_match else "X"
         lines.append(f"{r.outcome:<8}{urlsplit(r.url).netloc[:33]:<34}{r.method or '-':<9}{recipe:<10}"
                      f"{r.site_type or '-':<8}{sample:<6}{r.requests:>5}{r.seconds:>7}  {note}")
+        if r.kinds:
+            lines.append("        기사 종류: " + ", ".join(
+                f"{k['name']}{'' if k['enabled'] else '(꺼짐)'}" for k in r.kinds))
     ok = sum(r.outcome == "OK" for r in results)
     goal = f" (목표 {target}곳: {'달성' if ok >= target else '미달'})" if target else ""
     lines.append(f"\n자동 등록 성공 {ok}/{len(results)}곳{goal}")

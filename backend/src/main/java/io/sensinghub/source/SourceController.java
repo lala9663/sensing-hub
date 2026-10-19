@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -67,5 +68,17 @@ public class SourceController {
     @PostMapping("/{id}/configs/{version}/activate")
     public SourceSummary activate(CurrentUser user, @PathVariable long id, @PathVariable int version) {
         return service.activateConfig(user, id, version);
+    }
+
+    public record KindRequest(String signature, Boolean enabled) {
+    }
+
+    /** 기사 종류 켜고 끄기: 종류는 서명으로 고르고, 바뀌면 설정 새 버전이 활성화된다. 소스 상세를 돌려준다. */
+    @PutMapping("/{id}/kinds")
+    public SourceDetail setKind(CurrentUser user, @PathVariable long id, @RequestBody KindRequest body) {
+        if (body.signature() == null || body.signature().isBlank() || body.enabled() == null) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", "signature와 enabled를 보내 주세요.");
+        }
+        return service.setKindEnabled(user, id, body.signature(), body.enabled());
     }
 }

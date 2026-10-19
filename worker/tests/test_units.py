@@ -923,6 +923,191 @@ def test_crawl_stops_at_blocking_hub(tmp_path):
     assert store.record_error.call_args.args[1].code == Code.HTTP_4XX
 
 
+# ---------------------------------------------------------------------- 사이트 하나에 기사 종류 여러 개
+
+def _policy_site():
+    from fakesite import Site, multi_kind_routes, with_base
+    site = Site({})
+    site.routes.update(with_base(multi_kind_routes(), site.base))
+    return site
+
+
+def _kinds_by_path(kinds: list[dict]) -> dict[str, dict]:
+    return {k["signature"].split("?")[0]: k for k in kinds}
+
+
+def test_discover_finds_article_kinds_per_child_sitemap():
+    site = _policy_site()
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, detail = discover(f, "127.0.0.1", site.base, "PUBLIC")
+        assert result.method == "SITEMAP"
+        assert result.article_pattern["signature"] == "/briefing/pressReleaseView.do?newsId={n}"   # 대표 종류는 그대로
+        assert [k["name"] for k in result.kinds if k["enabled"]] == ["보도자료", "정책뉴스", "청와대 브리핑", "부처 브리핑"]
+        kinds = _kinds_by_path(result.kinds)
+        assert len(kinds) == 6
+        # 종류마다 자기 하위 사이트맵이 허브다 (한 하위에 두 모양이 섞여 있어도 모양별로 나뉜다)
+        assert kinds["/briefing/pressReleaseView.do"]["hubs"] == [f"{site.base}/sitemap_brief.xml"]
+        assert kinds["/briefing/presidentView.do"]["hubs"] == [f"{site.base}/sitemap_briefing.xml"]
+        assert kinds["/briefing/policyBriefingView.do"]["hubs"] == [f"{site.base}/sitemap_briefing.xml"]
+        assert kinds["/news/policyNewsView.do"]["count"] == 6 and "5건 통과" in kinds["/news/policyNewsView.do"]["quality"]
+        cartoon, speech = kinds["/multi/cartoonView.do"], kinds["/briefing/speechView.do"]
+        assert not cartoon["enabled"] and "기사가 아닌" in cartoon["note"] and cartoon["quality"] is None
+        assert not speech["enabled"] and "품질" in speech["note"] and speech["name"] == "연설문"
+        assert not any("cartoonView" in h for h in site.hits)            # 기본 꺼짐 종류는 표본도 열지 않는다
+        assert "기사 종류 6개 중 4개 켬" in detail
+        config = result.to_config()
+        assert config["article_patterns"][0]["signature"] == config["article_pattern"]["signature"]
+        assert config["hubs"] == [f"{site.base}/sitemapindex.xml"]       # 예전 워커가 읽는 자리는 그대로
+        assert matches(f"{site.base}/news/policyNewsView.do?newsId=5", config["article_patterns"][1])
+    finally:
+        f.close()
+        site.close()
+
+
+def test_discover_turns_on_only_top_kinds_and_can_skip_kind_search():
+    site = _policy_site()
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, _ = discover(f, "127.0.0.1", site.base, "PUBLIC",
+                             settings=Settings(min_interval_seconds=0, max_kinds=3))
+        assert [k["name"] for k in result.kinds if k["enabled"]] == ["보도자료", "정책뉴스", "청와대 브리핑"]
+        rest = _kinds_by_path(result.kinds)
+        assert "상위 3개" in rest["/briefing/policyBriefingView.do"]["note"]
+        assert "상위 3개" in rest["/briefing/speechView.do"]["note"]
+        assert not any("speechView" in h or "policyBriefingView" in h for h in site.hits)   # 검사하지 않았다
+
+        site.hits.clear()
+        result, detail = discover(f, "127.0.0.1", site.base, "PUBLIC",
+                                  settings=Settings(min_interval_seconds=0, max_kind_checks=0))
+        assert len(result.kinds) == 1 and result.kinds[0]["enabled"]
+        assert result.kinds[0]["hubs"] == [f"{site.base}/sitemapindex.xml"]   # 종류가 하나면 예전과 같은 허브
+        assert "기사 종류" not in detail
+        assert "/sitemap_cartoon.xml" not in site.hits                        # 하위 사이트맵을 더 열지 않는다
+    finally:
+        f.close()
+        site.close()
+
+
+def test_multi_kind_heuristic_result_skips_llm_recipe():
+    site = _policy_site()
+    llm = FakeLlm([portal_recipe(site.base)])
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, _ = discover(f, "127.0.0.1", site.base, "PUBLIC", llm=llm)
+        assert result.recipe_source == "heuristic" and len([k for k in result.kinds if k["enabled"]]) == 4
+        assert llm.calls == []                       # 종류 여럿을 켠 휴리스틱 설정이면 레시피를 만들지 않는다
+    finally:
+        f.close()
+        site.close()
+
+
+def test_kind_naming_and_non_article_rules():
+    from sensing_worker.discovery import is_non_article_kind, kind_name, sitemap_label, title_kind_piece
+    title = "연말까지 수도권 주택 착공 - 정책뉴스 | 뉴스 | 대한민국 정책브리핑"
+    assert title_kind_piece(title, "연말까지 수도권 주택 착공") == "정책뉴스"
+    assert title_kind_piece("기사 제목 : 네이버 뉴스", "기사 제목") is None            # 꼬리가 사이트 이름뿐
+    assert title_kind_piece("기사 제목(종합) - 사이트", "기사 제목") is None
+    assert sitemap_label("https://www.korea.kr/sitemap_policy.xml") == "policy"
+    assert sitemap_label("https://x.com/news-sitemap.xml") == "news"
+    pressrelease = pattern_from_signature("/briefing/pressReleaseView.do?newsId={n}")
+    sections = [{"name": "브리핑룸", "url": "https://www.korea.kr/briefing/pressReleaseList.do"}]
+    assert kind_name(pressrelease, (), sections) == "브리핑룸"                       # 홈 메뉴의 목록 주소
+    assert kind_name(pressrelease, (), [], ["brief"]) == "brief"                      # 하위 사이트맵 이름표
+    assert kind_name(pressrelease) == "pressReleaseView"                               # 경로 끝 조각
+    assert kind_name(pattern_from_signature("/video/index.html?newsId={n}")) == "video"   # index·view 같은 말은 건너뛴다
+    arts = [(f"글 {i} - 보도자료 | 브리핑룸 | 사이트", Article(url="u", title=f"글 {i}")) for i in range(3)]
+    assert kind_name(pressrelease, arts, sections) == "보도자료"                       # 표본 <title>이 먼저
+    arts[0][1].section = arts[1][1].section = "정책 브리핑"
+    assert kind_name(pressrelease, arts, sections) == "정책 브리핑"                    # article:section이 가장 먼저
+    assert is_non_article_kind(pattern_from_signature("/multi/cartoonView.do?newsId={n}"), "cartoon")
+    assert is_non_article_kind(pattern_from_signature("/archive/expDocView.do?newsId={n}"), "전문자료")
+    assert is_non_article_kind(pressrelease, "보도자료", ["visual"])                    # 하위 사이트맵 이름
+    assert is_non_article_kind(pressrelease, "포토 뉴스")
+    assert not is_non_article_kind(pattern_from_signature("/news/policyNewsView.do?newsId={n}"), "정책뉴스", ["policy"])
+
+
+def test_share_quota_round_robin_and_legacy_config_reads_as_one_kind():
+    from sensing_worker.discovery import article_kinds, share_quota
+    picked = share_quota([["a1", "a2", "a3", "a4"], ["b1"], [], ["c1", "c2", "c3"]], 6)
+    assert picked == [(0, "a1"), (1, "b1"), (3, "c1"), (0, "a2"), (3, "c2"), (0, "a3")]   # 남은 몫은 남은 종류가
+    assert share_quota([["a1"], ["b1"]], 10) == [(0, "a1"), (1, "b1")]
+    assert share_quota([["a1", "a2"]], 0) == []
+    legacy = article_kinds(NEWS_CONFIG)                      # article_patterns가 없는 예전 설정
+    assert len(legacy) == 1 and legacy[0]["name"] is None and legacy[0]["hubs"] == NEWS_CONFIG["hubs"]
+    assert legacy[0]["signature"] == "/news/articleView.html?idxno={n}"
+    on = {**NEWS_CONFIG, "article_patterns": [{**NEWS_CONFIG["article_pattern"], "name": "기사", "hubs": [], "enabled": True},
+                                              {**NEWS_CONFIG["article_pattern"], "name": "끔", "hubs": ["h"], "enabled": False}]}
+    assert [(k["name"], k["hubs"]) for k in article_kinds(on)] == [("기사", NEWS_CONFIG["hubs"])]   # 허브가 비면 설정 허브
+
+
+def _policy_kind(base: str, name: str, path: str, child: str, enabled: bool = True) -> dict:
+    return {**pattern_from_signature(f"{path}?newsId={{n}}"), "name": name, "hubs": [f"{base}/sitemap_{child}.xml"],
+            "enabled": enabled}
+
+
+def test_crawl_shares_article_limit_across_kinds_round_robin(tmp_path):
+    from collections import Counter
+    from sensing_worker.db import Job
+    from sensing_worker.jobs import JobRunner
+    site = _policy_site()
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True, evidence_dir=str(tmp_path),
+                 max_articles_per_run=7)
+    store = MagicMock()
+    store.found_baseline.return_value = None
+    store.known_urls.return_value = set()
+    store.upsert_document.return_value = (1, "NEW")
+    runner = JobRunner(store, PoliteFetcher(s), s, llm=NoLlm())
+    job = Job(id=7, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=None, attempt=1)
+    b = site.base
+    config = {"method": "SITEMAP", "hubs": [f"{b}/sitemapindex.xml"], "site_domain": "127.0.0.1",
+              "article_pattern": pattern_from_signature("/briefing/pressReleaseView.do?newsId={n}"),
+              "article_patterns": [
+                  _policy_kind(b, "보도자료", "/briefing/pressReleaseView.do", "brief"),
+                  _policy_kind(b, "정책뉴스", "/news/policyNewsView.do", "policy"),
+                  _policy_kind(b, "청와대 브리핑", "/briefing/presidentView.do", "briefing"),
+                  _policy_kind(b, "부처 브리핑", "/briefing/policyBriefingView.do", "briefing"),
+                  _policy_kind(b, "연설문", "/briefing/speechView.do", "list"),          # 허브에 이 모양이 없다
+                  _policy_kind(b, "카툰", "/multi/cartoonView.do", "cartoon", enabled=False)]}
+    try:
+        stats = runner._crawl(job, {"domain": "127.0.0.1", "active_config_version_id": None}, config)
+        assert stats.found == 8 + 6 + 4 + 3 and stats.new == 7
+        sections = [c.kwargs["section"] for c in store.upsert_document.call_args_list]
+        assert sections[:4] == ["보도자료", "정책뉴스", "청와대 브리핑", "부처 브리핑"]          # 돌아가며 하나씩
+        assert Counter(sections) == {"보도자료": 2, "정책뉴스": 2, "청와대 브리핑": 2, "부처 브리핑": 1}
+        assert site.hits.count("/sitemap_briefing.xml") == 1                                   # 같은 허브는 한 번만
+        assert not any("cartoon" in h for h in site.hits)                                     # 꺼진 종류는 열지 않는다
+        # 한 종류만 비면 실패시키지 않고 기록만 남긴다
+        assert stats.errors == 1
+        failure = store.record_error.call_args.args[1]
+        assert failure.code == Code.PARSE_EMPTY and "연설문" in str(failure) and failure.url.endswith("/sitemap_list.xml")
+    finally:
+        runner.f.close()
+        site.close()
+
+
+def test_crawl_with_legacy_single_pattern_config_is_unchanged(tmp_path):
+    from sensing_worker.db import Job
+    from sensing_worker.jobs import JobRunner
+    site = _policy_site()
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True, evidence_dir=str(tmp_path))
+    store = MagicMock()
+    store.found_baseline.return_value = None
+    store.known_urls.return_value = set()
+    store.upsert_document.return_value = (1, "NEW")
+    runner = JobRunner(store, PoliteFetcher(s), s, llm=NoLlm())
+    job = Job(id=7, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=None, attempt=1)
+    config = {"method": "SITEMAP", "hubs": [f"{site.base}/sitemapindex.xml"], "site_domain": "127.0.0.1",
+              "article_pattern": pattern_from_signature("/briefing/pressReleaseView.do?newsId={n}")}
+    try:
+        stats = runner._crawl(job, {"domain": "127.0.0.1", "active_config_version_id": None}, config)
+        assert stats.found == 8 and stats.new == 8 and stats.errors == 0      # 보도자료만 (색인의 최신 하위 3개에서)
+        assert {c.kwargs["section"] for c in store.upsert_document.call_args_list} == {None}   # 상세 메타 그대로
+    finally:
+        runner.f.close()
+        site.close()
+
+
 # ---------------------------------------------------------------------- 공개 API 소스 (M2)
 
 def _api_fetcher(handler) -> PoliteFetcher:

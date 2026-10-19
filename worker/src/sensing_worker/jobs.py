@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,10 +15,12 @@ from .codes import API_KEY_CODES, Code, CrawlFailure, MESSAGES
 from .company import biz_status_signal, build_corp_index, debarment_signal, disclosure_signal, pick_corp_code
 from .config import Settings
 from .db import Job, Store, sha256
-from .discovery import (Discoverer, DiscoveryResult, canonical_article_url, looks_like_feed, looks_like_sitemap,
-                        matches, parse_feed_entries, same_site, sitemap_urls)
+from .discovery import (MAX_LISTED_KINDS, NON_ARTICLE_NOTE, Discoverer, DiscoveryResult, article_kinds,
+                        canonical_article_url, covered, hubs_for, is_non_article_kind, kind_entry, kind_name,
+                        looks_like_feed, looks_like_sitemap, matches, page_title, parse_feed_entries, rank_kinds,
+                        same_site, share_quota, sitemap_urls, unique_names)
 from .evidence import EvidenceStore
-from .extract import extract_article, links_with_dates
+from .extract import Article, extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, Page, PoliteFetcher
 from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
 from . import portal
@@ -328,17 +331,26 @@ class JobRunner:
         return new, note
 
     def _crawl(self, job: Job, source: dict, config: dict) -> CrawlStats:
-        stats = CrawlStats()
-        pattern = config["article_pattern"]
-        domain = config.get("site_domain") or source["domain"]
+        """허브에서 기사 후보를 모아 새 기사만 받는다.
 
-        # 허브에서 기사 후보 모으기
-        candidates: list[str] = []
-        hints: dict[str, str] = {}  # 기사 URL → 목록·피드에 보인 날짜 (상세에 날짜가 없을 때 씀)
+        기사 종류(설정 article_patterns)가 여럿이면 켜진 종류마다 자기 허브에서 자기 모양의 주소를 찾고, 한 실행 상한
+        (max_articles_per_run)을 종류별로 돌아가며 나눈다 (share_quota) — 새 글이 많은 종류 하나가 상한을 다 먹지 않는다.
+        여러 종류가 같은 허브를 써도 허브는 한 번만 연다. 종류가 둘 이상인 설정이면 문서 section에 종류 이름을 남긴다.
+        종류 목록이 없는 예전 설정은 article_pattern·hubs 하나짜리 종류로 읽어 예전과 똑같이 수집한다 (article_kinds).
+        """
+        stats = CrawlStats()
+        kinds = article_kinds(config)
+        if not kinds:
+            raise CrawlFailure(Code.DISCOVERY_FAILED, "켜진 기사 종류가 없습니다.", stage="LIST")
+        named = len(config.get("article_patterns") or []) > 1
+        domain = config.get("site_domain") or source["domain"]
+        hubs = list(dict.fromkeys(h for k in kinds for h in k["hubs"]))
+
+        # 허브 열기
+        entries_by_hub: dict[str, list[tuple[str, str | None]]] = {}
         first_hub_html: str | None = None
-        opened = 0  # 실제로 연 허브 수
         hub_failures: list[CrawlFailure] = []  # 못 연 허브의 비차단 오류 (섹션 하나가 404여도 수집은 계속한다)
-        for hub in config["hubs"]:
+        for hub in hubs:
             try:
                 page = self.f.get(hub)
             except CrawlFailure as e:
@@ -351,7 +363,6 @@ class JobRunner:
                 log.warning("hub skipped source=%s url=%s code=%s", job.source_id, hub, e.code.value)
                 hub_failures.append(e)
                 continue
-            opened += 1
             first_hub_html = first_hub_html if first_hub_html is not None else page.text
             if looks_like_feed(page.text):
                 entries = parse_feed_entries(page.text)
@@ -359,13 +370,8 @@ class JobRunner:
                 entries = [(u, None) for u in sitemap_urls(self.f.get, page.text)[: self.s.max_articles_per_run * 3]]
             else:
                 entries = links_with_dates(page.text, page.url)
-            for u, date in entries:
-                if same_site(u, domain) and matches(u, pattern):
-                    c = canonical_article_url(u, pattern)
-                    candidates.append(c)
-                    if date and c not in hints:
-                        hints[c] = date
-        if not opened and hub_failures:
+            entries_by_hub[hub] = entries
+        if not entries_by_hub and hub_failures:
             # 허브를 하나도 못 열었다 → 마지막 오류로 실패 처리 (run()이 기록·반영). 앞의 오류는 여기서 남긴다
             for hf in hub_failures[:-1]:
                 self._record(job, hf)
@@ -373,30 +379,55 @@ class JobRunner:
         for hf in hub_failures:
             self._record(job, hf)
             stats.errors += 1
-        candidates = list(dict.fromkeys(candidates))
-        stats.found = len(candidates)
+
+        # 종류마다 자기 허브에서 자기 모양의 주소 (앞 종류가 가져간 주소는 뒤 종류에 넣지 않는다)
+        groups: list[list[str]] = []
+        hints: dict[str, str] = {}  # 기사 URL → 목록·피드에 보인 날짜 (상세에 날짜가 없을 때 씀)
+        taken: set[str] = set()
+        for kind in kinds:
+            group: list[str] = []
+            for hub in kind["hubs"]:
+                for u, date in entries_by_hub.get(hub, ()):
+                    if not (same_site(u, domain) and matches(u, kind)):
+                        continue
+                    c = canonical_article_url(u, kind)
+                    if date and c not in hints:
+                        hints[c] = date
+                    if c not in taken:
+                        taken.add(c)
+                        group.append(c)
+            groups.append(group)
+        stats.found = len(taken)
 
         hub_evidence = (first_hub_html or "")[:EVIDENCE_CHARS] or None
-        if not candidates:
-            raise CrawlFailure(Code.PARSE_EMPTY, url=config["hubs"][0] if config["hubs"] else None, stage="LIST",
-                               evidence=hub_evidence)
+        if not taken:
+            raise CrawlFailure(Code.PARSE_EMPTY, url=hubs[0] if hubs else None, stage="LIST", evidence=hub_evidence)
+        if named:
+            # 다른 종류는 잡히는데 한 종류만 비었다: 그 목록·사이트맵만 바뀐 것 (실패시키지 않고 기록만)
+            for kind, group in zip(kinds, groups):
+                if not group and any(h in entries_by_hub for h in kind["hubs"]):
+                    self._record(job, CrawlFailure(
+                        Code.PARSE_EMPTY, f"기사 종류 '{kind.get('name')}'의 허브에서 기사 후보를 찾지 못했습니다.",
+                        url=kind["hubs"][0], stage="LIST"))
+                    stats.errors += 1
 
         # 조용한 실패 감지 1: 허브에 보이는 기사 후보가 평소보다 크게 줄었다 (일부 섹션만 개편 등)
         baseline = self.db.found_baseline(job.source_id, source.get("active_config_version_id"))
         if baseline and stats.found < baseline * self.s.anomaly_drop_ratio:
             self._record(job, CrawlFailure(
                 Code.ANOMALY_DROP, f"기사 후보가 {stats.found}건으로 평소({baseline:.1f}건)보다 크게 줄었습니다.",
-                url=config["hubs"][0], stage="LIST", evidence=hub_evidence))
+                url=hubs[0], stage="LIST", evidence=hub_evidence))
             stats.errors += 1
             stats.anomalies += 1
 
-        hashes = {sha256(u): u for u in candidates}
-        known = self.db.known_urls(list(hashes))
-        fresh = [u for h, u in hashes.items() if h not in known][: self.s.max_articles_per_run]
+        url_hash = {u: sha256(u) for g in groups for u in g}
+        known = self.db.known_urls(list(url_hash.values()))
+        fresh = share_quota([[u for u in g if url_hash[u] not in known] for g in groups], self.s.max_articles_per_run)
 
         scope = config.get("store_scope", "FULL")
         missing_sample: tuple[str, str] | None = None  # 제목·발행일을 못 찾은 첫 페이지 (증거용)
-        for url in fresh:
+        for i, url in fresh:
+            label = kinds[i].get("name") if named else None
             try:
                 page = self.f.get(url)
             except CrawlFailure as e:
@@ -413,7 +444,7 @@ class JobRunner:
                 missing_sample = missing_sample or (page.url, page.text[:EVIDENCE_CHARS])
             doc_id, result = self.db.upsert_document(
                 source_id=job.source_id, job_id=job.id, url=url, title=art.title, author=art.author,
-                section=art.section, published_at=art.published_at,
+                section=label or art.section, published_at=art.published_at,
                 body=None if scope == "TITLE_LINK" else art.body)
             if result == "NEW":
                 stats.new += 1
@@ -749,13 +780,15 @@ def portal_message(registered: int, batch_id: str, duplicates: int = 0, over_cap
     return f"{msg} [묶음 {batch_id}]"
 
 
-def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site_type: str = "ETC") -> str:
+def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site_type: str = "ETC",
+                  seen: list[tuple[str | None, Article]] | None = None) -> str:
     """샘플 5건으로 품질 검사. 통과하면 설명을 돌려주고, 아니면 QUALITY_FAILED.
 
     언론사가 아니면 본문 대신 첨부(보도자료 HWP·PDF)가 있어도 샘플로 인정한다.
     후보에 셀렉터(LLM 레시피)가 있으면 수집 때와 똑같이 그 셀렉터로 뽑아 검사한다.
     정형 단신([부고]·[인사] 등, policy.is_routine_notice)은 표본에서 빼고 다음 후보 주소(최대 10건까지)로 채운다.
     단신만 있으면 단신으로 검사한다 (그래서 대개 불합격이다).
+    seen: 주면 연 표본마다 (<title>, 추출 결과)를 담는다 — 기사 종류 이름을 짓는 데 쓴다 (요청을 더 보내지 않는다).
     """
     samples, notices = [], []
     for i, url in enumerate(result.sample_urls[:10]):
@@ -769,6 +802,8 @@ def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site
             if e.blocking:
                 raise
             continue
+        if seen is not None:
+            seen.append((page_title(page.text), art))
         (notices if is_routine_notice(art) else samples).append(art)
     ok, detail = passes_quality(samples or notices, attachments_ok=site_type != "NEWS")
     if samples and notices:
@@ -777,6 +812,76 @@ def check_quality(f: PoliteFetcher, result: DiscoveryResult, base_url: str, site
         raise CrawlFailure(Code.QUALITY_FAILED, f"{MESSAGES[Code.QUALITY_FAILED]} ({detail})",
                            url=base_url, stage="DISCOVERY")
     return detail
+
+
+def discover_kinds(f: PoliteFetcher, disc: Discoverer, result: DiscoveryResult, detail: str,
+                   samples: list[tuple[str | None, Article]], base_url: str, site_type: str,
+                   settings: Settings) -> list[dict]:
+    """대표 종류(첫 합격 result)에 더해, 같은 입구 단계에서 본 다른 상세 URL 모양을 기사 종류로 검사한다 (설정 article_patterns).
+
+    - 후보: 그 단계의 허브별 주소 묶음(Discoverer.kind_pools)을 서명으로 묶은 것, 많이 보인 순서 (rank_kinds).
+      사이트맵 색인이 종류별 하위(sitemap_policy.xml 등)로 나뉘면 하위를 열어 본다.
+    - 이미 목록에 둔 종류와 주소가 절반 이상 겹치면 같은 종류로 보고 버린다.
+    - 기사가 아닌 종류(사진·영상·카툰·채용·옛 자료)는 이름·경로 규칙으로 꺼 둔다 (품질 검사를 하지 않는다).
+    - 나머지는 대표 종류와 같은 품질 검사(표본 5건 중 4건)를 통과해야 켠다. 켠 수가 settings.max_kinds에 닿거나 검사 수가
+      settings.max_kind_checks에 닿으면 남은 후보는 꺼진 채 목록에만 둔다 (관리자가 켤 수 있다).
+    - 대표 종류는 항상 켠다. 사이트맵 종류의 허브는 그 모양이 보인 하위 사이트맵이다. 종류가 하나뿐이면 허브는 예전과 같다.
+    samples: 대표 종류 품질 검사에서 본 (<title>, 추출 결과) — 이름 짓기에 쓴다.
+    """
+    pools = disc.kind_pools(result) if settings.max_kind_checks > 0 else []
+    primary = result.article_pattern
+    hubs = (hubs_for(primary, pools) or result.hubs) if result.method == "SITEMAP" and pools else result.hubs
+    count = len({canonical_article_url(u, primary) for _, urls, _ in pools for u in urls if matches(u, primary)})
+    labels = [label for hub, _, label in pools if label and hub in hubs]
+    kinds = [kind_entry(primary, kind_name(primary, samples, disc.sections, labels), hubs, True,
+                        count or len(result.sample_urls), quality=detail)]
+    listed = [primary]
+    enabled = checks = 0
+    cands = rank_kinds(pools)
+    # 하위 사이트맵 이름표(policy)는 그 하위에 모양이 하나뿐일 때만 이름으로 쓴다 (여럿이면 경로 이름이 더 낫다)
+    per_hub = Counter(h for c in cands for h in c.hubs)
+    for cand in cands:
+        if len(kinds) >= MAX_LISTED_KINDS:
+            break
+        if covered(cand.urls, listed):
+            continue
+        listed.append(cand.pattern)
+        name_labels = cand.labels if all(per_hub[h] == 1 for h in cand.hubs) else []
+        name = kind_name(cand.pattern, (), disc.sections, name_labels)
+        if is_non_article_kind(cand.pattern, name, cand.labels):
+            kinds.append(kind_entry(cand.pattern, name, cand.hubs, False, len(cand.urls), note=NON_ARTICLE_NOTE))
+            continue
+        if 1 + enabled >= settings.max_kinds or checks >= settings.max_kind_checks:
+            kinds.append(kind_entry(cand.pattern, name, cand.hubs, False, len(cand.urls),
+                                    note=f"종류가 많아 상위 {settings.max_kinds}개만 켭니다 (품질 검사를 하지 않음)."))
+            continue
+        checks += 1
+        sample_urls, dates = disc._samples(cand.urls, cand.pattern)
+        trial = DiscoveryResult(result.method, cand.hubs, cand.pattern, result.sections, result.excluded_sections,
+                                sample_urls[:10], [], disc.domain, dates, selectors=result.selectors,
+                                date_format=result.date_format)
+        seen: list[tuple[str | None, Article]] = []
+        try:
+            quality = check_quality(f, trial, base_url, site_type, seen=seen)
+        except CrawlFailure as e:
+            if e.code != Code.QUALITY_FAILED:
+                raise
+            reason = str(e).removeprefix(MESSAGES[Code.QUALITY_FAILED]).strip(" ()")
+            kinds.append(kind_entry(cand.pattern, kind_name(cand.pattern, seen, disc.sections, name_labels), cand.hubs,
+                                    False, len(cand.urls), note=f"품질 검사 불합격: {reason}"))
+            continue
+        name = kind_name(cand.pattern, seen, disc.sections, name_labels)
+        if is_non_article_kind(cand.pattern, name, cand.labels):   # 표본에서 본 이름이 사진·영상 등
+            kinds.append(kind_entry(cand.pattern, name, cand.hubs, False, len(cand.urls), quality, NON_ARTICLE_NOTE))
+            continue
+        enabled += 1
+        kinds.append(kind_entry(cand.pattern, name, cand.hubs, True, len(cand.urls), quality=quality))
+    if len(kinds) == 1:
+        kinds[0]["hubs"] = result.hubs
+    unique_names(kinds)
+    log.info("article kinds domain=%s: %s", disc.domain,
+             ", ".join(f"{k['name']}{'' if k['enabled'] else '(off)'}" for k in kinds))
+    return kinds
 
 
 def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_tries: int = 6,
@@ -788,11 +893,16 @@ def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_t
     품질 검사를 통과하면 그것을 쓴다. 아니면 휴리스틱 합격 후보로 돌아간다. LLM 장애(LlmUnavailable)는 경고만
     남기고 휴리스틱으로 진행한다 — LLM이 멈췄다고 등록이 실패해서는 안 된다.
     둘 다 없으면: 후보가 하나도 없었으면 DISCOVERY_FAILED, 있었지만 모두 불합격이면 첫 후보의 QUALITY_FAILED.
+    휴리스틱 합격이면 먼저 같은 입구 단계의 다른 상세 URL 모양도 기사 종류로 검사해 result.kinds에 둔다 (discover_kinds).
+    켜진 종류가 둘 이상이면 LLM 레시피를 만들지 않고 그 결과를 쓴다. LLM 레시피는 셀렉터가 한 상세 화면에 맞춰져 있어
+    종류를 늘리지 않는다 (대표 종류 하나).
     """
+    settings = settings or Settings()
     tried: set[str] = set()
     first_failure: CrawlFailure | None = None
     seen: list[DiscoveryResult] = []
     passed: tuple[DiscoveryResult, str] | None = None
+    passed_samples: list[tuple[str | None, Article]] = []
     disc = Discoverer(f, domain, base_url)
     for result in disc.candidates():
         sig = result.article_pattern.get("signature") or result.article_pattern["path"]
@@ -800,8 +910,10 @@ def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_t
             continue
         tried.add(sig)
         seen.append(result)
+        samples: list[tuple[str | None, Article]] = []
         try:
-            passed = (result, check_quality(f, result, base_url, site_type))
+            passed = (result, check_quality(f, result, base_url, site_type, seen=samples))
+            passed_samples = samples
             break
         except CrawlFailure as e:
             if e.code != Code.QUALITY_FAILED:
@@ -811,11 +923,22 @@ def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_t
         if len(tried) >= max_tries:
             break
 
+    if passed:
+        result, detail = passed
+        result.kinds = discover_kinds(f, disc, result, detail, passed_samples, base_url, site_type, settings)
+        on = [k["name"] for k in result.kinds if k["enabled"]]
+        if len(result.kinds) > 1:
+            detail = f"{detail}; 기사 종류 {len(result.kinds)}개 중 {len(on)}개 켬 ({', '.join(on)})"
+        passed = (result, detail)
+        if len(on) > 1:
+            # 종류 여럿을 켠 휴리스틱 설정이 한 상세 화면에 맞춘 LLM 레시피보다 넓다: 레시피를 만들지 않는다
+            return passed
+
     if llm is not None and not isinstance(llm, NoLlm):
         if progress:
             progress(LLM_STEP_MESSAGE)
         try:
-            outcome = propose_recipe(f, llm, settings or Settings(), disc, seen, site_type,
+            outcome = propose_recipe(f, llm, settings, disc, seen, site_type,
                                      quality=lambda r: check_quality(f, r, base_url, site_type))
         except LlmUnavailable as e:
             log.warning("LLM unavailable, continuing with heuristics domain=%s: %s", domain, e)
@@ -824,7 +947,10 @@ def discover(f: PoliteFetcher, domain: str, base_url: str, site_type: str, max_t
                 log.info("llm recipe accepted domain=%s pattern=%s hubs=%s selectors=%s", domain,
                          outcome.result.article_pattern.get("signature"), len(outcome.result.hubs),
                          sorted(outcome.result.selectors))
-                return outcome.result, outcome.detail
+                r = outcome.result
+                r.kinds = [kind_entry(r.article_pattern, kind_name(r.article_pattern, sections=r.sections), r.hubs,
+                                      True, None, quality=outcome.detail)]
+                return r, outcome.detail
             log.info("llm recipe rejected domain=%s: %s", domain, outcome.detail)
 
     if passed:
