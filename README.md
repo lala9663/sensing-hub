@@ -297,18 +297,23 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 ### 과거 기사 채우기 (백필)
 
 평소 수집은 입구에 지금 보이는 기사만 모읍니다(RSS 50건 안팎, 뉴스 사이트맵 이틀 안팎). 등록 전 기사는 관리자·등록 담당자가
-관리자 → 소스 상세의 **과거 기사 채우기**에서 기간을 정해 요청합니다(기본 최근 3개월, 최대 1년, ACTIVE 사이트 소스만, 소스당 하나씩).
-워커가 ① 보관 사이트맵(파일 이름의 날짜·`lastmod`로 기간에 걸치는 것만, `.xml.gz` 포함) → ② 목록 페이지를 쪽 번호로 거꾸로 넘기며
-기간 시작보다 오래된 글이 나오면 멈추는 순서로 주소를 모으고, 평소 수집과 같은 기사 판정·추출·저장(언론사는 제목·링크·발행일만)·감시 대조를 합니다.
-이미 있는 문서는 열지 않고, 새 문서의 수집 시각은 발행 시각으로 둡니다(다이제스트·"오늘" 필터에 옛 기사가 끼지 않게).
-진행률(찾은 주소·새로 저장·이미 있음·기간 밖·실패·남은 수)은 소스 상세에 10초마다 갱신되고, 취소하면 다음 기사 전에 멈춥니다.
-원리·속도·한계는 [docs/how-collection-works.md](docs/how-collection-works.md) 6-1절.
+관리자 → 소스 상세의 **과거 기사 채우기**에서 기간을 정해 요청합니다(기본 최근 3개월, ACTIVE 사이트 소스만, 소스당 하나씩).
+등록 담당자는 최대 1년, 관리자는 10년처럼 더 길게 정할 수 있습니다. 기간은 **기간 묶음**(기본 2개월, 보관 사이트맵이 한 달·두 달·석 달 파일이면
+그 단위 — 동아일보는 두 달 파일 하나가 묶음 하나)으로 나눠 **가장 최근 묶음부터** 과거로 채우고, 묶음마다 상태와 수가 남아
+"2026-09~10 완료 21,096건 · 2026-07~08 진행 40%"처럼 보입니다. 끊겨도 남은 묶음부터 잇고, **두 달 더**로 묶음을 뒤로 늘립니다.
+워커는 묶음마다 ① 보관 사이트맵(이름의 날짜가 걸치는 파일, 번호만 다른 파일 묶음은 이분 탐색, `.xml.gz` 포함) → ② 목록 페이지를 쪽 번호로
+거꾸로(묶음 사이에 이어서) 넘기는 순서로 주소를 모으고, 평소 수집과 같은 기사 판정·추출·저장(언론사는 제목·링크·발행일만)·감시 대조를 합니다.
+글의 날짜는 주소 안 날짜·발행일을 먼저 보고 `lastmod`(나중 수정일이 섞인다)는 상한으로만 씁니다.
+이미 있는 문서는 열지 않고, 새 문서의 수집 시각은 발행 시각으로 둡니다(다이제스트·"오늘" 필터에 옛 기사가 끼지 않게). 취소하면 다음 기사 전에 멈춥니다.
+원리·속도(동아일보 묶음 하나 약 12~15시간)·한계는 [docs/how-collection-works.md](docs/how-collection-works.md) 6-1절.
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
-| `SENSING_BACKFILL_ENABLED` | `true` | 큐가 빌 때 진행 중인 채우기의 다음 묶음(`crawl_job` BACKFILL)을 넣는다. 다른 작업이 하나라도 대기하면 넣지 않고, 묶음 도중에도 기사마다 확인해 평소 작업·이 소스의 주기 수집 차례에 양보한다 |
-| `SENSING_BACKFILL_CHUNK` | `100` | 한 묶음에 보내는 요청 수(사이트맵·목록·기사·robots 포함). 묶음마다 진행 위치를 남기고 끝난다 |
-| `SENSING_BACKFILL_MAX_SITEMAPS` | `60` | 채우기 하나가 여는 사이트맵 수 상한(색인 포함) |
+| `SENSING_BACKFILL_MAX_DAYS` (백엔드) | `366` | 등록 담당자가 요청할 수 있는 기간 길이 상한(일). 관리자는 넘길 수 있다(1990년부터) |
+| `SENSING_BACKFILL_SEGMENT_MONTHS` (백엔드) | `2` | 기간 묶음 기본 길이(개월). 워커가 보관 사이트맵 단위(1~3개월 파일)를 보면 그 단위로 바꾼다 |
+| `SENSING_BACKFILL_ENABLED` | `true` | 큐가 빌 때 진행 중인 채우기의 다음 작업(`crawl_job` BACKFILL)을 넣는다. 다른 작업이 하나라도 대기하면 넣지 않고, 작업 도중에도 기사마다 확인해 평소 작업·이 소스의 주기 수집 차례에 양보한다 |
+| `SENSING_BACKFILL_CHUNK` | `100` | 작업 하나에 보내는 요청 수(사이트맵·목록·기사·robots 포함). 작업마다 진행 위치를 남기고 끝난다 |
+| `SENSING_BACKFILL_MAX_SITEMAPS` | `60` | 채우기 하나가 읽는, 이름에 날짜가 없는 사이트맵 파일 수 상한 (날짜 있는 파일·번호 묶음 이분 탐색은 묶음에 필요한 만큼) |
 | `SENSING_BACKFILL_MAX_PAGES` | `300` | 목록 페이지를 거꾸로 넘길 때 허브 하나에서 볼 쪽 수 상한 |
 
 ### API 맛보기
@@ -364,9 +369,12 @@ curl localhost:8080/api/v1/review-queue -H 'X-User: admin'
 curl localhost:8080/api/v1/review-queue/counts -H 'X-User: admin'
 curl -X POST localhost:8080/api/v1/registrations/3/reject -H 'X-User: admin'      -H 'Content-Type: application/json' -d '{"reason":"업무와 관련 없는 사이트"}'
 
-# 과거 기사 채우기 (REGISTRAR 이상, ACTIVE 사이트 소스만, 소스당 하나씩). 본문을 비우면 최근 3개월, 길이 최대 1년 · 진행률 · 취소
+# 과거 기사 채우기 (REGISTRAR 이상, ACTIVE 사이트 소스만, 소스당 하나씩). 본문을 비우면 최근 3개월, 시작은 묶음 첫날로 맞춤(07-19 → 07-01),
+# 등록 담당자는 길이 최대 1년·관리자는 더 길게 · 진행률(묶음별 segments: label·status·found·saved·percent) · 두 달 더 · 취소
 curl -X POST localhost:8080/api/v1/sources/1/backfills -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"from":"2026-07-19","to":"2026-10-19"}'
-curl localhost:8080/api/v1/sources/1/backfills -H 'X-User: registrar'   # found·saved·skipped·outOfRange·failed·remaining·requests·chunks·message
+curl -X POST localhost:8080/api/v1/sources/1/backfills -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"from":"2016-10-19"}'   # 10년 (관리자)
+curl localhost:8080/api/v1/sources/1/backfills -H 'X-User: registrar'   # found·saved·skipped·outOfRange·failed·remaining·requests·chunks·unitMonths·segments·message
+curl -X POST localhost:8080/api/v1/sources/1/backfills/1/extend -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"segments":1}'   # 두 달 더 (끝난 채우기는 다시 연다)
 curl -X POST localhost:8080/api/v1/sources/1/backfills/1/cancel -H 'X-User: registrar'
 
 # 관리자: 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
@@ -393,7 +401,7 @@ worker/    Python 수집 워커
     apis/         공개 API 소스: 카탈로그(도메인 → 제공자), 커넥터 형식, DART 공시 목록·네이버 뉴스 검색·국세청 사업자 상태 커넥터
     company.py    회사 레이어 규칙: 태그 → 회사 정확 일치, 회사 신호(BIZ_STATUS·NEWS)의 심각도·fingerprint
     jobs.py       ONBOARD / CRAWL 작업 (API 소스는 크롤링 대신 커넥터로, 키워드 감시는 document_watch 기록, CHECK 소스는 회사 상태 점검)
-    backfill.py   과거 기사 채우기(BACKFILL 한 묶음): 보관 사이트맵 고르기·목록 역순·양보·취소·진행 위치
+    backfill.py   과거 기사 채우기(BACKFILL 작업 하나): 기간 묶음(최근 것부터)·보관 사이트맵 고르기(번호 묶음 이분 탐색)·목록 역순·양보·취소·진행 위치
     db.py         작업 큐(SKIP LOCKED·lease), 문서 저장·버전, 회사 연결·신호
   tests/          단위 테스트 + 가짜 사이트로 DB 흐름 통합 테스트
 docs/      설계 메모 — 수집 원리는 docs/how-collection-works.md (사이트를 등록하면 기사를 어떻게 찾아 가져오나)
@@ -444,9 +452,10 @@ LLM 요약·분류는 10-19 Gemini 무료 등급(`gemini-3.5-flash-lite`)으로 
 
 **진행 중 (10-19)** — 각각 별도 브랜치에서 작업하고 끝나면 main에 합친다.
 
-- 과거 기사 채우기(백필): **10-19 구현 완료, main 병합 대기**. 소스 상세에서 기간(기본 최근 3개월, 최대 1년)을 정하면 보관 사이트맵(`.xml.gz` 포함)
-  → 목록 페이지 역순으로 등록 이전 기사를 평소 수집이 쉬는 틈에 요청 100건씩 끊어 채운다. 평소 수집·등록이 기다리면 양보하고, 취소할 수 있다
-  (`docs/how-collection-works.md` 6-1절, 아래 "과거 기사 채우기"). 실측: 동아일보 석 달 ≈ 기사 주소 3.1만 건, 이 사이트만 채우면 약 22시간.
+- 과거 기사 채우기(백필): **10-19 구현 완료, main 병합 대기**. 소스 상세에서 기간(기본 최근 3개월, 등록 담당자 최대 1년·관리자는 더 길게)을 정하면
+  기간 묶음(기본 2개월, 보관 사이트맵 단위에 맞춤)으로 나눠 최근 묶음부터 보관 사이트맵(`.xml.gz`, 번호 묶음 이분 탐색) → 목록 페이지 역순으로
+  평소 수집이 쉬는 틈에 요청 100건씩 끊어 채운다. 묶음별 상태·수가 보이고, 두 달 더로 늘리고, 양보·취소한다
+  (`docs/how-collection-works.md` 6-1절, 위 "과거 기사 채우기"). 실측: 동아일보 두 달 묶음 하나 = 주소 21,096개 ≈ 12~15시간, 10년이면 묶음 61개.
 - 사이트 하나에 기사 종류 여러 개: korea.kr이 보도자료만 모이는 문제(정책뉴스·브리핑·연설문 누락). 종류별 품질 검사·켜고 끄기,
   특정 목록 주소로 등록하면 그 종류만, 이미 있는 사이트에 다른 목록 주소를 넣으면 종류 추가.
 - 챗봇 2단계: 임베딩 의미 검색 (1단계 — 도구 호출·대화 저장·근거 링크·화면 — 은 10-19 완료, 아래 M5 체크리스트).

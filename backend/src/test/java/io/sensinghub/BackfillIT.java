@@ -49,7 +49,7 @@ class BackfillIT {
     @BeforeEach
     void clean() {
         jdbc.sql("""
-                TRUNCATE backfill_url, backfill, chunk, attachment, document_version, document_watch, document_enrichment,
+                TRUNCATE backfill_url, backfill_segment, backfill_sitemap, backfill, chunk, attachment, document_version, document_watch, document_enrichment,
                          document_company, document, crawl_error, crawl_job, registration_request, audit_log
                 RESTART IDENTITY CASCADE
                 """).update();
@@ -112,12 +112,23 @@ class BackfillIT {
         JsonNode b = json(res);
         LocalDate today = LocalDate.now(BackfillService.KST);
         assertThat(b.get("to").asText()).isEqualTo(today.toString());
-        assertThat(b.get("from").asText()).isEqualTo(today.minusMonths(3).toString());
+        // 최근 3개월, 시작은 두 달 묶음(1~2월, 3~4월 …)의 첫날로 맞춘다
+        LocalDate from = BackfillService.segmentStart(today.minusMonths(3), 2, 0);
+        assertThat(from.getDayOfMonth()).isEqualTo(1);
+        assertThat(from.getMonthValue() % 2).isEqualTo(1);
+        assertThat(b.get("from").asText()).isEqualTo(from.toString());
+        assertThat(b.get("unitMonths").asInt()).isEqualTo(2);
+        assertThat(b.get("segments")).isEmpty();                     // 묶음은 워커가 사이트맵 색인을 읽은 뒤 나눈다
         assertThat(b.get("status").asText()).isEqualTo("QUEUED");
         assertThat(count("SELECT count(*) FROM audit_log WHERE action = 'BACKFILL_REQUESTED'")).isEqualTo(1);
 
-        // 워커가 주소를 찾고 몇 건을 처리한 모습
+        // 워커가 묶음을 나누고 주소를 찾아 몇 건을 처리한 모습: 최근 묶음 완료, 그다음 묶음 진행 중
         long bid = b.get("id").asLong();
+        jdbc.sql("""
+                INSERT INTO backfill_segment (backfill_id, seq, date_from, date_to, status, found_count, saved_count, skipped_count)
+                VALUES (?, 0, '2026-09-01', '2026-10-19', 'DONE', 21096, 20500, 596),
+                       (?, 1, '2026-07-01', '2026-08-31', 'RUNNING', 10, 3, 1)
+                """).params(bid, bid).update();
         jdbc.sql("""
                 INSERT INTO backfill_url (backfill_id, url_hash, url, status)
                 SELECT ?, md5(g::text) || md5(g::text), 'https://www.donga.example/news/' || g,
@@ -136,6 +147,14 @@ class BackfillIT {
         assertThat(row.get("skipped").asInt()).isEqualTo(1);
         assertThat(row.get("remaining").asLong()).isEqualTo(6);
         assertThat(row.get("requestedBy").asText()).isNotBlank();
+        JsonNode segs = row.get("segments");
+        assertThat(segs).hasSize(2);
+        assertThat(segs.get(0).get("label").asText()).isEqualTo("2026-09~10");
+        assertThat(segs.get(0).get("status").asText()).isEqualTo("DONE");
+        assertThat(segs.get(0).get("found").asInt()).isEqualTo(21096);
+        assertThat(segs.get(0).get("percent").asInt()).isEqualTo(100);
+        assertThat(segs.get(1).get("label").asText()).isEqualTo("2026-07~08");
+        assertThat(segs.get(1).get("percent").asInt()).isEqualTo(40);   // 10건 중 4건 처리 → "진행 40%"
 
         // 소스당 진행 중인 채우기는 하나
         ResponseEntity<String> dup = post("admin", "/api/v1/sources/" + id + "/backfills", "{}");
@@ -156,13 +175,59 @@ class BackfillIT {
                 .getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);                       // 거꾸로
         assertThat(post("registrar", path, "{\"from\":\"2026/07/01\"}").getStatusCode())
                 .isEqualTo(HttpStatus.BAD_REQUEST);                                         // 형식
-        // 정확히 1년은 된다
+        // 정확히 1년은 된다 (시작을 묶음 첫날로 맞추면서 길어지는 것은 상한에 세지 않는다)
         ResponseEntity<String> ok = post("registrar", path,
                 "{\"from\":\"" + today.minusYears(1) + "\",\"to\":\"" + today + "\"}");
         assertThat(ok.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
         assertThat(post("viewer", "/api/v1/sources/" + id + "/backfills", "{}").getStatusCode())
                 .isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(get("viewer", path).getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        // 관리자는 상한보다 길게(예: 10년) 정할 수 있다. 1990년 전은 안 된다
+        long other = siteSource("seoul.example", "ACTIVE", "SITE", "SITEMAP");
+        String otherPath = "/api/v1/sources/" + other + "/backfills";
+        assertThat(post("registrar", otherPath, "{\"from\":\"" + today.minusYears(10) + "\"}").getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(post("admin", otherPath, "{\"from\":\"1989-12-31\"}").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        ResponseEntity<String> decade = post("admin", otherPath, "{\"from\":\"" + today.minusYears(10) + "\"}");
+        assertThat(decade.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(json(decade).get("from").asText())
+                .isEqualTo(BackfillService.segmentStart(today.minusYears(10), 2, 0).toString());
+    }
+
+    @Test
+    void extendAddsOneSegmentBackwardsAndReopensAFinishedBackfill() {
+        long id = siteSource("mk.example", "ACTIVE", "SITE", "SITEMAP");
+        String path = "/api/v1/sources/" + id + "/backfills";
+        LocalDate today = LocalDate.now(BackfillService.KST);
+        long bid = json(post("registrar", path, "{}")).get("id").asLong();
+        LocalDate from = LocalDate.parse(json(get("registrar", path)).get(0).get("from").asText());
+
+        // 진행 중: 두 달 더 → 시작이 두 달 앞으로, 상태는 그대로
+        JsonNode b = json(post("registrar", path + "/" + bid + "/extend", null));
+        assertThat(b.get("from").asText()).isEqualTo(from.minusMonths(2).toString());
+        assertThat(b.get("status").asText()).isEqualTo("QUEUED");
+
+        // 끝난 채우기: 다시 연다 (시작한 적이 있으면 RUNNING), 끝난 시각은 지운다
+        jdbc.sql("UPDATE backfill SET status = 'DONE', started_at = now(), finished_at = now() WHERE id = ?").param(bid).update();
+        b = json(post("registrar", path + "/" + bid + "/extend", "{\"segments\":2}"));
+        assertThat(b.get("from").asText()).isEqualTo(from.minusMonths(6).toString());
+        assertThat(b.get("status").asText()).isEqualTo("RUNNING");
+        assertThat(b.get("finishedAt").isNull()).isTrue();
+        assertThat(count("SELECT count(*) FROM audit_log WHERE action = 'BACKFILL_EXTENDED'")).isEqualTo(2);
+
+        // 등록 담당자는 상한(366일)을 넘겨 늘릴 수 없고, 관리자는 된다
+        jdbc.sql("UPDATE backfill SET date_from = ? WHERE id = ?")
+                .params(BackfillService.segmentStart(today.minusDays(360), 2, 0), bid).update();
+        assertThat(post("registrar", path + "/" + bid + "/extend", null).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(post("admin", path + "/" + bid + "/extend", null).getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // 다른 채우기가 진행 중이면 끝난 것을 다시 열 수 없다
+        jdbc.sql("UPDATE backfill SET status = 'CANCELLED' WHERE id = ?").param(bid).update();
+        long second = json(post("registrar", path, "{}")).get("id").asLong();
+        assertThat(post("admin", path + "/" + bid + "/extend", null).getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(post("admin", path + "/" + second + "/extend", "{\"segments\":0}").getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
@@ -183,10 +248,14 @@ class BackfillIT {
         long bid = json(post("registrar", "/api/v1/sources/" + id + "/backfills", "{}")).get("id").asLong();
         long jobId = jdbc.sql("INSERT INTO crawl_job (source_id, job_type, trigger, backfill_id) VALUES (?, 'BACKFILL', 'MANUAL', ?) RETURNING id")
                 .params(id, bid).query(Long.class).single();
+        jdbc.sql("INSERT INTO backfill_segment (backfill_id, seq, date_from, date_to, status) VALUES (?, 0, '2026-09-01', '2026-10-19', 'RUNNING')")
+                .param(bid).update();
 
         ResponseEntity<String> res = post("registrar", "/api/v1/sources/" + id + "/backfills/" + bid + "/cancel", null);
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(json(res).get("status").asText()).isEqualTo("CANCELLED");
+        // 진행 중이던 묶음은 대기로 돌려 두 달 더(다시 열기) 하면 그 묶음부터 잇는다
+        assertThat(json(res).get("segments").get(0).get("status").asText()).isEqualTo("QUEUED");
         assertThat(jdbc.sql("SELECT status FROM crawl_job WHERE id = ?").param(jobId).query(String.class).single())
                 .isEqualTo("SUCCESS");
         // 두 번 취소하면 409, 다른 소스 주소로는 404

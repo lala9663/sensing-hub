@@ -17,7 +17,10 @@ import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.backfill.BackfillService.BackfillView;
 import io.sensinghub.common.ApiException;
 
-/** 과거 기사 채우기: 관리자·등록 담당자가 소스와 기간(기본 최근 3개월, 최대 1년)을 정해 요청한다. */
+/**
+ * 과거 기사 채우기: 관리자·등록 담당자가 소스와 기간(기본 최근 3개월)을 정해 요청한다. 기간 묶음(기본 2개월) 단위로 최근 것부터 채우고,
+ * "두 달 더"로 뒤로 늘린다. 길이 상한(기본 1년)은 등록 담당자에게만 적용한다.
+ */
 @RestController
 @RequestMapping("/api/v1/sources/{sourceId}/backfills")
 public class BackfillController {
@@ -42,6 +45,18 @@ public class BackfillController {
     public BackfillView create(CurrentUser user, @PathVariable long sourceId, @RequestBody(required = false) CreateRequest body) {
         return service.request(user, sourceId, date(body == null ? null : body.from(), "from"),
                 date(body == null ? null : body.to(), "to"));
+    }
+
+    /** segments: 가장 오래된 묶음 앞에 더할 묶음 수 (기본 1 = "두 달 더"). */
+    public record ExtendRequest(Integer segments) {
+    }
+
+    /** 기간을 뒤로 늘린다. 끝났거나 취소한 채우기는 다시 열어 더한 묶음을 채운다. */
+    @PostMapping("/{backfillId}/extend")
+    public BackfillView extend(CurrentUser user, @PathVariable long sourceId, @PathVariable long backfillId,
+                               @RequestBody(required = false) ExtendRequest body) {
+        int segments = body == null || body.segments() == null ? 1 : body.segments();
+        return service.extend(user, sourceId, backfillId, segments);
     }
 
     @PostMapping("/{backfillId}/cancel")

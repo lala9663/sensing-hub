@@ -1,23 +1,33 @@
-"""과거 기사 채우기(BACKFILL): 등록 전에 나온 기사를 기간(date_from~date_to)을 정해 천천히 가져온다.
+"""과거 기사 채우기(BACKFILL): 등록 전에 나온 기사를 기간을 정해 기간 묶음 단위로, 가장 최근 묶음부터 과거로 천천히 가져온다.
 
 평소 수집은 허브에 지금 보이는 최신 기사만 본다 (RSS 50건 안팎, 뉴스 사이트맵 이틀 안팎). 채우기는 그 이전 기사를 찾는다.
 
-찾는 방법 (앞에서 기간을 덮으면 뒤로 가지 않는다)
-1. SITEMAP: robots.txt의 Sitemap 줄(과 설정의 사이트맵 허브)에서 출발해 색인을 따라가며 기간에 걸치는 보관 사이트맵(.xml·.xml.gz)만
-   연다. 하위 사이트맵은 파일 이름의 날짜(donga-sitemap-202609-202610.xml.gz → 2026-09-01~10-31)로, 이름에 날짜가 없으면 색인의
-   lastmod로 고른다 (lastmod가 기간 시작보다 이르면 그 안의 글도 모두 이르다). 항목은 news:publication_date → lastmod로 기간을 본다.
-2. LIST: 사이트맵에 기간의 글이 없거나 사이트맵이 기간 시작까지 닿지 않으면 소스의 목록 페이지(HTML 허브)를 쪽 번호로 거꾸로
-   넘긴다. 쪽 번호 매개변수는 목록의 쪽 링크(?page=2, /page/2, fn_egov_link_page(2) + hidden pageIndex)에서 찾는다. 앞 쪽에 없던
-   글(고정 공지 제외)의 날짜가 모두 기간 시작보다 이르면 멈춘다. 목록에 날짜가 없으면 그 쪽 글을 열어 본 발행일로 판단한다.
+기간 묶음
+- 요청 기간을 묶음으로 나눈다. 기본 2개월이고, 보관 사이트맵이 한 달·두 달·석 달 단위 파일이면 그 단위에 맞춘다(동아일보 두 달 파일
+  하나 = 묶음 하나, 하루 단위 파일이면 한 달 묶음). 연도별처럼 더 긴 파일은 기본 묶음으로 나누고 한 파일을 여러 묶음이 함께 쓴다.
+  시작 날짜는 묶음의 첫날로 맞춘다. 묶음은 backfill_segment에 상태(대기·진행·완료·실패)와 수를 남기고, 끊기면 남은 묶음부터 잇는다.
+- 요청 기간을 뒤로 늘리면(두 달 더) 다음 묶음에서 더 오래된 묶음을 만든다. 전에 읽은 파일 중 늘어난 기간의 글이 있을 것은 다시 읽는다.
+
+찾는 방법 (묶음마다, 앞에서 덮으면 뒤로 가지 않는다)
+1. SITEMAP: robots.txt의 Sitemap 줄(과 사이트맵 허브)에서 출발해 색인의 하위 파일을 backfill_sitemap에 모두 적어 두고, 묶음에 필요한
+   파일만 읽는다. 파일 이름에 날짜가 있으면(donga-sitemap-202607-202608.xml.gz, 1993.xml, weekly-sitemap-2000-2005.xml.gz, 20261019.xml)
+   그 기간이 묶음에 걸칠 때만 읽는다. 번호만 다른 파일 묶음(mbn_all_sitemap0~549.xml)은 번호가 날짜 순서라고 보고, 양 끝을 읽어 방향을
+   알아낸 뒤 이분 탐색으로 묶음에 걸치는 파일만 읽는다 (읽은 파일의 글 날짜 범위가 이웃 파일의 범위를 가둔다). 나머지 이름에 날짜가
+   없는 파일은 색인의 lastmod가 묶음 시작 이후일 때만, 채우기 하나에 settings.backfill_max_sitemaps개까지 읽는다.
+   글의 날짜는 주소 안 날짜(/20260915/) → news:publication_date → (파일 기간 안으로 자른) lastmod 순서로 본다. lastmod는 나중에 고친
+   날이 섞이므로(1996 파일에 2024 lastmod) "그보다 이른 글"이라는 뜻으로만 쓰고, 상세의 발행일로 다시 확인해 맞는 묶음으로 옮긴다.
+2. LIST: 사이트맵이 묶음을 덮지 못하면(날짜 있는 파일이 없고, 날짜 없는 파일의 가장 이른 글이 묶음 시작보다 늦으면) 목록 페이지
+   (HTML 허브)를 쪽 번호로 거꾸로 넘긴다. 쪽은 묶음 사이에 이어서 넘긴다(다음 묶음은 멈춘 쪽부터). 앞 쪽에 없던 글(고정 공지 제외)의
+   날짜가 모두 묶음 시작보다 이르면 그 묶음은 끝, 요청 기간 시작보다 이르면 그 허브는 끝이다. 목록에 날짜가 없으면 열어 본 발행일로 판단한다.
 
 기사 판정·추출·저장·키워드 대조는 평소 수집(jobs.JobRunner._crawl)과 같은 함수를 쓴다 — 기사 패턴(article_pattern 또는 기사 종류
 article_patterns)·matches·canonical_article_url, extract_article(설정 selectors·date_format), upsert_document(언론사는 제목·링크·
-발행일만, 본문 미저장), _match_watches, 첨부. 열어 본 발행일이 기간 밖이거나 없으면 저장하지 않는다(OUT_OF_RANGE).
+발행일만, 본문 미저장), _match_watches, 첨부. 열어 본 발행일이 요청 기간 밖이거나 없으면 저장하지 않는다(OUT_OF_RANGE).
 
 저속·저우선
-- 한 묶음(crawl_job BACKFILL 하나)에 요청 settings.backfill_chunk(기본 100)건까지 하고 진행 위치를 남긴다: cursor(사이트맵 대기열·목록
-  쪽 번호)와 backfill_url(찾은 주소별 PENDING·SAVED·SKIPPED·OUT_OF_RANGE·FAILED). 다음 묶음은 큐가 빈 워커가 넣는다(main.backfill_idle).
-- 묶음 도중에도 주소마다 확인해 평소 작업(CRAWL·ONBOARD)이 대기하거나 이 소스의 주기 수집 차례가 오면 멈추고 양보한다. 취소도 같다.
+- 한 묶음 작업(crawl_job BACKFILL 하나)에 요청 settings.backfill_chunk(기본 100)건까지 하고 진행 위치를 남긴다: cursor(단계·목록 쪽 번호),
+  backfill_sitemap(읽은 파일), backfill_url(찾은 주소별 상태). 다음 작업은 큐가 빈 워커가 넣는다(main.backfill_idle).
+- 작업 도중에도 기사마다 확인해 평소 작업(CRAWL·ONBOARD)이 대기하거나 이 소스의 주기 수집 차례가 오면 멈추고 양보한다. 취소도 같다.
 - 도메인 간격·robots는 fetcher가 평소와 같이 지킨다. 차단 신호(봇 확인·429·로그인)는 우회하지 않고 즉시 멈추고 소스를 BLOCKED로 둔다.
 - 이미 있는 문서(url_hash)는 열지 않는다. 새 문서의 collected_at은 발행 시각으로 둔다 — 다이제스트·문서 화면의 "오늘·3일·7일"·
   색인·요약 순서처럼 수집 시각을 "새로 들어온 것"으로 쓰는 곳에 옛 기사가 새 기사처럼 끼지 않게. 색인·이슈 묶기·요약은 평소 유휴
@@ -30,7 +40,7 @@ import calendar
 import html as htmllib
 import logging
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -45,15 +55,15 @@ from .extract import Article, _parse_date, extract_article, links_with_dates
 log = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
-# lastmod는 글을 고친 시각일 수 있다: 기간 끝보다 이만큼 늦은 것까지는 넣고 상세에서 발행일로 확인한다
-LASTMOD_SLACK_DAYS = 3
-# 사이트맵의 가장 이른 글이 기간 시작보다 이만큼 넘게 늦으면 사이트맵이 기간을 다 덮지 못한 것으로 보고 목록 페이지로 이어 찾는다
+# 날짜 없는 사이트맵의 가장 이른 글이 묶음 시작보다 이만큼 넘게 늦으면 사이트맵이 묶음을 덮지 못한 것으로 보고 목록 페이지로 찾는다
 COVERAGE_SLACK_DAYS = 3
 MAX_SITEMAP_DEPTH = 3      # 색인 → 색인 → 사이트맵
+NUMBERED_MIN = 10          # 번호만 다른 하위 파일이 이만큼 넘으면 번호 순서를 날짜 순서로 보고 이분 탐색한다
 ARTICLE_BATCH = 10         # 한 번에 꺼내 여는 주소 수 (주소마다 양보·취소를 확인한다)
-RECORDED_ERRORS = 3        # 묶음 하나에서 crawl_error로 남기는 기사 실패 수 (나머지는 수만 센다)
+RECORDED_ERRORS = 3        # 작업 하나에서 crawl_error로 남기는 기사 실패 수 (나머지는 수만 센다)
 MAX_NOTES = 8
-CANCELLED = "취소됨"        # 묶음을 멈춘 이유: 사용자가 취소 (나머지 이유는 양보·상한)
+CANCELLED = "취소됨"        # 작업을 멈춘 이유: 사용자가 취소 (나머지 이유는 양보·상한)
+READ_ALL = date.min        # 색인은 한 번 읽으면 하위가 모두 들어온다 (다시 읽지 않는다)
 
 
 # ---------------------------------------------------------------------- 기사 판정 (평소 수집과 같은 규칙)
@@ -101,14 +111,38 @@ def published_day(art: Article) -> date | None:
     return art.published_at.astimezone(KST).date() if art.published_at else None
 
 
+# 기사 주소 경로 안의 날짜: /20260915/ (동아일보), /2026/09/15/, /2026-09-15-slug
+_URL_DATE_RES = (
+    re.compile(r"/((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?=/|$|[._-][^\d])"),
+    re.compile(r"/((?:19|20)\d{2})/(0[1-9]|1[0-2])/(0[1-9]|[12]\d|3[01])(?=/|$|[._-])"),
+    re.compile(r"/((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?=/|$|[._-])"),
+)
+
+
+def url_day(url: str, today: date | None = None) -> date | None:
+    """기사 주소 경로에 든 날짜 (경로 조각 하나가 날짜일 때만, 쿼리는 보지 않는다). 없거나 미래면 None."""
+    path = urlsplit(url).path
+    limit = (today or datetime.now(KST).date()) + timedelta(days=1)
+    for regex in _URL_DATE_RES:
+        m = regex.search(path)
+        if m:
+            try:
+                d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                continue
+            if d <= limit:
+                return d
+    return None
+
+
 # 파일 이름의 날짜 조각: 2026 | 202609 | 2026-09 | 20260915 | 2026/09/15
 _SPAN_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?:[-_./]?(0[1-9]|1[0-2])(?:[-_./]?(0[1-9]|[12]\d|3[01]))?)?(?!\d)")
 
 
 def sitemap_span(url: str, today: date | None = None) -> tuple[date, date] | None:
     """사이트맵 주소(경로·쿼리)의 날짜로 본 기간. donga-sitemap-202609-202610.xml.gz → (2026-09-01, 2026-10-31).
-    날짜 조각이 둘 이상이면 처음 것의 시작부터 마지막 것의 끝까지. 연도만 있는 조각은 올해 이하일 때만 연도로 본다
-    (sitemap-2048.xml 같은 쪽 번호를 연도로 읽지 않게). 날짜가 없으면 None."""
+    날짜 조각이 둘 이상이면 처음 것의 시작부터 마지막 것의 끝까지(weekly-sitemap-2000-2005 → 2000-01-01~2005-12-31).
+    연도만 있는 조각은 올해 이하일 때만 연도로 본다 (sitemap-2048.xml 같은 쪽 번호를 연도로 읽지 않게). 날짜가 없으면 None."""
     parts = urlsplit(url)
     text = parts.path + ("?" + parts.query if parts.query else "")
     this_year = (today or datetime.now(KST).date()).year
@@ -131,6 +165,18 @@ def sitemap_span(url: str, today: date | None = None) -> tuple[date, date] | Non
     if not spans:
         return None
     return min(s for s, _ in spans), max(e for _, e in spans)
+
+
+_LAST_NUMBER_RE = re.compile(r"(\d+)(?=\D*$)")
+
+
+def numbered(url: str) -> tuple[str, int] | None:
+    """번호만 다른 파일의 묶음 이름과 번호: .../mbn_all_sitemap12.xml → (".../mbn_all_sitemap{n}.xml", 12)."""
+    parts = urlsplit(url)
+    m = _LAST_NUMBER_RE.search(parts.path)
+    if not m:
+        return None
+    return f"{parts.netloc}{parts.path[:m.start()]}{{n}}{parts.path[m.end():]}", int(m.group(1))
 
 
 # ---------------------------------------------------------------------- 사이트맵
@@ -171,34 +217,172 @@ def parse_sitemap(text: str) -> tuple[bool, list[SitemapEntry]]:
     return is_index, out
 
 
-def child_wanted(entry: SitemapEntry, date_from: date, date_to: date, today: date | None = None) -> bool:
-    """색인의 하위 사이트맵을 열지. 이름에 날짜가 있으면 그 기간이 겹칠 때, 없으면 lastmod가 기간 시작 이후일 때(또는 lastmod가 없을 때)."""
-    span = sitemap_span(entry.loc, today)
+def resolve_entry(entry: SitemapEntry, span: tuple[date, date] | None) -> tuple[date | None, bool]:
+    """사이트맵 항목의 날짜와 믿을 만한지. 주소 안 날짜 → news:publication_date (믿을 만함) → lastmod (나중에 고친 날일 수 있어
+    "그보다 이른 글"이라는 뜻: 믿을 만하지 않음. 파일 이름에 기간이 있으면 그 안으로 자르고, lastmod가 없으면 파일 기간의 끝)."""
+    d = url_day(entry.loc) or kst_day(entry.published)
+    if d:
+        return d, True
+    m = kst_day(entry.lastmod)
     if span:
-        return span[0] <= date_to and span[1] >= date_from
-    day = kst_day(entry.lastmod)
-    return day is None or day >= date_from
+        return (span[1] if m is None else min(max(m, span[0]), span[1])), False
+    return m, False
 
 
-def child_order(entry: SitemapEntry, today: date | None = None) -> date:
-    """하위 사이트맵을 여는 순서의 키 (최근 것부터): 이름의 기간 끝 → lastmod."""
-    span = sitemap_span(entry.loc, today)
-    return (span[1] if span else None) or kst_day(entry.lastmod) or date.min
+def sitemap_child_rows(entries: list[SitemapEntry], depth: int, today: date | None = None) -> list[dict]:
+    """색인의 하위 파일을 backfill_sitemap 행으로. 이름에 날짜가 없고 번호만 다른 파일이 NUMBERED_MIN개를 넘으면 묶음(grp·num)으로 적는다."""
+    rows = []
+    for e in entries:
+        span = sitemap_span(e.loc, today)
+        rows.append({"url": e.loc, "depth": depth, "span_from": span[0] if span else None,
+                     "span_to": span[1] if span else None, "lastmod": kst_day(e.lastmod), "grp": None, "num": None})
+    groups: dict[str, list[tuple[dict, int]]] = defaultdict(list)
+    for r in rows:
+        if r["span_from"] is None:
+            key = numbered(r["url"])
+            if key:
+                groups[key[0]].append((r, key[1]))
+    for key, members in groups.items():
+        if len(members) >= NUMBERED_MIN:
+            for r, n in members:
+                r["grp"], r["num"] = key, n
+    return rows
 
 
-def entry_day(entry: SitemapEntry) -> date | None:
-    return kst_day(entry.published) or kst_day(entry.lastmod)
+def _overlaps(a_from: date | None, a_to: date | None, b_from: date, b_to: date) -> bool:
+    return (a_from is None or a_from <= b_to) and (a_to is None or a_to >= b_from)
 
 
-def entry_in_period(entry: SitemapEntry, date_from: date, date_to: date) -> bool:
-    """사이트맵 항목을 후보로 넣을지. 발행일이 있으면 그것으로, lastmod뿐이면 끝에 여유를 두고, 날짜가 없으면 넣는다(상세에서 확인)."""
-    pub = kst_day(entry.published)
-    if pub:
-        return date_from <= pub <= date_to
-    mod = kst_day(entry.lastmod)
-    if mod:
-        return date_from <= mod <= date_to + timedelta(days=LASTMOD_SLACK_DAYS)
-    return True
+def _needs_read(r: dict, seg_from: date, seg_to: date) -> bool:
+    """이 묶음을 위해 (다시) 읽어야 하는지: 아직 안 읽었거나, 이 묶음 시작보다 늦은 날짜까지만 나눠 넣었고 그보다 이른 글이 든 파일."""
+    if r["read_from"] is None:
+        return True
+    return r["read_from"] > seg_from and (r["obs_from"] is None or r["obs_from"] <= seg_to)
+
+
+def pick_numbered(rows: list[dict], seg_from: date, seg_to: date) -> dict | None:
+    """번호 묶음에서 다음에 읽을 파일. 양 끝을 먼저 읽어 번호가 커질수록 최근인지 오래된지 알아낸 뒤, 읽은 파일의 글 날짜 범위로
+    안 읽은 파일의 범위를 가두고(번호 순서 = 날짜 순서), 묶음에 걸칠 수 있는 파일들의 가운데를 읽는다 (이분 탐색)."""
+    rows = sorted(rows, key=lambda r: r["num"])
+    for end in (rows[0], rows[-1]):
+        if end["read_at"] is None:
+            return end
+    def mid(r):
+        return r["obs_to"] or r["obs_from"]
+    lo_row, hi_row = rows[0], rows[-1]
+    newest_first = bool(mid(lo_row) and mid(hi_row) and mid(lo_row) >= mid(hi_row))
+    ordered = rows if newest_first else rows[::-1]         # 최근 파일부터
+    known = [i for i, r in enumerate(ordered) if r["read_at"] is not None and not r["error"] and r["obs_from"]]
+    candidates: list[int] = []
+    for i, r in enumerate(ordered):
+        if r["error"]:
+            continue
+        if r["read_at"] is not None:
+            if r["obs_from"] and _needs_read(r, seg_from, seg_to) and _overlaps(r["obs_from"], r["obs_to"], seg_from, seg_to):
+                return r                                    # 기간을 늘려 다시 읽을 파일
+            continue
+        if r["lastmod"] is not None and r["lastmod"] < seg_from:
+            continue
+        newer = [k for k in known if k < i]
+        older = [k for k in known if k > i]
+        hi = ordered[newer[-1]]["obs_from"] if newer else None   # 더 최근 파일의 가장 이른 글보다 늦을 수 없다
+        lo = ordered[older[0]]["obs_to"] if older else None      # 더 오래된 파일의 가장 늦은 글보다 이를 수 없다
+        if _overlaps(lo, hi, seg_from, seg_to):
+            candidates.append(i)
+    if not candidates:
+        return None
+    return ordered[candidates[len(candidates) // 2]]
+
+
+def pick_sitemap(rows: list[dict], seg_from: date, seg_to: date, plain_cap_reached: bool) -> dict | None:
+    """묶음 [seg_from, seg_to]를 위해 다음에 읽을 사이트맵 파일. 이름에 날짜가 있는 파일(최근 것부터) → 번호 묶음(이분 탐색) →
+    날짜 없는 나머지 파일(lastmod 최근 것부터, 상한까지). 색인은 한 번만 읽는다."""
+    dated, plain = [], []
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["error"] or (r["is_index"] and r["read_from"] is not None):
+            continue
+        if r["grp"]:
+            groups[r["grp"]].append(r)
+            continue
+        if not _needs_read(r, seg_from, seg_to):
+            continue
+        if r["span_from"] is not None:
+            if _overlaps(r["span_from"], r["span_to"], seg_from, seg_to):
+                dated.append(r)
+        elif r["lastmod"] is None or r["lastmod"] >= seg_from:
+            plain.append(r)
+    if dated:
+        return max(dated, key=lambda r: (r["span_to"], r["span_from"]))
+    for members in groups.values():
+        pick = pick_numbered(members, seg_from, seg_to)
+        if pick:
+            return pick
+    if plain and not plain_cap_reached:
+        return max(plain, key=lambda r: (r["read_at"] is None, r["lastmod"] or date.min))
+    return None
+
+
+def sitemaps_cover(rows: list[dict], seg_from: date, seg_to: date) -> bool:
+    """사이트맵만으로 묶음을 덮는지: 이름에 날짜가 있고 묶음에 걸치는 파일을 읽었거나, 날짜 없는 파일의 글이 묶음 시작(+여유)까지 닿았다."""
+    reached: date | None = None
+    for r in rows:
+        if r["is_index"] or r["read_at"] is None or r["error"]:
+            continue
+        if r["span_from"] is not None and _overlaps(r["span_from"], r["span_to"], seg_from, seg_to):
+            return True
+        if r["span_from"] is None and r["obs_from"] and r["obs_to"] and r["obs_to"] >= seg_from:
+            reached = r["obs_from"] if reached is None else min(reached, r["obs_from"])
+    return reached is not None and reached <= seg_from + timedelta(days=COVERAGE_SLACK_DAYS)
+
+
+# ---------------------------------------------------------------------- 기간 묶음
+
+def month_index(d: date) -> int:
+    return d.year * 12 + d.month - 1
+
+
+def month_start(index: int) -> date:
+    return date(index // 12, index % 12 + 1, 1)
+
+
+def segment_start(d: date, unit: int, offset: int) -> date:
+    """d가 든 묶음의 첫날. 묶음은 month_index % unit == offset인 달에서 시작한다 (2/0: 1~2월, 3~4월 …)."""
+    i = month_index(d)
+    return month_start(i - ((i - offset) % unit))
+
+
+def plan_segments(date_from: date, date_to: date, unit: int, offset: int) -> list[tuple[date, date]]:
+    """[date_from, date_to]를 묶음으로, 가장 최근 것부터. 가장 최근 묶음은 date_to에서 끝나고, 가장 오래된 묶음은 date_from에서 시작한다."""
+    out: list[tuple[date, date]] = []
+    end = date_to
+    while end >= date_from:
+        start = segment_start(end, unit, offset)
+        out.append((max(start, date_from), end))
+        end = start - timedelta(days=1)
+    return out
+
+
+def detect_unit(spans: list[tuple[date, date]], default_unit: int = 2, default_offset: int = 0) -> tuple[int, int]:
+    """보관 사이트맵 파일 이름의 기간으로 묶음 단위(개월)와 시작 달을 정한다. 가장 흔한 파일 길이가 1~3개월이면 그 단위(하루 파일은
+    한 달), 더 길면(연도별·5년 단위) 기본 단위로 나눠 한 파일을 여러 묶음이 함께 읽는다. 파일이 없으면 기본 단위."""
+    lengths = Counter(month_index(e) - month_index(s) + 1 for s, e in spans)
+    if not lengths:
+        return default_unit, default_offset
+    unit = lengths.most_common(1)[0][0]
+    if unit not in (1, 2, 3):
+        return default_unit, default_offset
+    offsets = Counter(month_index(s) % unit for s, e in spans if month_index(e) - month_index(s) + 1 == unit)
+    return unit, offsets.most_common(1)[0][0]
+
+
+def segment_label(start: date, end: date) -> str:
+    """2026-09~10, 2026-09, 2025-11~2026-01"""
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start:%Y-%m}"
+    if start.year == end.year:
+        return f"{start:%Y-%m}~{end:%m}"
+    return f"{start:%Y-%m}~{end:%Y-%m}"
 
 
 # ---------------------------------------------------------------------- 목록 페이지 쪽 번호
@@ -288,10 +472,10 @@ def store_article(runner, job: Job, config: dict, url: str, art: Article, *, sec
     return doc_id, result
 
 
-# ---------------------------------------------------------------------- 묶음 실행
+# ---------------------------------------------------------------------- 작업 실행
 
 def run_backfill(runner, job: Job, source: dict) -> str:
-    """BACKFILL 작업 하나(한 묶음)를 실행한다. 작업 상태를 돌려준다."""
+    """BACKFILL 작업 하나를 실행한다. 작업 상태를 돌려준다."""
     db = runner.db
     bf = db.load_backfill(job.id, job.source_id)
     if bf is None or bf["status"] not in ("QUEUED", "RUNNING"):
@@ -319,25 +503,37 @@ class BackfillChunk:
         self.bf_id = bf["id"]
         self.date_from: date = bf["date_from"]
         self.date_to: date = bf["date_to"]
-        self.method: str | None = bf["method"]
+        self.unit: int = bf["unit_months"]
+        self.offset: int = bf["unit_offset"]
         self.cursor: dict = dict(bf["cursor"] or {})
+        if self.cursor.get("v") != 2:          # 기간 묶음 이전 형식의 진행 위치는 처음부터 다시 (찾은 주소는 남아 있다)
+            self.cursor = {"v": 2}
         self.kinds = article_kinds(config)
         self.named = len(config.get("article_patterns") or []) > 1
         self.domain = config.get("site_domain") or source["domain"]
         self.start_requests = self.f.request_count
         self.found = self.saved = self.skipped = self.out = self.failed = 0
         self.recorded = 0
+        self.segments: list[dict] = []
+        self.current: dict | None = None
 
     # -------------------------------------------------------------- 흐름
     def run(self) -> str:
         stop: str | None = None
         done = False
         try:
+            if self.cursor.get("phase") == "SEGMENTS":
+                self._load_segments()
             while True:
                 stop = self._stop_reason()
                 if stop:
                     break
-                rows = self.db.next_backfill_urls(self.bf_id, ARTICLE_BATCH)
+                if self.cursor.get("phase") != "SEGMENTS":
+                    self._plan_step()
+                    continue
+                seg = self._current_segment()
+                self.current = seg
+                rows = self.db.next_backfill_urls(self.bf_id, seg["seq"] if seg else 10 ** 9, ARTICLE_BATCH)
                 if rows:
                     for row in rows:
                         stop = self._stop_reason()
@@ -347,10 +543,14 @@ class BackfillChunk:
                     if stop:
                         break
                     continue
-                if self.cursor.get("phase") == "DONE":
+                if seg is None:
                     done = True
                     break
-                self._discover_step()
+                if seg["status"] == "QUEUED":
+                    self.db.start_segment(seg["id"])
+                    seg["status"] = "RUNNING"
+                if not self._segment_step(seg):
+                    self._finish_segment(seg)
         except CrawlFailure as e:
             return self._blocked(e)
         return self._finish(stop, done)
@@ -369,19 +569,20 @@ class BackfillChunk:
         pending = self.db.pending_backfill_count(self.bf_id)
         # 취소됐으면 백엔드가 남긴 취소 메시지를 덮지 않는다
         message = None if done or stop == CANCELLED else self._progress(stop)
-        self.db.save_backfill(self.bf_id, method=self.method, cursor=self.cursor, requests=self._used(), message=message)
+        self.db.save_backfill(self.bf_id, method=self._method(), cursor=self.cursor, requests=self._used(), message=message)
         if done and pending == 0:
             row = self.db.load_backfill(self.job.id, self.job.source_id) or {}
-            self.db.finish_backfill(self.bf_id, "DONE", done_message(row, self.cursor))
+            self.db.finish_backfill(self.bf_id, "DONE", done_message(row, self.db.load_segments(self.bf_id)))
         status = "PARTIAL" if self.failed else "SUCCESS"
-        note = f"과거 기사 채우기 #{self.bf_id}: 새 {self.saved} · 이미 {self.skipped} · 남은 {pending}"
+        where = f" {segment_label(self.current['date_from'], self.current['date_to'])}" if self.current else ""
+        note = f"과거 기사 채우기 #{self.bf_id}{where}: 새 {self.saved} · 이미 {self.skipped} · 남은 {pending}"
         if stop and stop != "BUDGET":
             note += f" · {stop}"
         self.db.finish_job(self.job.id, status, self.found, self.saved, self.failed,
                            self.source.get("active_config_version_id"), note=note)
         log.info("backfill %s source=%s chunk: requests=%s found=%s saved=%s skipped=%s out=%s failed=%s pending=%s "
-                 "phase=%s stop=%s", self.bf_id, self.job.source_id, self._used(), self.found, self.saved, self.skipped,
-                 self.out, self.failed, pending, self.cursor.get("phase"), stop)
+                 "segment=%s stop=%s", self.bf_id, self.job.source_id, self._used(), self.found, self.saved, self.skipped,
+                 self.out, self.failed, pending, where.strip() or self.cursor.get("phase"), stop)
         return status
 
     def _blocked(self, e: CrawlFailure) -> str:
@@ -392,7 +593,9 @@ class BackfillChunk:
             message = f"사이트가 자동 접근을 막아 멈췄습니다 ({e.code.value}: {e}). 소스는 차단(BLOCKED)으로 두었습니다."
         else:
             message = f"멈췄습니다 ({e.code.value}: {e})."
-        self.db.save_backfill(self.bf_id, method=self.method, cursor=self.cursor, requests=self._used(), message=None)
+        if self.current is not None:
+            self.db.finish_segment(self.current["id"], "FAILED", self._segment_method(self.current), message)
+        self.db.save_backfill(self.bf_id, method=self._method(), cursor=self.cursor, requests=self._used(), message=None)
         self.db.finish_backfill(self.bf_id, "FAILED", message)
         self.db.finish_job(self.job.id, "FAILED", self.found, self.saved, self.failed + 1,
                            self.source.get("active_config_version_id"), note=f"과거 기사 채우기 #{self.bf_id} 중단: {e.code.value}")
@@ -400,22 +603,313 @@ class BackfillChunk:
         return "FAILED"
 
     def _progress(self, stop: str | None) -> str:
-        c = self.cursor
-        if c.get("phase") == "SITEMAP":
-            where = f"보관 사이트맵 {c.get('files', 0)}개 읽음, 열 사이트맵 {len(c.get('queue') or [])}개 남음"
-        elif c.get("phase") == "LIST":
-            hubs = c.get("hubs") or []
-            where = f"목록 페이지 {min(c.get('hub', 0) + 1, len(hubs))}/{len(hubs)}번째 허브 {c.get('page', 0)}쪽까지 봄"
+        if self.cursor.get("phase") != "SEGMENTS":
+            where = "사이트맵 색인을 읽고 기간 묶음을 나누는 중"
+        elif self.current is not None:
+            where = f"{segment_label(self.current['date_from'], self.current['date_to'])} 묶음 진행 중"
         else:
-            where = "기사를 여는 중"
+            where = "남은 기사를 여는 중"
         if stop and stop != "BUDGET":
             where += f" · 잠시 멈춤: {stop}"
         return where
+
+    def _method(self) -> str | None:
+        states = (self.cursor.get("segs") or {}).values()
+        if any(st.get("list_needed") for st in states):
+            return "LIST" if not any(st.get("files") for st in states) else "SITEMAP"
+        return "SITEMAP" if self.cursor.get("phase") else None
 
     def _note(self, text: str) -> None:
         notes = list(self.cursor.get("notes") or [])
         notes.append(text[:200])
         self.cursor["notes"] = notes[-MAX_NOTES:]
+
+    # -------------------------------------------------------------- 기간 묶음
+    def _load_segments(self) -> None:
+        self.segments = self.db.load_segments(self.bf_id)
+        self._extend_if_needed()
+
+    def _extend_if_needed(self) -> None:
+        """요청 기간을 뒤로 늘렸으면(두 달 더) 더 오래된 묶음을 만들고, 기간 시작에 닿아 멈췄던 목록 허브를 다시 연다."""
+        oldest = min((s["date_from"] for s in self.segments), default=None)
+        if oldest is None or self.date_from >= oldest:
+            return
+        start_seq = max(s["seq"] for s in self.segments) + 1
+        new = plan_segments(self.date_from, oldest - timedelta(days=1), self.unit, self.offset)
+        self.db.add_segments(self.bf_id, [(start_seq + i, a, b) for i, (a, b) in enumerate(new)])
+        for h in (self.cursor.get("list") or {}).get("hubs") or []:
+            if h.get("stop") == "older":
+                h.update({"done": False, "stop": None, "page": max(h["page"] - 1, 0), "prev": []})
+        self.segments = self.db.load_segments(self.bf_id)
+        # 전에 열어 보니 기간 밖(늘린 기간 안)이었던 글은 다시 연다 — 열어 본 발행일을 date_hint에 남겨 두었다
+        moves = []
+        for r in self.db.out_of_range_urls(self.bf_id):
+            day = kst_day(r["date_hint"])
+            target = self._segment_of(day) if day and self.date_from <= day < oldest else None
+            if target is not None:
+                moves.append((r["url_hash"], r["segment_id"], target["id"]))
+        self.db.reopen_backfill_urls(self.bf_id, moves)
+        self._note(f"기간을 {self.date_from}까지 늘려 묶음 {len(new)}개를 더했습니다"
+                   + (f" (전에 기간 밖이던 글 {len(moves)}건을 다시 엽니다)." if moves else "."))
+
+    def _current_segment(self) -> dict | None:
+        return next((s for s in self.segments if s["status"] in ("QUEUED", "RUNNING")), None)
+
+    def _segment_of(self, day: date) -> dict | None:
+        return next((s for s in self.segments if s["date_from"] <= day <= s["date_to"]), None)
+
+    def _state(self, seg: dict) -> dict:
+        return self.cursor.setdefault("segs", {}).setdefault(
+            str(seg["id"]), {"sm_done": False, "list_needed": False, "list_done": False, "files": 0, "pages": 0})
+
+    def _segment_method(self, seg: dict) -> str | None:
+        st = self._state(seg)
+        parts = (["SITEMAP"] if st["files"] else []) + (["LIST"] if st["list_needed"] and st["pages"] else [])
+        return "+".join(parts) or None
+
+    def _segment_step(self, seg: dict) -> bool:
+        """이 묶음의 주소 찾기를 한 걸음. 더 할 것이 없으면 False."""
+        st = self._state(seg)
+        if not st["sm_done"]:
+            rows = self.db.load_sitemaps(self.bf_id)
+            pick = pick_sitemap(rows, seg["date_from"], seg["date_to"],
+                                self.cursor.get("plain_reads", 0) >= self.s.backfill_max_sitemaps)
+            if pick is not None:
+                self._read_sitemap(pick)
+                st["files"] += 1
+                return True
+            st["sm_done"] = True
+            if not sitemaps_cover(rows, seg["date_from"], seg["date_to"]):
+                st["list_needed"] = True
+                self._init_list()
+            return True
+        if st["list_needed"] and not st["list_done"]:
+            hub = self._list_hub(seg)
+            if hub is None:
+                st["list_done"] = True
+            else:
+                self._list_page(seg, hub)
+                st["pages"] += 1
+            return True
+        return False
+
+    def _finish_segment(self, seg: dict) -> None:
+        st = self._state(seg)
+        label = segment_label(seg["date_from"], seg["date_to"])
+        row = next((s for s in self.db.load_segments(self.bf_id) if s["id"] == seg["id"]), seg)
+        hubs = (self.cursor.get("list") or {}).get("hubs") or []
+        no_way = st["list_needed"] and not st["files"] and not any(h.get("param") for h in hubs)
+        if no_way and not row["found_count"]:
+            status, message = "FAILED", f"{label}: 보관 사이트맵도 넘길 목록 페이지도 없어 채우지 못했습니다."
+        else:
+            how = ([f"사이트맵 {st['files']}개"] if st["files"] else []) + ([f"목록 {st['pages']}쪽"] if st["pages"] else [])
+            status, message = "DONE", f"{label} 완료 ({', '.join(how) or '찾을 곳 없음'})"
+        self.db.finish_segment(seg["id"], status, self._segment_method(seg), message)
+        seg["status"] = status
+        self._note(message)
+
+    # -------------------------------------------------------------- 계획: 사이트맵 색인 읽기 → 단위 정하기 → 묶음 나누기
+    def _hubs(self) -> list[str]:
+        return list(dict.fromkeys([h for k in self.kinds for h in k["hubs"]] + list(self.config.get("hubs") or [])))
+
+    def _plan_step(self) -> None:
+        phase = self.cursor.get("phase")
+        if phase is None:
+            roots = [u for u in self.f.sitemaps(self.source["base_url"]) if same_site(u, self.domain)]
+            if self.config.get("method") == "SITEMAP":
+                roots += self._hubs()
+            roots = list(dict.fromkeys(roots))
+            self.db.add_sitemaps(self.bf_id, [{**r, "depth": 0} for r in sitemap_child_rows(
+                [SitemapEntry(u) for u in roots], 0)])
+            self.cursor["phase"] = "CLASSIFY"
+            self._note(f"사이트맵 {len(roots)}곳에서 출발합니다." if roots else "robots.txt와 설정에 사이트맵이 없습니다.")
+            return
+        rows = self.db.load_sitemaps(self.bf_id)
+        unread = [r for r in rows if r["depth"] == 0 and r["read_at"] is None]
+        if unread:
+            self._read_sitemap(unread[0], classify=True)
+            return
+        spans = [(r["span_from"], r["span_to"]) for r in rows if r["depth"] > 0 and r["span_from"] is not None]
+        self.unit, self.offset = detect_unit(spans, self.unit, self.offset)
+        self.date_from = segment_start(self.date_from, self.unit, self.offset)
+        self.db.set_backfill_unit(self.bf_id, self.unit, self.offset, self.date_from)
+        planned = plan_segments(self.date_from, self.date_to, self.unit, self.offset)
+        self.db.add_segments(self.bf_id, [(i, a, b) for i, (a, b) in enumerate(planned)])
+        self.cursor["phase"] = "SEGMENTS"
+        self._note(f"{self.date_from}~{self.date_to}를 {self.unit}개월 묶음 {len(planned)}개로 나눠 최근 것부터 채웁니다"
+                   + (" (보관 사이트맵 단위)" if spans else "") + ".")
+        self._load_segments()
+
+    def _read_sitemap(self, row: dict, classify: bool = False) -> None:
+        """사이트맵 파일 하나를 읽는다. 색인이면 하위 파일을 적고, 사이트맵이면 기사 주소를 날짜에 맞는 묶음에 나눠 넣는다
+        (색인을 읽는 계획 단계에서는 묶음이 아직 없으므로 사이트맵은 표시만 하고 나중에 다시 읽는다)."""
+        url = row["url"]
+        try:
+            page = self.f.get_sitemap(url)
+        except CrawlFailure as e:
+            if e.blocking:
+                raise
+            self.db.mark_sitemap(self.bf_id, url, is_index=None, read_from=None, error=e.code.value)
+            self._note(f"사이트맵을 열지 못함 {short(url)}: {e.code.value}")
+            return
+        if not looks_like_sitemap(page.text[:3000]):
+            self.db.mark_sitemap(self.bf_id, url, is_index=None, read_from=None, error="NOT_SITEMAP")
+            self._note(f"사이트맵이 아님 {short(url)}")
+            return
+        is_index, entries = parse_sitemap(page.text)
+        if is_index:
+            kids = [e for e in entries if same_site(e.loc, self.domain)]
+            if row["depth"] < MAX_SITEMAP_DEPTH:
+                self.db.add_sitemaps(self.bf_id, sitemap_child_rows(kids, row["depth"] + 1))
+            self.db.mark_sitemap(self.bf_id, url, is_index=True, read_from=READ_ALL, entries=len(entries))
+            dated = sum(1 for e in kids if sitemap_span(e.loc))
+            self._note(f"색인 {short(url)}: 하위 {len(kids)}개" + (f" (이름에 날짜 {dated}개)" if dated else ""))
+            return
+        if classify:
+            self.db.mark_sitemap(self.bf_id, url, is_index=False, read_from=None, entries=len(entries))
+            return
+        span = (row["span_from"], row["span_to"]) if row["span_from"] is not None else None
+        rows: list[tuple[str, str | None, str | None, int | None]] = []
+        sure, unsure = [], []
+        for e in entries:
+            day, reliable = resolve_entry(e, span)
+            if day:
+                (sure if reliable else unsure).append(day)
+            hit = match_article(e.loc, self.kinds, self.domain)
+            if hit is None:
+                continue
+            target = self._target(day, reliable)
+            if target is None:
+                continue
+            hint = e.published or (url_day(e.loc).isoformat() if url_day(e.loc) else None)
+            rows.append((hit[0], hint, hit[1], target["id"]))
+        days = sure or unsure
+        self.db.mark_sitemap(self.bf_id, url, is_index=False, read_from=self.date_from,
+                             obs_from=min(days) if days else None, obs_to=max(days) if days else None, entries=len(entries))
+        if span is None and not row["grp"]:      # 번호 묶음은 이분 탐색이라 상한에 세지 않는다
+            self.cursor["plain_reads"] = self.cursor.get("plain_reads", 0) + 1
+        added = self._add(rows)
+        self._note(f"사이트맵 {short(url)}: 항목 {len(entries)}개 중 기간 안 기사 {len(rows)}건 (새 주소 {added})"
+                   + (" (일부만 읽음: 크기 상한)" if page.truncated else ""))
+
+    def _target(self, day: date | None, reliable: bool) -> dict | None:
+        """찾은 주소를 넣을 묶음. 날짜를 모르면 지금 묶음, 믿을 만한 날짜면 그 날짜의 묶음(요청 기간 밖이면 버림),
+        lastmod뿐이면(실제 발행일은 그보다 이르다) 그 날짜의 묶음(기간 끝보다 늦으면 가장 최근 묶음, 기간 시작보다 이르면 버림)."""
+        if day is None:
+            return self.current
+        if reliable:
+            return self._segment_of(day) if self.date_from <= day <= self.date_to else None
+        if day < self.date_from:
+            return None
+        return self._segment_of(min(day, self.date_to))
+
+    def _add(self, rows: list[tuple[str, str | None, str | None, int | None]]) -> int:
+        inserted, _ = self.db.add_backfill_urls(self.bf_id, rows)
+        self.found += inserted
+        return inserted
+
+    # -------------------------------------------------------------- 목록 페이지 역순 (묶음 사이에 이어서)
+    def _init_list(self) -> None:
+        if "list" in self.cursor:
+            return
+        hubs = self._hubs()
+        if self.config.get("method") != "STATIC":
+            # 피드·사이트맵 소스: 허브가 목록 페이지가 아니므로 탐색 때 본 섹션(목록) 페이지도 넘겨 본다
+            excluded = set(self.config.get("excluded_sections") or [])
+            hubs += [s["url"] for s in (self.config.get("sections") or []) if s.get("name") not in excluded][:8]
+        hubs = list(dict.fromkeys(hubs))
+        self.cursor["list"] = {"hubs": [{"url": u, "page": 0, "param": None, "prev": [], "dated": True, "newest": None,
+                                         "reached": None, "done": False, "stop": None} for u in hubs]}
+        self._note("사이트맵이 묶음을 덮지 못해 목록 페이지를 거꾸로 넘깁니다." if hubs else "넘겨 볼 목록 페이지가 없습니다.")
+
+    def _hub_done(self, hub: dict, stop: str, reason: str) -> None:
+        hub.update({"done": True, "stop": stop})
+        self._note(f"목록 {short(hub['url'])}: {reason}")
+
+    def _list_hub(self, seg: dict) -> dict | None:
+        """이 묶음을 위해 더 넘길 허브. 모든 허브가 끝났거나 묶음 시작보다 이른 글까지 갔으면 None."""
+        for hub in (self.cursor.get("list") or {}).get("hubs") or []:
+            if hub["done"]:
+                continue
+            if not hub["dated"] and hub["page"] and hub["newest"]:
+                # 날짜 없는 목록: 그 쪽 글을 열어 본 가장 늦은 발행일이 이 허브가 닿은 곳이다
+                hub["reached"] = hub["newest"]
+                if date.fromisoformat(hub["newest"]) < self.date_from:
+                    self._hub_done(hub, "older", f"{hub['page']}쪽 글이 기간 시작보다 이르러 멈춤")
+                    continue
+            if hub["reached"] and date.fromisoformat(hub["reached"]) < seg["date_from"]:
+                continue
+            return hub
+        return None
+
+    def _list_page(self, seg: dict, hub: dict) -> None:
+        self.cursor["list"]["active"] = hub["url"]
+        page_no = hub["page"] + 1
+        if page_no > 1 and not hub["param"]:
+            self._hub_done(hub, "no-param", "쪽 번호를 넘기는 방법을 찾지 못함")
+            return
+        if page_no > self.s.backfill_max_pages:
+            self._hub_done(hub, "cap", f"쪽 수 상한({self.s.backfill_max_pages}쪽)에 닿음")
+            return
+        url = hub["url"] if page_no == 1 else page_url(hub["url"], hub["param"], page_no)
+        try:
+            page = self.f.get(url)
+        except CrawlFailure as e:
+            if e.blocking:
+                raise
+            self._hub_done(hub, "error", f"{page_no}쪽을 열지 못함 ({e.code.value})")
+            return
+        hub["page"] = page_no
+        if page_no == 1:
+            if looks_like_feed(page.text) or looks_like_sitemap(page.text):
+                self._hub_done(hub, "feed", "피드·사이트맵이라 쪽을 넘길 수 없음")
+                return
+            id_keys = {key for k in self.kinds for key in (k.get("query_keys") or [])}
+            hub["param"] = find_page_param(page.text, page.url, id_keys)
+        entries: list[tuple[str, str | None, str | None]] = []
+        seen: set[str] = set()
+        for u, hint in links_with_dates(page.text, page.url):
+            hit = match_article(u, self.kinds, self.domain)
+            if hit is None or hit[0] in seen:
+                continue
+            seen.add(hit[0])
+            entries.append((hit[0], hint or (url_day(hit[0]).isoformat() if url_day(hit[0]) else None), hit[1]))
+        prev = set(hub["prev"] or [])
+        fresh = [e for e in entries if sha256(e[0])[:16] not in prev]
+        hub["prev"] = [sha256(e[0])[:16] for e in entries][:300]
+        if page_no > 1 and not fresh:
+            self._hub_done(hub, "end", f"{page_no}쪽에 새 글이 없어 목록 끝으로 봄")
+            return
+        days = [kst_day(hint) for _, hint, _ in fresh]
+        dated = [d for d in days if d]
+        rows: list[tuple[str, str | None, str | None, int | None]] = []
+        if dated:
+            hub["dated"] = True
+            # 이 허브가 닿은 곳 = 쪽 맨 아래 글의 날짜 (목록은 최근 글부터라 위쪽에 고정된 오래된 공지에 끌려가지 않는다)
+            hub["reached"] = next(d for d in reversed(days) if d).isoformat()
+            if max(dated) < self.date_from:
+                self._hub_done(hub, "older", f"{page_no}쪽 글이 모두 {self.date_from}보다 일러 멈춤")
+                return
+            for (u, hint, kind), d in zip(fresh, days):
+                target = self.current if d is None else (self._segment_of(d) if self.date_from <= d <= self.date_to else None)
+                if target is not None:
+                    rows.append((u, hint, kind, target["id"]))
+        else:
+            # 목록에 날짜가 없다: 이미 있는 문서의 발행일과, 이 쪽 글을 열어 본 발행일(_seen_day)로 이 허브가 닿은 곳을 정한다
+            hub["dated"] = False
+            newest = self.db.newest_published([u for u, _, _ in fresh])
+            hub["newest"] = newest.astimezone(KST).date().isoformat() if newest else None
+            rows = [(u, hint, kind, seg["id"]) for u, hint, kind in fresh]
+        self._add(rows)
+
+    def _seen_day(self, day: date | None) -> None:
+        """날짜 없는 목록: 그 쪽 글을 열어 본 가장 늦은 발행일을 허브에 남긴다."""
+        lst = self.cursor.get("list") or {}
+        hub = next((h for h in lst.get("hubs") or [] if h["url"] == lst.get("active")), None)
+        if day is None or hub is None or hub["dated"]:
+            return
+        if not hub["newest"] or day.isoformat() > hub["newest"]:
+            hub["newest"] = day.isoformat()
 
     # -------------------------------------------------------------- 기사 하나
     def _article(self, row: dict) -> None:
@@ -439,16 +933,18 @@ class BackfillChunk:
         day = published_day(art)
         self._seen_day(day)
         if day is None or not self.date_from <= day <= self.date_to:
-            self._mark(url_hash, "OUT_OF_RANGE")
+            self._mark(url_hash, "OUT_OF_RANGE", published=day.isoformat() if day else None)
             return
+        target = self._segment_of(day)
+        move = target["id"] if target is not None and target["id"] != row["segment_id"] else None
         now = datetime.now(timezone.utc)
         _, result = store_article(self.r, self.job, self.config, url, art,
                                   section=row["kind"] if self.named else None,
                                   collected_at=min(art.published_at, now))
-        self._mark(url_hash, "SAVED" if result == "NEW" else "SKIPPED")
+        self._mark(url_hash, "SAVED" if result == "NEW" else "SKIPPED", move)
 
-    def _mark(self, url_hash: str, status: str) -> None:
-        self.db.mark_backfill_url(self.bf_id, url_hash, status)
+    def _mark(self, url_hash: str, status: str, move_to: int | None = None, published: str | None = None) -> None:
+        self.db.mark_backfill_url(self.bf_id, url_hash, status, move_to, published)
         if status == "SAVED":
             self.saved += 1
         elif status == "SKIPPED":
@@ -458,201 +954,6 @@ class BackfillChunk:
         else:
             self.failed += 1
 
-    def _seen_day(self, day: date | None) -> None:
-        """날짜 없는 목록: 그 쪽 글을 열어 본 가장 늦은 발행일을 남긴다 (다음 쪽으로 갈지 정한다)."""
-        c = self.cursor
-        if day is None or c.get("phase") != "LIST" or c.get("dated", True):
-            return
-        if not c.get("newest") or day.isoformat() > c["newest"]:
-            c["newest"] = day.isoformat()
-
-    def _add(self, rows: list[tuple[str, str | None, str | None]]) -> int:
-        inserted, _ = self.db.add_backfill_urls(self.bf_id, rows)
-        self.found += inserted
-        return inserted
-
-    # -------------------------------------------------------------- 주소 찾기
-    def _discover_step(self) -> None:
-        phase = self.cursor.get("phase")
-        if phase is None:
-            self._plan()
-        elif phase == "SITEMAP":
-            self._sitemap_step()
-        elif phase == "LIST":
-            self._list_step()
-        else:
-            self.cursor["phase"] = "DONE"
-
-    def _hubs(self) -> list[str]:
-        return list(dict.fromkeys([h for k in self.kinds for h in k["hubs"]] + list(self.config.get("hubs") or [])))
-
-    def _plan(self) -> None:
-        roots = [u for u in self.f.sitemaps(self.source["base_url"]) if same_site(u, self.domain)]
-        if self.config.get("method") == "SITEMAP":
-            roots += self._hubs()
-        roots = list(dict.fromkeys(roots))
-        if not roots:
-            self._to_list("robots.txt와 설정에 사이트맵이 없습니다.")
-            return
-        self.method = "SITEMAP"
-        self.cursor.update({"phase": "SITEMAP", "queue": [{"url": u, "depth": 0} for u in roots], "seen": [],
-                            "opened": 0, "files": 0, "found": 0, "oldest": None})
-        self._note(f"사이트맵 {len(roots)}곳에서 출발합니다.")
-
-    def _sitemap_step(self) -> None:
-        c = self.cursor
-        queue = c.get("queue") or []
-        if not queue or c.get("opened", 0) >= self.s.backfill_max_sitemaps:
-            if queue:
-                self._note(f"사이트맵 상한({self.s.backfill_max_sitemaps}개)에 닿아 {len(queue)}개는 열지 않았습니다.")
-            self._after_sitemaps()
-            return
-        item = queue.pop(0)
-        c["queue"] = queue
-        c["opened"] = c.get("opened", 0) + 1
-        c["seen"] = (list(c.get("seen") or []) + [item["url"]])[-300:]
-        try:
-            page = self.f.get_sitemap(item["url"])
-        except CrawlFailure as e:
-            if e.blocking:
-                raise
-            self._note(f"사이트맵을 열지 못함 {item['url']}: {e.code.value}")
-            return
-        if not looks_like_sitemap(page.text[:3000]):
-            self._note(f"사이트맵이 아님 {item['url']}")
-            return
-        is_index, entries = parse_sitemap(page.text)
-        if is_index:
-            if item["depth"] >= MAX_SITEMAP_DEPTH:
-                return
-            seen = set(c["seen"]) | {q["url"] for q in queue}
-            kids = [e for e in entries if same_site(e.loc, self.domain) and e.loc not in seen
-                    and child_wanted(e, self.date_from, self.date_to)]
-            kids.sort(key=child_order, reverse=True)
-            c["queue"] = [{"url": e.loc, "depth": item["depth"] + 1} for e in kids] + queue
-            self._note(f"색인 {short(item['url'])}: 하위 {len(entries)}개 중 기간에 걸치는 {len(kids)}개")
-            return
-        rows: list[tuple[str, str | None, str | None]] = []
-        oldest = date.fromisoformat(c["oldest"]) if c.get("oldest") else None
-        for e in entries:
-            hit = match_article(e.loc, self.kinds, self.domain)
-            if hit is None:
-                continue
-            day = entry_day(e)
-            if day and (oldest is None or day < oldest):
-                oldest = day
-            if entry_in_period(e, self.date_from, self.date_to):
-                rows.append((hit[0], e.published, hit[1]))
-        c["oldest"] = oldest.isoformat() if oldest else None
-        added = self._add(rows)
-        c["files"] = c.get("files", 0) + 1
-        c["found"] = c.get("found", 0) + added
-        self._note(f"사이트맵 {short(item['url'])}: 항목 {len(entries)}개 중 기간 안 기사 {len(rows)}건"
-                   + (" (일부만 읽음: 크기 상한)" if page.truncated else ""))
-
-    def _after_sitemaps(self) -> None:
-        """사이트맵을 다 봤다: 기간을 덮었으면 끝, 아니면 목록 페이지로 이어 찾는다."""
-        c = self.cursor
-        oldest = date.fromisoformat(c["oldest"]) if c.get("oldest") else None
-        if not c.get("found"):
-            self._to_list("사이트맵에 기간 안 기사가 없어 목록 페이지를 거꾸로 넘깁니다.")
-        elif oldest is None:
-            self._to_list("사이트맵 항목에 날짜가 없어 목록 페이지로도 찾아 봅니다.")
-        elif oldest > self.date_from + timedelta(days=COVERAGE_SLACK_DAYS):
-            self._to_list(f"사이트맵이 {oldest}까지만 있어 그 전은 목록 페이지로 이어 찾습니다.")
-        else:
-            c["phase"] = "DONE"
-
-    def _to_list(self, reason: str) -> None:
-        hubs = self._hubs()
-        if self.config.get("method") != "STATIC":
-            # 피드·사이트맵 소스: 허브가 목록 페이지가 아니므로 탐색 때 본 섹션(목록) 페이지도 넘겨 본다
-            excluded = set(self.config.get("excluded_sections") or [])
-            hubs += [s["url"] for s in (self.config.get("sections") or []) if s.get("name") not in excluded][:8]
-        hubs = list(dict.fromkeys(hubs))
-        self._note(reason)
-        if not hubs:
-            self.cursor["phase"] = "DONE"
-            self._note("넘겨 볼 목록 페이지가 없습니다.")
-            return
-        self.method = "LIST"
-        self.cursor.update({"phase": "LIST", "hubs": hubs, "hub": 0})
-        self._reset_hub()
-
-    def _reset_hub(self) -> None:
-        self.cursor.update({"page": 0, "param": None, "prev": [], "dated": True, "newest": None})
-
-    def _next_hub(self, reason: str) -> None:
-        c = self.cursor
-        hubs = c.get("hubs") or []
-        hub = hubs[c["hub"]] if c.get("hub", 0) < len(hubs) else ""
-        self._note(f"목록 {short(hub)}: {reason}")
-        c["hub"] = c.get("hub", 0) + 1
-        self._reset_hub()
-
-    def _list_step(self) -> None:
-        c = self.cursor
-        hubs = c.get("hubs") or []
-        if c.get("hub", 0) >= len(hubs):
-            c["phase"] = "DONE"
-            return
-        hub = hubs[c["hub"]]
-        page_no = c.get("page", 0) + 1
-        if page_no > 1 and not c.get("dated", True) and c.get("newest") and \
-                date.fromisoformat(c["newest"]) < self.date_from:
-            self._next_hub(f"{page_no - 1}쪽 글이 기간 시작보다 이르러 멈춤")
-            return
-        if page_no > 1 and not c.get("param"):
-            self._next_hub("쪽 번호를 넘기는 방법을 찾지 못함")
-            return
-        if page_no > self.s.backfill_max_pages:
-            self._next_hub(f"쪽 수 상한({self.s.backfill_max_pages}쪽)에 닿음")
-            return
-        url = hub if page_no == 1 else page_url(hub, c["param"], page_no)
-        try:
-            page = self.f.get(url)
-        except CrawlFailure as e:
-            if e.blocking:
-                raise
-            self._next_hub(f"{page_no}쪽을 열지 못함 ({e.code.value})")
-            return
-        c["page"] = page_no
-        if page_no == 1:
-            if looks_like_feed(page.text) or looks_like_sitemap(page.text):
-                self._next_hub("피드·사이트맵이라 쪽을 넘길 수 없음")
-                return
-            id_keys = {key for k in self.kinds for key in (k.get("query_keys") or [])}
-            c["param"] = find_page_param(page.text, page.url, id_keys)
-        entries: list[tuple[str, str | None, str | None]] = []
-        seen: set[str] = set()
-        for u, hint in links_with_dates(page.text, page.url):
-            hit = match_article(u, self.kinds, self.domain)
-            if hit is None or hit[0] in seen:
-                continue
-            seen.add(hit[0])
-            entries.append((hit[0], hint, hit[1]))
-        prev = set(c.get("prev") or [])
-        fresh = [e for e in entries if sha256(e[0])[:16] not in prev]
-        c["prev"] = [sha256(e[0])[:16] for e in entries][:300]
-        if page_no > 1 and not fresh:
-            self._next_hub(f"{page_no}쪽에 새 글이 없어 목록 끝으로 봄")
-            return
-        days = [kst_day(hint) for _, hint, _ in fresh]
-        dated = [d for d in days if d]
-        if dated:
-            c["dated"] = True
-            if max(dated) < self.date_from:
-                self._next_hub(f"{page_no}쪽 글이 모두 {self.date_from}보다 일러 멈춤")
-                return
-            rows = [e for e, d in zip(fresh, days) if d is None or self.date_from <= d <= self.date_to]
-        else:
-            # 목록에 날짜가 없다: 이미 있는 문서의 발행일과, 이 쪽 글을 열어 본 발행일(_seen_day)로 다음 쪽을 정한다
-            c["dated"] = False
-            newest = self.db.newest_published([u for u, _, _ in fresh])
-            c["newest"] = newest.astimezone(KST).date().isoformat() if newest else None
-            rows = fresh
-        self._add(rows)
-
 
 def short(url: str) -> str:
     parts = urlsplit(url)
@@ -660,11 +961,11 @@ def short(url: str) -> str:
     return (tail + ("?" + parts.query if parts.query else ""))[:80] or url[:80]
 
 
-def done_message(row: dict, cursor: dict) -> str:
-    text = (f"완료: 기사 주소 {row.get('found_count', 0)}건 중 새로 저장 {row.get('saved_count', 0)}건, "
+def done_message(row: dict, segments: list[dict]) -> str:
+    done = sum(1 for s in segments if s["status"] == "DONE")
+    failed = sum(1 for s in segments if s["status"] == "FAILED")
+    text = (f"완료: 묶음 {len(segments)}개 중 완료 {done}" + (f"·실패 {failed}" if failed else "")
+            + f". 기사 주소 {row.get('found_count', 0)}건 중 새로 저장 {row.get('saved_count', 0)}건, "
             f"이미 있음 {row.get('skipped_count', 0)}건, 기간 밖·발행일 없음 {row.get('out_of_range_count', 0)}건, "
             f"실패 {row.get('failed_count', 0)}건.")
-    notes = cursor.get("notes") or []
-    if notes:
-        text += " " + notes[-1]
     return text[:500]

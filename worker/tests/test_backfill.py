@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import gzip
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
 import pytest
@@ -15,7 +15,6 @@ from sensing_worker.discovery import pattern_from_signature
 from sensing_worker.fetcher import PoliteFetcher
 
 TODAY = date(2026, 10, 19)
-FROM, TO = date(2026, 7, 19), date(2026, 10, 19)
 
 
 # ---------------------------------------------------------------------- 보관 사이트맵 고르기
@@ -33,6 +32,72 @@ def test_sitemap_span_reads_dates_in_archive_file_names():
     assert bf.sitemap_span("https://x.example/sitemap-2048.xml", TODAY) is None
     assert bf.sitemap_span("https://x.example/sitemap-12345678.xml", TODAY) is None
     assert bf.sitemap_span("https://www.korea.kr/sitemap_policy.xml", TODAY) is None
+    # 조사한 사이트들의 이름 꼴: 5년 단위(주간동아), 연도별(매일신문 1993.xml·2024_1.xml), 일별(20261019.xml, 2026/1019.xml)
+    assert bf.sitemap_span("https://weekly.donga.com/sitemap/weekly-sitemap-2000-2005.xml.gz", TODAY) == (
+        date(2000, 1, 1), date(2005, 12, 31))
+    assert bf.sitemap_span("https://www.imaeil.com/sitemap/1993.xml", TODAY) == (date(1993, 1, 1), date(1993, 12, 31))
+    assert bf.sitemap_span("https://www.imaeil.com/sitemap/2024_1.xml", TODAY) == (date(2024, 1, 1), date(2024, 12, 31))
+    assert bf.sitemap_span("https://www.koreaherald.com/sitemap/20261019.xml", TODAY) == (date(2026, 10, 19),) * 2
+    assert bf.sitemap_span("https://www.hankyung.com/sitemap/2026/1019.xml", TODAY) == (date(2026, 10, 19),) * 2
+    assert bf.sitemap_span("https://www.mbn.co.kr/sitemap/mbn_all_sitemap549.xml", TODAY) is None
+
+
+def test_date_inside_article_url_wins_over_lastmod():
+    assert bf.url_day("https://www.donga.com/news/Politics/article/all/19961015/7212345/1", TODAY) == date(1996, 10, 15)
+    assert bf.url_day("https://blog.example/2026/09/15/chip-plant/", TODAY) == date(2026, 9, 15)
+    assert bf.url_day("https://n.example/2026-09-15-chip-plant", TODAY) == date(2026, 9, 15)
+    # 식별자·쿼리·미래 날짜는 날짜가 아니다
+    assert bf.url_day("https://www.mk.co.kr/news/economy/11412345", TODAY) is None
+    assert bf.url_day("https://www.x.example/news/articleView.html?idxno=20240115", TODAY) is None
+    assert bf.url_day("https://www.x.example/news/20301231/1", TODAY) is None
+    # 1996 파일에 나중 수정일(2024 lastmod)이 섞여도 주소 안 날짜를 쓴다
+    span = bf.sitemap_span("https://image.donga.com/sitemap/donga-sitemap-199609-199610.xml.gz", TODAY)
+    entry = bf.SitemapEntry("https://www.donga.com/news/Politics/article/all/19961015/7212345/1", lastmod="2024-03-02")
+    assert bf.resolve_entry(entry, span) == (date(1996, 10, 15), True)
+    assert bf.resolve_entry(bf.SitemapEntry("https://k.example/view.do?id=1", published="2026-07-01T09:00:00+09:00"),
+                            None) == (date(2026, 7, 1), True)
+    # 주소·발행일에 날짜가 없으면 lastmod (그보다 이른 글이라는 뜻) — 파일 이름의 기간 안으로 자른다
+    assert bf.resolve_entry(bf.SitemapEntry("https://k.example/view.do?id=2", lastmod="2024-03-02"), span) == (
+        date(1996, 10, 31), False)
+    assert bf.resolve_entry(bf.SitemapEntry("https://k.example/view.do?id=3"), span) == (date(1996, 10, 31), False)
+    assert bf.resolve_entry(bf.SitemapEntry("https://k.example/view.do?id=4", lastmod="2026-09-02"), None) == (
+        date(2026, 9, 2), False)
+
+
+# ---------------------------------------------------------------------- 기간 묶음
+
+def test_segments_are_aligned_two_month_blocks_newest_first():
+    assert bf.segment_start(date(2026, 7, 19), 2, 0) == date(2026, 7, 1)
+    assert bf.segment_start(date(2026, 8, 31), 2, 0) == date(2026, 7, 1)
+    assert bf.segment_start(date(2026, 2, 3), 3, 0) == date(2026, 1, 1)
+    assert bf.plan_segments(date(2026, 7, 1), date(2026, 10, 19), 2, 0) == [
+        (date(2026, 9, 1), date(2026, 10, 19)), (date(2026, 7, 1), date(2026, 8, 31))]
+    # 10년이면 묶음 60개, 해를 넘는 묶음도 단위대로
+    ten_years = bf.plan_segments(date(2016, 11, 1), date(2026, 10, 19), 2, 0)
+    assert len(ten_years) == 60 and ten_years[-1] == (date(2016, 11, 1), date(2016, 12, 31))
+    assert bf.plan_segments(date(2025, 12, 1), date(2026, 2, 10), 3, 2) == [
+        (date(2025, 12, 1), date(2026, 2, 10))]                        # 12~2월이 한 묶음 (석 달, 12월 시작)
+    assert bf.segment_label(date(2026, 9, 1), date(2026, 10, 19)) == "2026-09~10"
+    assert bf.segment_label(date(2026, 9, 1), date(2026, 9, 30)) == "2026-09"
+    assert bf.segment_label(date(2025, 12, 1), date(2026, 2, 28)) == "2025-12~2026-02"
+
+
+def test_segment_unit_follows_archive_file_names():
+    def spans(urls):
+        return [bf.sitemap_span(u, TODAY) for u in urls]
+    donga = [f"https://image.donga.com/sitemap/donga/donga-sitemap-{y}{m:02d}-{y}{m + 1:02d}.xml.gz"
+             for y in (2025, 2026) for m in range(1, 12, 2)]
+    assert bf.detect_unit(spans(donga)) == (2, 0)                      # 두 달 파일 하나 = 묶음 하나 (1~2월, 3~4월 …)
+    odd = [f"https://x.example/s-{y}{m:02d}-{y if m < 12 else y + 1}{m % 12 + 1:02d}.xml" for y in (2025,) for m in (2, 4, 6, 8)]
+    assert bf.detect_unit(spans(odd)) == (2, 1)                        # 2~3월, 4~5월 … 단위면 그 시작 달
+    monthly = [f"https://x.example/sitemap-2026-{m:02d}.xml" for m in range(1, 10)]
+    assert bf.detect_unit(spans(monthly)) == (1, 0)
+    daily = [f"https://www.koreaherald.com/sitemap/202610{d:02d}.xml" for d in range(1, 20)]
+    assert bf.detect_unit(spans(daily)) == (1, 0)                      # 하루 파일은 한 달 묶음
+    yearly = [f"https://www.imaeil.com/sitemap/{y}.xml" for y in range(1993, 2026)]
+    assert bf.detect_unit(spans(yearly)) == (2, 0)                     # 연도별 파일은 기본 두 달로 나눠 한 파일을 함께 읽는다
+    assert bf.detect_unit(spans(["https://weekly.donga.com/s/weekly-sitemap-2000-2005.xml.gz"])) == (2, 0)
+    assert bf.detect_unit([], 1, 0) == (1, 0)
 
 
 DONGA_INDEX = """<?xml version="1.0" encoding="UTF-8"?>
@@ -45,22 +110,78 @@ DONGA_INDEX = """<?xml version="1.0" encoding="UTF-8"?>
 </sitemapindex>"""
 
 
-def test_index_children_overlapping_the_period_are_chosen_newest_first():
+def file_rows(entries, depth=1):
+    """backfill_sitemap 행처럼 (DB 없이 고르기 규칙을 본다)."""
+    return [{**r, "is_index": None, "read_from": None, "read_at": None, "obs_from": None, "obs_to": None, "error": None}
+            for r in bf.sitemap_child_rows(entries, depth, TODAY)]
+
+
+def read(row, date_from, obs=None, is_index=False):
+    row.update({"read_at": "now", "read_from": date_from, "is_index": is_index,
+                "obs_from": obs[0] if obs else None, "obs_to": obs[1] if obs else None})
+
+
+def test_each_segment_reads_only_the_archive_file_for_its_months_newest_first():
     is_index, entries = bf.parse_sitemap(DONGA_INDEX)
     assert is_index and len(entries) == 5
-    kids = [e for e in entries if bf.child_wanted(e, FROM, TO, TODAY)]
-    kids.sort(key=lambda e: bf.child_order(e, TODAY), reverse=True)
-    assert [e.loc.rsplit("/", 1)[-1] for e in kids] == ["donga-sitemap-202609-202610.xml.gz",
-                                                        "donga-sitemap-202607-202608.xml.gz"]
+    rows = file_rows(entries)
+    f = date(2026, 7, 1)
+    sep_oct, jul_aug = (date(2026, 9, 1), date(2026, 10, 19)), (date(2026, 7, 1), date(2026, 8, 31))
+    pick = bf.pick_sitemap(rows, *sep_oct, False)
+    assert pick["url"].endswith("donga-sitemap-202609-202610.xml.gz")
+    read(pick, f)
+    assert bf.pick_sitemap(rows, *sep_oct, False) is None and bf.sitemaps_cover(rows, *sep_oct)
+    pick = bf.pick_sitemap(rows, *jul_aug, False)
+    assert pick["url"].endswith("donga-sitemap-202607-202608.xml.gz")
+    read(pick, f)
+    assert bf.pick_sitemap(rows, *jul_aug, False) is None
+    # 기간을 두 달 늘리면 그 묶음의 파일만 더 읽는다 (이미 읽은 파일은 그 달 글이 없으니 다시 읽지 않는다)
+    may_jun = (date(2026, 5, 1), date(2026, 6, 30))
+    assert bf.pick_sitemap(rows, *may_jun, False)["url"].endswith("donga-sitemap-202605-202606.xml.gz")
 
 
-def test_undated_children_are_chosen_by_lastmod():
-    old = bf.SitemapEntry("https://www.korea.kr/sitemap_old.xml", lastmod="2026-05-01")
-    recent = bf.SitemapEntry("https://www.korea.kr/sitemap_policy.xml", lastmod="2026-10-18T09:00:00+09:00")
-    unknown = bf.SitemapEntry("https://www.korea.kr/sitemap_speech.xml")
-    assert not bf.child_wanted(old, FROM, TO, TODAY)       # 기간 시작 전에 마지막으로 바뀐 파일의 글은 모두 그 전 글
-    assert bf.child_wanted(recent, FROM, TO, TODAY)
-    assert bf.child_wanted(unknown, FROM, TO, TODAY)
+def test_undated_files_are_read_by_lastmod_and_cover_only_as_far_as_their_oldest_article():
+    rows = file_rows([bf.SitemapEntry("https://www.korea.kr/sitemap_old.xml", lastmod="2026-05-01"),
+                      bf.SitemapEntry("https://www.korea.kr/sitemap_policy.xml", lastmod="2026-10-18T09:00:00+09:00"),
+                      bf.SitemapEntry("https://www.korea.kr/sitemap_speech.xml")])
+    seg = (date(2026, 7, 1), date(2026, 8, 31))
+    seen = []
+    while (pick := bf.pick_sitemap(rows, *seg, False)) is not None:
+        seen.append(pick["url"].rsplit("/", 1)[-1])
+        read(pick, seg[0], (date(2026, 7, 20), date(2026, 10, 18)))
+    assert seen == ["sitemap_policy.xml", "sitemap_speech.xml"]     # 기간 시작 전에 마지막으로 바뀐 파일은 읽지 않는다
+    assert not bf.sitemaps_cover(rows, *seg)                          # 가장 이른 글이 07-20이라 7월 초는 목록 페이지로
+    assert bf.sitemaps_cover(rows, date(2026, 7, 19), date(2026, 8, 31))
+    assert bf.pick_sitemap(file_rows([bf.SitemapEntry("https://www.korea.kr/sitemap_x.xml")]), *seg, True) is None  # 상한
+
+
+def test_numbered_files_are_binary_searched_by_the_dates_inside():
+    # mbn_all_sitemap0~549.xml처럼 이름에 날짜가 없고 번호만 다르다: 0번이 가장 최근, 파일 하나에 닷새치
+    n = 550
+    rows = file_rows([bf.SitemapEntry(f"https://www.mbn.co.kr/sitemap/mbn_all_sitemap{i}.xml") for i in range(n)])
+    assert all(r["grp"] for r in rows)
+    newest = date(2026, 10, 19)
+
+    def obs(i):
+        end = newest - timedelta(days=i * 5)
+        return end - timedelta(days=4), end
+
+    seg = (date(2026, 1, 1), date(2026, 2, 28))       # 59일 → 파일 열두세 개
+    reads = []
+    while (pick := bf.pick_sitemap(rows, *seg, True)) is not None:   # 상한에 닿아도 번호 묶음은 이분 탐색으로 읽는다
+        reads.append(pick["num"])
+        read(pick, seg[0], obs(pick["num"]))
+    overlapping = {i for i in range(n) if obs(i)[0] <= seg[1] and obs(i)[1] >= seg[0]}
+    assert overlapping <= set(reads)                  # 묶음에 걸치는 파일은 모두 읽었다
+    assert len(reads) <= len(overlapping) + 2 + 12    # 양 끝 + 이분 탐색 (log2 550 ≈ 9)
+    assert bf.sitemaps_cover(rows, *seg)
+    # 번호가 클수록 최근이어도 같다
+    rows = file_rows([bf.SitemapEntry(f"https://www.dailian.co.kr/sitemap_www_{i}.xml") for i in range(20)])
+    reads = []
+    while (pick := bf.pick_sitemap(rows, *seg, False)) is not None:
+        reads.append(pick["num"])
+        read(pick, seg[0], obs(19 - pick["num"]))
+    assert {19 - i for i in range(20) if obs(i)[0] <= seg[1] and obs(i)[1] >= seg[0]} <= set(reads)
 
 
 def test_urlset_entries_with_cdata_entities_and_news_dates():
@@ -79,19 +200,7 @@ def test_urlset_entries_with_cdata_entities_and_news_dates():
                                         "https://www.x.example/view.do?a=1&b=2", "https://www.x.example/photo/3"]
     assert entries[0].lastmod == "2026-09-15T10:00:00+09:00" and entries[0].published is None
     assert entries[1].published == "2026-07-01T09:00:00+09:00"
-    assert bf.entry_day(entries[0]) == date(2026, 9, 15)
-
-
-def test_entry_period_uses_publication_date_strictly_and_lastmod_with_slack():
-    f, t = date(2026, 7, 1), date(2026, 8, 31)
-    assert bf.entry_in_period(bf.SitemapEntry("u", published="2026-07-01T00:10:00+09:00"), f, t)
-    assert not bf.entry_in_period(bf.SitemapEntry("u", published="2026-06-30T23:50:00+09:00"), f, t)
-    assert not bf.entry_in_period(bf.SitemapEntry("u", published="2026-09-01", lastmod="2026-08-01"), f, t)
-    # lastmod는 고친 시각일 수 있다: 끝 뒤 3일까지는 후보로 두고 상세의 발행일로 확인한다
-    assert bf.entry_in_period(bf.SitemapEntry("u", lastmod="2026-09-02"), f, t)
-    assert not bf.entry_in_period(bf.SitemapEntry("u", lastmod="2026-09-05"), f, t)
-    assert not bf.entry_in_period(bf.SitemapEntry("u", lastmod="2026-06-29"), f, t)
-    assert bf.entry_in_period(bf.SitemapEntry("u"), f, t)    # 날짜 없음 → 상세에서 확인
+    assert bf.resolve_entry(entries[0], None) == (date(2026, 9, 15), True)
 
 
 def test_kst_day_handles_iso_utc_and_korean_list_dates():
