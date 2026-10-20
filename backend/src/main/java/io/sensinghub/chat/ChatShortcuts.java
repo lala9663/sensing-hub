@@ -13,7 +13,8 @@ import java.util.regex.Pattern;
  * <ul>
  *   <li><b>키워드만</b> ({@link #keyword}): 물음표·문장부호·요청 말(알려·찾아·보여·해줘·요약 …)·질문 말(뭐·어디 …)·때 말(오늘·최근 …)·
  *       허브 기능 말(이슈·감시·등록 …) 없이 짧은 낱말 1~4개, 40자 이하. "반도체", "삼성전자 DS", "메타넷 글로벌".
- *       LLM을 거치지 않고 수집 기사에서 바로 찾는다. 끝의 '기사'·'뉴스'·'관련' 같은 낱말은 검색어에서 뺀다.</li>
+ *       LLM을 거치지 않고 수집 기사에서 바로 찾는다. 끝의 '기사'·'뉴스'·'관련' 같은 낱말은 검색어에서 뺀다.
+ *       앞 답의 목록을 가리키는 말({@link #refersToPrevious}: "이 중 삼성전자만")은 키워드가 아니다 (LLM이 앞 근거 안에서 거른다).</li>
  *   <li><b>네이버 형식</b> ({@link #naverQuery}): 맨 앞 '네이버'(또는 '네이버 뉴스') + 구분자(-, :, 대시) + 검색어.
  *       구분자 없이 띄어 쓴 "네이버 닌텐도"는 뒤가 키워드만일 때만 (그래야 "네이버 관련 기사 찾아 줘" 같은 질문을 가로채지 않는다).
  *       네이버 결과는 표시 전용이라 화면이 직접 불러 보여 주고, 대화로 저장하거나 LLM에 보내지 않는다.</li>
@@ -29,6 +30,12 @@ final class ChatShortcuts {
     private static final Pattern JAMO_ONLY = Pattern.compile("[ㄱ-ㅎㅏ-ㅣ]+");
     /** "3일", "10개", "2번", "5시간" — 기간·개수·번호는 질문이다 (LLM이 days·limit으로 바꾼다). */
     private static final Pattern COUNT = Pattern.compile("\\d+(?:일|주|주일|주간|개|건|번|번째|시간|분|달|개월|월|년)");
+    /**
+     * 앞 답의 목록을 가리키는 말: "이 중"·"그중에서"·"저 가운데", "위 기사 중"·"앞 결과에서"·"방금 목록"·"이 기사들" (뒤에 띄어쓰기·문장 끝).
+     * "이중고"·"이중국적"처럼 붙어 있는 낱말은 아니다.
+     */
+    private static final Pattern PREVIOUS = Pattern.compile("(?:^|\\s)(?:(?:이|그|저)\\s?(?:중|가운데)(?:에서|에)?"
+            + "|(?:위|앞|방금|아까|이|그)(?:의)?\\s?(?:기사|결과|목록|문서|근거)들?(?:\\s?(?:중|가운데))?(?:에서|에)?)(?=\\s|$|[,.?!])");
     private static final Pattern NAVER_SEPARATED = Pattern.compile("^네이버(?:\\s*뉴스)?\\s*[-:：–—]\\s*(.*)$");
     private static final Pattern NAVER_SPACED = Pattern.compile("^네이버\\s+(.+)$");
 
@@ -70,7 +77,7 @@ final class ChatShortcuts {
             return Optional.empty();
         }
         String compact = t.replace(" ", "").toLowerCase(Locale.ROOT);
-        if (REQUEST_STEMS.stream().anyMatch(compact::contains)) {
+        if (REQUEST_STEMS.stream().anyMatch(compact::contains) || refersToPrevious(t)) {
             return Optional.empty();
         }
         List<String> query = new ArrayList<>();
@@ -85,6 +92,11 @@ final class ChatShortcuts {
             }
         }
         return query.isEmpty() ? Optional.empty() : Optional.of(String.join(" ", query));
+    }
+
+    /** 앞 답의 목록을 가리키는가 ("이 중 삼성전자만", "위 기사 중 이데일리 것만"): 키워드가 아니라 LLM이 앞 근거 안에서 거른다. */
+    static boolean refersToPrevious(String text) {
+        return PREVIOUS.matcher(flat(text)).find();
     }
 
     /** 네이버 형식이면 네이버 검색어 (구분자 뒤가 비었으면 빈 문자열), 아니면 비어 있다. */

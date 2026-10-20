@@ -79,4 +79,13 @@ public class LlmException extends RuntimeException {
     public RateLimit rateLimit() {
         return rateLimit;
     }
+
+    /**
+     * 스트리밍으로 부르다 이 오류가 나면 같은 요청을 한 번에 받기로 다시 보낼 만한가 ({@link LlmClient#chatStreaming}).
+     * 서버 오류·연결 끊김·스트림 형식 오류·요청 거절(스트리밍을 지원하지 않는 게이트웨이의 400)은 바꿔 볼 만하다.
+     * 429·키 오류·시간 초과·미설정은 다시 불러도 같거나 한도만 더 쓰므로 그대로 둔다.
+     */
+    public boolean streamFallback() {
+        return kind == Kind.SERVER_ERROR || kind == Kind.NETWORK || kind == Kind.BAD_REQUEST || kind == Kind.BAD_RESPONSE;
+    }
 }

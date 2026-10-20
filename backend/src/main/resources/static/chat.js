@@ -13,6 +13,10 @@
  *   <li>바로 가기: 키워드만 보내면 서버가 LLM 없이 바로 찾아 답한다(mode KEYWORD — 기사 카드 목록으로 그린다). "네이버 - 검색어"는 서버
  *       대화로 보내지 않고 이 화면이 GET /naver/news를 불러 임시 카드로 보여 준다 (표시 전용: 대화 기록·LLM에 남기지 않음, 새로 고치면 사라짐).
  *       시작 화면의 칩은 관리자가 정한 주요 키워드다 (GET /featured-keywords).</li>
+ *   <li>보내기는 스트리밍(POST /messages/stream, SSE를 fetch로 읽는다 — App.apiStream): 서버가 알린 단계 문구("수집 기사 검색 중…")를 보이고,
+ *       답 글이 오기 시작하면 초안으로 그려 가다가 done(저장된 최종 답)으로 바꿔 그린다 (근거 칩·카드·추천 칩은 최종 답에만).
+ *       받다가 끊기면 "대화 다시 불러오기" 카드 (서버는 답을 끝까지 만들어 저장한다).</li>
+ *   <li>답 아래의 추천 칩(followUps)은 누르면 그 문장을 보낸다. 맨 아래 답의 칩만 보인다.</li>
  * </ul>
  */
 const Chat = (() => {
@@ -29,6 +33,7 @@ const Chat = (() => {
   const HELP = ['키워드만 입력 → 수집 기사 바로 검색', '네이버 - 검색어 → 네이버 결과만 (저장 안 함)'];
   const NAVER_PAGE = 10;
   const SOURCES_OPEN_MAX = 5;   // 근거가 이보다 많으면 접어 둔다 (본문의 칩으로도 열 수 있다)
+  const PAINT_MS = 50;   // 스트리밍 초안을 다시 그리는 간격 (requestAnimationFrame은 뒤에 있는 창에서 멈춘다)
   const OPEN_KEY = 'sensing.chat.open';
   const LAST_KEY = 'sensing.chat.last.';
   const POPUP_NAME = 'sensing-chat';
@@ -81,6 +86,8 @@ const Chat = (() => {
     '오늘', '어제', '그제', '내일', '최근', '요즘', '이번', '지난', '이번주', '지난주', '이번달', '지난달', '금주', '올해',
     '작년', '지금', '주간', '일간', '더', '다시', '계속', '그거', '이거', '저거', '그중', '위', '아래', '다음', '이전']);
   const FILLER_WORDS = new Set(['관련', '기사', '기사들', '뉴스', '소식', '보도', '동향', '자료', '문서', 'news', 'article', 'articles']);
+  /** 앞 답의 목록을 가리키는 말 ("이 중", "그중에서", "위 기사 중", "앞 결과에서") — 키워드가 아니다 (LLM이 앞 근거 안에서 거른다). */
+  const PREVIOUS = /(?:^|\s)(?:(?:이|그|저)\s?(?:중|가운데)(?:에서|에)?|(?:위|앞|방금|아까|이|그)(?:의)?\s?(?:기사|결과|목록|문서|근거)들?(?:\s?(?:중|가운데))?(?:에서|에)?)(?=\s|$|[,.?!])/;
   const NAVER_SEPARATED = /^네이버(?:\s*뉴스)?\s*[-:：–—]\s*(.*)$/;
   const NAVER_SPACED = /^네이버\s+(.+)$/;
 
@@ -95,7 +102,7 @@ const Chat = (() => {
     const words = t.split(' ');
     if (words.length > 4) return null;
     const compact = t.replace(/ /g, '').toLowerCase();
-    if (REQUEST_STEMS.some(s => compact.includes(s))) return null;
+    if (REQUEST_STEMS.some(s => compact.includes(s)) || PREVIOUS.test(t)) return null;
     const query = [];
     for (const w of words) {
       const lower = w.toLowerCase();
@@ -275,6 +282,21 @@ const Chat = (() => {
       + (external(safeUrl(c.url)) ? `\n${c.url}` : '')).join('\n')}`;
   }
 
+  /**
+   * 추천 후속 질문 칩 (서버 meta.followUps, LLM 없이 규칙으로 만든 2~3개). 누르면 그 문장을 보낸다. url이 있는 칩은 원문을 새 탭으로 연다.
+   * 맨 아래 답의 칩만 보인다 (chat.css): 앞 답의 "이 중 ~만"은 가리키는 목록이 달라지기 때문이다.
+   */
+  function followUpsHtml(items) {
+    const list = (items || []).filter(f => f && f.text);
+    if (!list.length) return '';
+    return `<div class="follow-ups" role="group" aria-label="추천 질문">${list.map(f => {
+      const url = f.url && external(safeUrl(f.url)) ? f.url : '';
+      return url
+        ? `<a class="follow-chip link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(f.text)}${icon('arrow', 12)}</a>`
+        : `<button type="button" class="follow-chip" data-q="${esc(f.text)}">${esc(f.text)}</button>`;
+    }).join('')}</div>`;
+  }
+
   function actionsHtml() {
     return `<div class="msg-actions"><button type="button" class="icon-btn copy" aria-label="답 복사" title="복사">${icon('copy', 15)}</button></div>`;
   }
@@ -336,6 +358,9 @@ const Chat = (() => {
       return { icon: 'cloud', title: 'AI 서버가 제때 답하지 않았습니다', hint: '잠시 후 다시 보내 주세요.', retry: true };
     }
     if (k === 'SEND') return { icon: 'alert', title: '보내지 못했습니다', hint: '', retry: true };
+    if (k === 'STREAM_BROKEN') {
+      return { icon: 'cloud', title: '답을 받다가 연결이 끊겼습니다', hint: '답은 서버에서 끝까지 만들어 저장됩니다. 잠시 뒤 대화를 다시 불러와 주세요.', reload: true };
+    }
     return { icon: 'alert', title: '답을 만들지 못했습니다', hint: '질문을 조금 바꿔 다시 보내 주세요.', retry: true };
   }
 
@@ -349,6 +374,7 @@ const Chat = (() => {
           <div class="alert-text">${esc(m.content)}</div>
           ${info.hint ? `<div class="alert-hint">${esc(info.hint)}</div>` : ''}
           ${info.retry ? `<button type="button" class="pill-btn retry">${icon('retry', 14)}질문 다시 넣기</button>` : ''}
+          ${info.reload ? `<button type="button" class="pill-btn reload">${icon('retry', 14)}대화 다시 불러오기</button>` : ''}
         </div>
       </div>`, { id: m.id, time: msgTime(m.createdAt) });
   }
@@ -392,7 +418,7 @@ const Chat = (() => {
     const body = keyword ? `<div class="msg-body kw-body">${keywordBody(m)}</div>`
       : `<div class="msg-body md">${markdown(m.content, m.citations)}</div>${sourcesHtml(m.citations)}`;
     return assistantHtml(`${keyword ? 'keyword' : ''} ${enter ? 'enter' : ''}`,
-      `${body}${toolsHtml(m.tools, keyword)}${actionsHtml()}`,
+      `${body}${toolsHtml(m.tools, keyword)}${followUpsHtml(m.followUps)}${actionsHtml()}`,
       { id: m.id, time: msgTime(m.createdAt), copy: plainText(m), tag: keyword ? 'AI 없이 바로 검색' : '' });
   }
 
@@ -707,7 +733,16 @@ const Chat = (() => {
       if (loaded) loaded.then(scrollDown);
     }
 
-    /** 생각 중: 점 세 개와 단계 문구. 키워드만 보낸 글은 LLM을 거치지 않으므로 "수집 기사 검색 중"만. */
+    /** 맨 아래 가까이 보고 있었는가 (그럴 때만 새 글자를 따라 내려간다 — 위로 올려 읽는 중이면 그대로 둔다). */
+    function nearBottom() {
+      return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+    }
+
+    /**
+     * 생각 중: 점 세 개와 단계 문구, 그리고 스트리밍으로 오는 답 글(초안). 서버 단계(stage)가 오면 그 문구를 쓰고, 오기 전(한 번에 받기)에는
+     * 시간에 따라 바꾼다. 키워드만 보낸 글은 LLM을 거치지 않으므로 "수집 기사 검색 중"만.
+     * delta: 초안을 보이고(단계 줄은 숨김) 글을 이어 붙인다 — 근거 번호는 최종 답이 오면 칩이 된다. reset: 초안을 버리고 단계 줄로 돌아간다.
+     */
     function thinking(keyword) {
       const stages = keyword ? [[0, '수집 기사 검색 중…']]
         : [[0, '질문을 살펴보는 중…'], [1500, '수집 기사 검색 중…'], [5000, '근거를 정리하는 중…'], [12000, '답을 쓰는 중…']];
@@ -718,19 +753,86 @@ const Chat = (() => {
       const stageEl = el.querySelector('.stage');
       const elapsedEl = el.querySelector('.elapsed');
       const started = Date.now();
+      let timed = true;
+      let draft = null;
+      let draftText = '';
+      let frame = 0;
       const timer = setInterval(() => {
         const ms = Date.now() - started;
-        const stage = stages.filter(s => s[0] <= ms).pop()[1];
-        if (stageEl.textContent !== stage) stageEl.textContent = stage;
+        if (timed) {
+          const stage = stages.filter(s => s[0] <= ms).pop()[1];
+          if (stageEl.textContent !== stage) stageEl.textContent = stage;
+        }
         const sec = Math.floor(ms / 1000);
         elapsedEl.textContent = sec >= 3 ? `${sec}초` : '';
       }, 500);
+      const paint = () => {
+        frame = 0;
+        if (!draft) return;
+        const follow = nearBottom();
+        draft.querySelector('.msg-body').innerHTML = markdown(draftText, []);
+        // 부드러운 스크롤(chat.css)은 조각마다 따라가다 뒤처져 "맨 아래 가까이"를 놓치므로 바로 내린다
+        if (follow) log.scrollTo({ top: log.scrollHeight, behavior: 'instant' });
+      };
       return {
+        /** 서버가 알린 단계 문구. */
+        stage(label) {
+          timed = false;
+          if (label) stageEl.textContent = label;
+        },
+        delta(text) {
+          if (!draft) {
+            draft = App.html(assistantHtml('streaming', '<div class="msg-body md" aria-hidden="true"></div>'));
+            el.after(draft);
+            el.hidden = true;
+          }
+          draftText += text;
+          if (!frame) frame = setTimeout(paint, PAINT_MS);
+        },
+        reset() {
+          if (frame) clearTimeout(frame);
+          frame = 0;
+          if (draft) draft.remove();
+          draft = null;
+          draftText = '';
+          el.hidden = false;
+        },
+        /** 초안을 보였는가 (최종 답을 나타나는 움직임 없이 바꿔 그린다). */
+        get streamed() { return !!draft; },
         stop() {
           clearInterval(timer);
+          if (frame) clearTimeout(frame);
+          if (draft) draft.remove();
           el.remove();
         },
       };
+    }
+
+    /**
+     * 답을 스트리밍으로 받는다 (POST /messages/stream, 단계·글 조각 → done). 서버에 스트리밍 주소가 없으면(405) 한 번에 받기로.
+     * 돌려주는 값은 한 번에 받기와 같은 TurnResult. done 없이 끝나면 ApiError(STREAM_BROKEN).
+     */
+    async function receive(sid, text, wait, current) {
+      let result = null;
+      let failure = null;
+      let r;
+      try {
+        r = await App.apiStream(`/chat/sessions/${sid}/messages/stream`, { content: text }, (name, data) => {
+          if (name === 'done') result = data;
+          else if (name === 'error') failure = data;
+          else if (!current()) return;
+          else if (name === 'stage') wait.stage(data && data.label);
+          else if (name === 'delta') wait.delta((data && data.text) || '');
+          else if (name === 'reset') wait.reset();
+        });
+      } catch (e) {
+        if (e instanceof App.ApiError && e.status === 405) return api('POST', `/chat/sessions/${sid}/messages`, { content: text });
+        throw e;
+      }
+      if (r && r.assistant) return r;   // 서버가 스트림 대신 JSON으로 답했다
+      if (result) return result;
+      if (failure) throw new App.ApiError(500, failure.error || 'INTERNAL', failure.message || '답을 만들다 서버 오류가 났습니다.');
+      throw new App.ApiError(0, 'STREAM_BROKEN', '답을 받다가 연결이 끊겼습니다.');
     }
 
     /** 기다리던 답을 그만 기다린다 (대화를 바꾸거나 화면을 떠날 때). */
@@ -774,11 +876,12 @@ const Chat = (() => {
           }
         }
         // 대화를 바꿨더라도 이미 보낸 질문은 그 대화에 저장되고 답을 받는다 (그리기만 하지 않는다)
-        const r = await api('POST', `/chat/sessions/${sid}/messages`, { content: text });
+        const r = await receive(sid, text, wait, current);
         if (current()) {
+          const streamed = wait.streamed;
           wait.stop();
           if (r.user && r.user.content !== text) userEl.querySelector('.bubble').textContent = r.user.content;
-          log.appendChild(App.html(messageHtml(r.assistant, true)));
+          log.appendChild(App.html(messageHtml(r.assistant, !streamed)));
           if (r.notice) notice(r.notice);
           if (r.session && opts.onSession) opts.onSession(r.session);
         }
@@ -786,8 +889,9 @@ const Chat = (() => {
       } catch (e) {
         if (!current()) return;
         wait.stop();
+        const broken = e instanceof App.ApiError && e.error === 'STREAM_BROKEN';
         log.appendChild(App.html(messageHtml({
-          role: 'ASSISTANT', error: true, errorKind: 'SEND', createdAt: new Date().toISOString(),
+          role: 'ASSISTANT', error: true, errorKind: broken ? 'STREAM_BROKEN' : 'SEND', createdAt: new Date().toISOString(),
           content: e.message || String(e),
         }, true)));
         if (e instanceof App.ApiError && e.status === 409) setInput(text);
@@ -882,7 +986,9 @@ const Chat = (() => {
         while (prev && !prev.classList.contains('user')) prev = prev.previousElementSibling;
         if (prev) setInput(prev.querySelector('.bubble').textContent);
         input.focus();
-      } else if (t.classList.contains('example-card') || t.classList.contains('kw-chip')) {
+      } else if (t.classList.contains('reload')) {
+        if (st.sessionId) App.guard(() => load(st.sessionId));
+      } else if (t.classList.contains('example-card') || t.classList.contains('kw-chip') || t.classList.contains('follow-chip')) {
         setInput(t.dataset.q || t.dataset.k || '');
         send();
       }

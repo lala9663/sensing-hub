@@ -4,11 +4,16 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +25,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
+import io.sensinghub.chat.ChatFollowUps.DocFacts;
+import io.sensinghub.chat.ChatFollowUps.SearchFacts;
 import io.sensinghub.common.ApiException;
 import io.sensinghub.common.UrlNormalizer;
 import io.sensinghub.digest.DigestComposer;
@@ -28,6 +35,7 @@ import io.sensinghub.document.DocumentService.DocumentRow;
 import io.sensinghub.document.DocumentService.Filter;
 import io.sensinghub.document.DocumentService.SiteMatch;
 import io.sensinghub.document.HybridSearch;
+import io.sensinghub.document.SearchTerms;
 import io.sensinghub.issue.IssueService;
 import io.sensinghub.issue.IssueService.IssueRow;
 import io.sensinghub.llm.LlmClient;
@@ -49,6 +57,10 @@ import io.sensinghub.watch.WatchService.WatchView;
  *   <li>사이트(site)·기사 종류(section)는 검색어가 아니라 조건이다. LLM이 이름을 정확히 모를 수 있어 종류 이름은 그 사이트의 실제 이름에
  *       맞추고(같은 이름, 없으면 포함하는 이름), 못 맞추면 문서 대신 고를 수 있는 이름(sites·site_sections)을 준다. 검색어 낱말이 하나도
  *       맞지 않았는데 검색어에 사이트·종류 이름이 있으면 site·section으로 거르라고 note로 알려 준다.</li>
+ *   <li>앞 결과 안에서 다시 거르기: search_documents의 within_previous(·previous_refs)면 새로 찾지 않고 앞 답의 근거({@link Context#previous})
+ *       안에서만 기존 조건(검색어·분류·사이트·종류·기간·감시)으로 거른다. 문서 id는 서버가 chat_citation에서 꺼낸다 — LLM은 표시와 근거 번호만 쓴다.
+ *       이슈 근거는 그 이슈에 묶인 문서로 넓힌다. 이때는 의미 검색 없이 낱말·태그·회사·사이트 이름이 맞는 문서만, 앞 답의 순서로 준다.</li>
+ *   <li>도구는 결과와 함께 추천 후속 질문용 요약({@link Outcome#facts()}, {@link ChatFollowUps})을 남긴다.</li>
  * </ul>
  */
 @Component
@@ -68,6 +80,9 @@ public class ChatTools {
     static final int SUMMARY_CHARS = 300;
     static final int SECTION_HINTS = 20;
     static final int MAX_WATCHES = 30;
+    /** 앞 답의 근거 안에서 거를 때: 이슈 근거 하나에서 꺼낼 문서 수, 거를 문서 수의 상한. */
+    static final int MAX_ISSUE_DOCUMENTS = 50;
+    static final int MAX_WITHIN_BASE = 100;
     /** 키워드 바로 검색 기간: 먼저 7일, 낱말이 든 문서가 없으면 30일. */
     static final int[] QUICK_DAYS = {7, 30};
     static final String CREDENTIALS_PATH = "#/admin/credentials";
@@ -137,8 +152,26 @@ public class ChatTools {
     /**
      * @param content LLM에 보내고 TOOL 메시지로 저장하는 JSON
      * @param link    화면이 도구 아래에 보여 줄 바로 가기 (해시 경로, 없으면 null)
+     * @param facts   추천 후속 질문용 조건·결과 요약 ({@link ChatFollowUps}, LLM에 보내지 않는다. 없으면 null)
      */
-    public record Outcome(String content, boolean ok, String link, String linkLabel) {
+    public record Outcome(String content, boolean ok, String link, String linkLabel, ChatFollowUps.Facts facts) {
+
+        public Outcome(String content, boolean ok, String link, String linkLabel) {
+            this(content, ok, link, linkLabel, null);
+        }
+    }
+
+    /**
+     * 도구가 대화에서 알아야 할 것. previous: 앞 답의 근거 (근거가 있는 가장 최근 답의 chat_citation, 번호 순) —
+     * search_documents의 within_previous·previous_refs가 그 안에서 거른다. LLM은 문서 id를 다루지 않고 이 표시만 쓴다.
+     */
+    public record Context(List<Ref> previous) {
+
+        public static final Context NONE = new Context(List.of());
+
+        public Context {
+            previous = previous == null ? List.of() : List.copyOf(previous);
+        }
     }
 
     private final HybridSearch search;
@@ -164,6 +197,21 @@ public class ChatTools {
         return LABELS.getOrDefault(toolName, toolName);
     }
 
+    /** 스트리밍 단계 문구: 이 도구를 실행하는 동안 화면에 보일 말. */
+    public static String stageLabel(LlmClient.ToolCall call) {
+        Map<String, Object> args = call.arguments() == null ? Map.of() : call.arguments();
+        return switch (call.name()) {
+            case SEARCH_DOCUMENTS -> bool(args, "within_previous") || !integers(args, "previous_refs").isEmpty()
+                    ? "앞 결과 안에서 거르는 중…" : "수집 기사 검색 중…";
+            case LIST_ISSUES -> "이슈를 모으는 중…";
+            case LIST_WATCHES -> "감시 목록을 보는 중…";
+            case CREATE_WATCH -> "감시를 만드는 중…";
+            case REGISTER_SOURCE -> "사이트를 등록하는 중…";
+            case GET_SOURCE_STATUS -> "진행 상태를 확인하는 중…";
+            default -> "도구를 실행하는 중…";
+        };
+    }
+
     /** 문서 검색 방식 (상태 표시용): "낱말+의미 (모델/차원)" 또는 "낱말". */
     public String searchMode() {
         return search.describe();
@@ -181,7 +229,11 @@ public class ChatTools {
                                 + "사용자가 종류·섹션을 말하면 정확한 이름이 아니어도 그 낱말을 section에 준다 (도구가 실제 이름에 맞춘다: "
                                 + "'브리핑' → '부처 브리핑'·'청와대 브리핑'). site를 주면 결과의 site_sections에 그 사이트의 기사 종류 이름이 온다. 문서의 match가 "
                                 + "'의미'면 검색어 낱말은 없고 뜻만 가까운 문서다. 각 문서의 ref 번호를 답에 [1]처럼 붙인다. "
-                                + "type이 '언론'인 문서는 제목·분류만 있고 내용은 없다.",
+                                + "type이 '언론'인 문서는 제목·분류만 있고 내용은 없다. "
+                                + "사용자가 '그중', '이 중', '위 기사 중', '앞 결과에서'처럼 앞 답의 목록을 가리키면 새로 찾지 말고 "
+                                + "within_previous=true에 거를 조건(query·topic·site·section·days)을 준다: 앞 답의 근거 안에서만 거른다 "
+                                + "('그중 삼성전자만' → query '삼성전자', '이 중 정책·규제만' → topic, '위 기사 중 이데일리 것만' → site '이데일리'). "
+                                + "앞 답의 특정 번호를 가리키면 previous_refs ('2번 기사' → [2], '1번 이슈 언론사 목록' → [1]: 이슈 번호면 그 이슈의 기사들).",
                         object(Map.of(
                                 "query", prop("string", "주제 검색어 (예: '반도체 수출', '가정폭력 피해자 보호'). 사이트·기사 종류 이름은 "
                                         + "넣지 않는다. 비우면 다른 조건에 맞는 최신 문서"),
@@ -194,7 +246,11 @@ public class ChatTools {
                                 "since", prop("string", "이 날짜(YYYY-MM-DD, 한국 시각) 이후 수집한 문서만. days보다 우선"),
                                 "topic", enumProp("분류 (이 값 중 하나)", DigestComposer.TOPIC_ORDER),
                                 "watch_id", prop("integer", "이 키워드 감시(list_watches의 id)에 걸린 문서만"),
-                                "limit", prop("integer", "최대 개수 (기본 10, 최대 20)")),
+                                "limit", prop("integer", "최대 개수 (기본 10, 최대 20)"),
+                                "within_previous", prop("boolean", "true면 새로 찾지 않고 바로 앞 답의 근거 목록 안에서만 거른다 "
+                                        + "(앞 답의 순서대로, 번호는 새로 매긴다). 앞 목록을 가리키는 말('그중', '이 중', '위 기사 중')에 쓴다"),
+                                "previous_refs", Map.of("type", "array", "items", Map.of("type", "integer"),
+                                        "description", "앞 답의 근거 번호 중 이것만 (within_previous와 함께). 이슈 번호면 그 이슈에 묶인 기사들")),
                                 List.of())),
                 new LlmClient.Tool(LIST_ISSUES,
                         "여러 언론사가 같은 사건을 보도한 기사 묶음(이슈)을 보도한 언론사가 많은 순으로 준다. "
@@ -254,10 +310,14 @@ public class ChatTools {
     // ------------------------------------------------------------------ 실행
 
     public Outcome execute(CurrentUser user, LlmClient.ToolCall call, Refs refs) {
+        return execute(user, call, refs, Context.NONE);
+    }
+
+    public Outcome execute(CurrentUser user, LlmClient.ToolCall call, Refs refs, Context context) {
         Map<String, Object> args = call.arguments() == null ? Map.of() : call.arguments();
         try {
             return switch (call.name()) {
-                case SEARCH_DOCUMENTS -> searchDocuments(user, args, refs);
+                case SEARCH_DOCUMENTS -> searchDocuments(user, args, refs, context == null ? Context.NONE : context);
                 case LIST_ISSUES -> listIssues(user, args, refs);
                 case LIST_WATCHES -> listWatches(user);
                 case CREATE_WATCH -> createWatch(user, args);
@@ -273,7 +333,7 @@ public class ChatTools {
         }
     }
 
-    private Outcome searchDocuments(CurrentUser user, Map<String, Object> args, Refs refs) {
+    private Outcome searchDocuments(CurrentUser user, Map<String, Object> args, Refs refs, Context context) {
         String query = str(args, "query");
         String since = str(args, "since");
         Integer days = integer(args, "days");
@@ -281,17 +341,52 @@ public class ChatTools {
         Long watchId = longValue(args, "watch_id");
         String siteArg = str(args, "site");
         List<String> askedSections = strings(args, "section");
+        List<Integer> previousRefs = integers(args, "previous_refs");
+        boolean within = bool(args, "within_previous") || !previousRefs.isEmpty();
         int limit = clamp(integer(args, "limit"), DEFAULT_DOCUMENTS, 1, MAX_DOCUMENTS);
         List<String> notes = new ArrayList<>();
         if (topic != null && !DigestComposer.TOPIC_ORDER.contains(topic)) {
             notes.add("topic '" + topic + "'은(는) 분류 체계에 없어 빼고 찾았습니다.");
             topic = null;
         }
+        Integer period = since == null && days != null ? clamp(days, 7, 1, 90) : null;
         String from = since != null ? since
-                : days != null ? OffsetDateTime.now(DigestComposer.KST).minusDays(clamp(days, 7, 1, 90)).toString() : null;
+                : period != null ? OffsetDateTime.now(DigestComposer.KST).minusDays(period).toString() : null;
+        String topicArg = topic;
+        BiFunction<List<DocFacts>, Integer, SearchFacts> facts = (docs, previousCount) ->
+                new SearchFacts(query, siteArg, askedSections, topicArg, period, watchId, within, previousCount, docs);
+
+        // 앞 답의 근거 안에서 다시 거르기: 문서 id는 서버가 앞 답의 chat_citation에서 꺼낸다 (LLM은 표시만 준다)
+        List<Long> base = null;
+        if (within) {
+            List<Ref> previous = context.previous();
+            List<Ref> picked = previousRefs.isEmpty() ? previous
+                    : previous.stream().filter(r -> previousRefs.contains(r.no())).toList();
+            String problem = previous.isEmpty()
+                    ? "앞 답에 근거 목록이 없어 그 안에서 거를 수 없습니다. 새로 찾으려면 within_previous 없이 다시 찾으세요."
+                    : picked.isEmpty() ? "앞 답의 근거 번호는 " + previous.stream().map(r -> String.valueOf(r.no()))
+                            .collect(Collectors.joining(", ")) + "입니다. previous_refs를 그 안에서 고르세요."
+                    : null;
+            base = problem == null ? previousDocuments(picked) : List.of();
+            if (problem == null && base.isEmpty()) {
+                problem = "앞 답의 근거에 기사·문서가 없습니다. 새로 찾으려면 within_previous 없이 다시 찾으세요.";
+            }
+            if (problem != null) {
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("ok", true);
+                result.put("within_previous", "앞 답의 근거 " + previous.size() + "건");
+                result.put("count", 0);
+                result.put("documents", List.of());
+                result.put("note", problem);
+                return success(result, null, null, facts.apply(List.of(), previous.size()));
+            }
+        }
 
         // 사이트·기사 종류: 이름을 실제 값으로 맞추고, 못 맞추면 고를 수 있는 이름을 돌려준다 (LLM이 이름을 정확히 모를 수 있다)
         Map<String, Object> scope = new LinkedHashMap<>();
+        if (within) {
+            scope.put("within_previous", "앞 답의 근거 " + base.size() + "건 안에서 (앞 답의 순서)");
+        }
         Map<String, Long> siteSections = Map.of();
         if (siteArg != null) {
             List<SiteMatch> matched = documents.matchSites(siteArg);
@@ -317,17 +412,21 @@ public class ChatTools {
             }
         }
 
-        Filter filter = new Filter(from, null, topic, watchId, null, sections, siteArg);
-        HybridSearch.Result found = search.search(user, filter, query, limit);
+        Filter filter = new Filter(from, null, topic, watchId, null, sections, siteArg, within ? base : List.of());
+        HybridSearch.Result found = within ? searchWithin(user, filter, query, base, limit) : search.search(user, filter, query, limit);
         boolean hybrid = found.mode() == HybridSearch.Mode.HYBRID;
         Map<Long, SiteInfo> sites = sites(found.hits().stream().map(h -> h.row().sourceId()).distinct().toList());
+        Map<Long, List<String>> companies = companies(found.hits().stream().map(h -> h.row().id()).toList());
         List<Map<String, Object>> out = new ArrayList<>();
+        List<DocFacts> docFacts = new ArrayList<>();
         boolean meaningOnly = false;
         for (HybridSearch.Hit hit : found.hits()) {
             DocumentRow d = hit.row();
             SiteInfo site = sites.getOrDefault(d.sourceId(), new SiteInfo("UNKNOWN", null, false));
             String source = site.name() != null && !site.name().isBlank() ? site.name() : d.domain();
             int ref = refs.document(d.id(), d.title(), d.url(), source, d.publishedAt());
+            List<String> linked = companies.getOrDefault(d.id(), List.of());
+            docFacts.add(new DocFacts(d.id(), source, d.section(), d.topics(), d.tags(), linked));
             Map<String, Object> doc = new LinkedHashMap<>();
             doc.put("ref", ref);
             if (hybrid) {
@@ -346,6 +445,9 @@ public class ChatTools {
             }
             if (!d.tags().isEmpty()) {
                 doc.put("tags", d.tags());
+            }
+            if (!linked.isEmpty()) {
+                doc.put("companies", linked);
             }
             if (!d.keywords().isEmpty()) {
                 doc.put("watch_keywords", d.keywords());
@@ -366,11 +468,12 @@ public class ChatTools {
         result.put("ok", true);
         result.putAll(scope);
         result.put("count", out.size());
-        result.put("order", switch (found.mode()) {
-            case HYBRID -> "관련도순 (낱말 일치와 의미 유사도를 합친 순위)";
-            case FULLTEXT -> "최신순 (검색어 낱말을 모두 포함한 문서)";
-            case LATEST -> "최신순";
-        });
+        result.put("order", within ? "앞 답의 근거 순서" + (query != null ? " (검색어 낱말·태그·회사·사이트 이름이 맞는 문서)" : "")
+                : switch (found.mode()) {
+                    case HYBRID -> "관련도순 (낱말 일치와 의미 유사도를 합친 순위)";
+                    case FULLTEXT -> "최신순 (검색어 낱말을 모두 포함한 문서)";
+                    case LATEST -> "최신순";
+                });
         if (out.size() == limit) {
             result.put("more", "더 있을 수 있습니다 (최대 " + limit + "건만 보냄)");
         }
@@ -382,7 +485,8 @@ public class ChatTools {
             }
         }
         if (out.isEmpty()) {
-            notes.add("조건에 맞는 문서가 없습니다.");
+            notes.add(within ? "앞 답의 근거 " + base.size() + "건 중 조건에 맞는 문서가 없습니다. 앞 목록에는 없다고 말하고, 새로 찾아볼지 "
+                    + "물어봅니다 (새로 찾을 때는 within_previous 없이)." : "조건에 맞는 문서가 없습니다.");
         }
         if (query != null && found.hits().stream().noneMatch(HybridSearch.Hit::words)) {
             String hint = namesInQuery(user, query, siteArg, sections, siteSections);
@@ -396,14 +500,102 @@ public class ChatTools {
         if (!notes.isEmpty()) {
             result.put("note", String.join(" ", notes));
         }
-        return success(result, null, null);
+        return success(result, null, null, facts.apply(docFacts, within ? base.size() : 0));
+    }
+
+    /**
+     * 앞 답의 근거 문서(base, 앞 답의 순서) 안에서 거른다. 의미 검색은 하지 않는다 (좁히기는 글자 그대로가 기대에 맞다).
+     * 검색어가 있으면 낱말(제목·본문·요약 — 목록 검색과 같다)이나 태그·분류·연결된 회사·사이트 이름에 검색어 낱말이 모두 든 문서만.
+     * 다른 조건(기간·분류·사이트·종류·감시)은 filter로 건다.
+     */
+    private HybridSearch.Result searchWithin(CurrentUser user, Filter filter, String query, List<Long> base, int limit) {
+        List<DocumentRow> allowed = documents.list(user, filter, null, base.size());
+        Set<Long> matched = null;
+        if (query != null) {
+            matched = new HashSet<>();
+            for (DocumentRow r : documents.list(user, filter, query, base.size())) {
+                matched.add(r.id());
+            }
+            matched.addAll(metaMatches(base, query));
+        }
+        Map<Long, Integer> order = new HashMap<>();
+        for (int i = 0; i < base.size(); i++) {
+            order.putIfAbsent(base.get(i), i);
+        }
+        Set<Long> keep = matched;
+        List<HybridSearch.Hit> hits = allowed.stream().filter(r -> keep == null || keep.contains(r.id()))
+                .sorted(Comparator.comparingInt(r -> order.getOrDefault(r.id(), Integer.MAX_VALUE)))
+                .limit(limit).map(r -> new HybridSearch.Hit(r, query != null, false)).toList();
+        return new HybridSearch.Result(hits, query != null ? HybridSearch.Mode.FULLTEXT : HybridSearch.Mode.LATEST,
+                "within previous");
+    }
+
+    /** base 중 검색어 낱말이 모두 태그·분류·연결된 회사(이름·별칭)·사이트 이름·도메인에 든 문서 (제목에 없는 회사로도 거를 수 있게). */
+    private List<Long> metaMatches(List<Long> base, String query) {
+        List<String> terms = SearchTerms.terms(query);
+        if (terms.isEmpty()) {
+            terms = List.of(query.strip().toLowerCase(Locale.ROOT));
+        }
+        StringBuilder sql = new StringBuilder("""
+                SELECT d.id FROM document d
+                JOIN source s ON s.id = d.source_id
+                JOIN site t ON t.id = s.site_id
+                LEFT JOIN document_enrichment e ON e.document_id = d.id
+                WHERE d.id IN (:ids)
+                """);
+        Map<String, Object> params = new HashMap<>();
+        params.put("ids", base);
+        for (int i = 0; i < terms.size(); i++) {
+            String p = "t" + i;
+            sql.append(" AND (COALESCE(e.tags::text, '') ILIKE :").append(p)
+                    .append(" OR COALESCE(e.topics::text, '') ILIKE :").append(p)
+                    .append(" OR COALESCE(t.name, '') ILIKE :").append(p)
+                    .append(" OR t.domain ILIKE :").append(p)
+                    .append(" OR EXISTS (SELECT 1 FROM document_company dc JOIN company c ON c.id = dc.company_id")
+                    .append(" WHERE dc.document_id = d.id AND (c.name ILIKE :").append(p)
+                    .append(" OR c.aliases::text ILIKE :").append(p).append(")))");
+            params.put(p, SearchTerms.likePattern(terms.get(i)));
+        }
+        return jdbc.sql(sql.toString()).params(params).query(Long.class).list();
+    }
+
+    /** 앞 답의 근거 → 문서 id (근거 순서). 문서 근거는 그 문서, 이슈 근거는 그 이슈에 묶인 문서 (발행 순, 이슈마다 최대 {@link #MAX_ISSUE_DOCUMENTS}건). */
+    private List<Long> previousDocuments(List<Ref> refs) {
+        List<Long> out = new ArrayList<>();
+        for (Ref r : refs) {
+            if (r.documentId() != null) {
+                out.add(r.documentId());
+            } else if (r.issueId() != null) {
+                out.addAll(jdbc.sql("""
+                        SELECT idoc.document_id FROM issue_document idoc JOIN document d ON d.id = idoc.document_id
+                        WHERE idoc.issue_id = ? ORDER BY d.published_at ASC NULLS LAST, d.id LIMIT ?
+                        """).params(r.issueId(), MAX_ISSUE_DOCUMENTS).query(Long.class).list());
+            }
+        }
+        return out.stream().distinct().limit(MAX_WITHIN_BASE).toList();
+    }
+
+    /** 문서마다 연결된 회사 이름 (document_company, 보관된 회사는 뺀다). */
+    private Map<Long, List<String>> companies(List<Long> documentIds) {
+        Map<Long, List<String>> out = new HashMap<>();
+        if (documentIds.isEmpty()) {
+            return out;
+        }
+        jdbc.sql("""
+                SELECT dc.document_id, c.name FROM document_company dc JOIN company c ON c.id = dc.company_id
+                WHERE dc.document_id IN (:ids) AND c.status = 'ACTIVE' ORDER BY dc.document_id, c.name
+                """).param("ids", documentIds).query(rs -> {
+                    out.computeIfAbsent(rs.getLong(1), k -> new ArrayList<>()).add(rs.getString(2));
+                });
+        return out;
     }
 
     /** 키워드 바로 검색 결과. words: 검색어 낱말이 든 문서 (false면 뜻만 가까운 문서). days: 실제로 찾은 기간. */
     public record QuickHit(Ref ref, boolean words) {
     }
 
-    public record QuickResult(List<QuickHit> hits, int days, HybridSearch.Mode mode) {
+    /** facts: 추천 후속 질문용 (검색어·기간·문서별 언론사·분류·태그·회사). */
+    public record QuickResult(List<QuickHit> hits, int days, HybridSearch.Mode mode, ChatFollowUps.SearchFacts facts) {
     }
 
     /**
@@ -425,15 +617,19 @@ public class ChatTools {
         List<HybridSearch.Hit> ordered = new ArrayList<>(found.hits().stream().filter(HybridSearch.Hit::words).toList());
         found.hits().stream().filter(h -> !h.words()).forEach(ordered::add);
         Map<Long, SiteInfo> sites = sites(ordered.stream().map(h -> h.row().sourceId()).distinct().toList());
+        Map<Long, List<String>> companies = companies(ordered.stream().map(h -> h.row().id()).toList());
         List<QuickHit> hits = new ArrayList<>();
+        List<DocFacts> docs = new ArrayList<>();
         for (HybridSearch.Hit hit : ordered) {
             DocumentRow d = hit.row();
             SiteInfo site = sites.getOrDefault(d.sourceId(), new SiteInfo("UNKNOWN", null, false));
             String source = site.name() != null && !site.name().isBlank() ? site.name() : d.domain();
             int no = refs.document(d.id(), d.title(), d.url(), source, d.publishedAt());
             hits.add(new QuickHit(refs.get(no), hit.words()));
+            docs.add(new DocFacts(d.id(), source, d.section(), d.topics(), d.tags(), companies.getOrDefault(d.id(), List.of())));
         }
-        return new QuickResult(hits, days, found.mode());
+        return new QuickResult(hits, days, found.mode(),
+                new SearchFacts(query, null, List.of(), null, days, null, false, 0, docs));
     }
 
     /**
@@ -516,9 +712,11 @@ public class ChatTools {
         List<IssueRow> rows = issues.list(user, since, 2, minSources == null ? 2 : Math.max(1, minSources),
                 str(args, "query"), limit);
         List<Map<String, Object>> out = new ArrayList<>();
+        List<ChatFollowUps.IssueItem> items = new ArrayList<>();
         for (IssueRow i : rows) {
             int ref = refs.issue(i.id(), i.title(), "언론사 " + i.sourceCount() + "곳 · 기사 " + i.docCount() + "건",
                     i.lastSeenAt());
+            items.add(new ChatFollowUps.IssueItem(ref, i.title(), i.topTerms()));
             Map<String, Object> issue = new LinkedHashMap<>();
             issue.put("ref", ref);
             issue.put("title", i.title());
@@ -537,7 +735,7 @@ public class ChatTools {
         if (out.isEmpty()) {
             result.put("note", "조건에 맞는 이슈가 없습니다. 기간을 늘리거나 언론사 수 조건을 낮춰 볼 수 있습니다.");
         }
-        return success(result, "#/issues", "이슈 화면");
+        return success(result, "#/issues", "이슈 화면", new ChatFollowUps.IssueFacts(days, items));
     }
 
     private Outcome listWatches(CurrentUser user) {
@@ -554,7 +752,8 @@ public class ChatTools {
         if (out.isEmpty()) {
             result.put("note", "키워드 감시가 없습니다. 감시 이름과 키워드를 알려 주면 만들 수 있다고 안내합니다.");
         }
-        return success(result, "#/watches", "키워드 감시 화면");
+        return success(result, "#/watches", "키워드 감시 화면", new ChatFollowUps.WatchFacts(list.stream().limit(MAX_WATCHES)
+                .map(w -> new ChatFollowUps.WatchItem(w.name(), w.documentCount())).toList()));
     }
 
     private Outcome createWatch(CurrentUser user, Map<String, Object> args) {
@@ -571,7 +770,7 @@ public class ChatTools {
         result.put("ok", true);
         result.put("watch", watchJson(w));
         result.put("message", w.registrationMessage());
-        return success(result, "#/watches", "키워드 감시 화면");
+        return success(result, "#/watches", "키워드 감시 화면", new ChatFollowUps.ActionFacts(CREATE_WATCH));
     }
 
     private Map<String, Object> watchJson(WatchView w) {
@@ -609,7 +808,7 @@ public class ChatTools {
             result.put("note", "점검·자동 탐색·첫 수집은 시스템이 자동으로 진행하며 수십 초~수 분 걸립니다. "
                     + "결과는 아직 모르므로 약속하지 말고, 나중에 진행 상태를 물어보면 알려 줄 수 있다고 안내합니다.");
         }
-        return success(result, "#/registrations", "등록·내 요청 화면");
+        return success(result, "#/registrations", "등록·내 요청 화면", new ChatFollowUps.ActionFacts(REGISTER_SOURCE));
     }
 
     private Outcome sourceStatus(CurrentUser user, Map<String, Object> args) {
@@ -762,7 +961,11 @@ public class ChatTools {
     }
 
     private Outcome success(Map<String, Object> result, String link, String linkLabel) {
-        return new Outcome(toJson(result), true, link, linkLabel);
+        return success(result, link, linkLabel, null);
+    }
+
+    private Outcome success(Map<String, Object> result, String link, String linkLabel, ChatFollowUps.Facts facts) {
+        return new Outcome(toJson(result), true, link, linkLabel, facts);
     }
 
     private Outcome failure(String message) {
@@ -808,6 +1011,36 @@ public class ChatTools {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    /** true·"true"·1만 참. */
+    static boolean bool(Map<String, Object> args, String key) {
+        Object v = args.get(key);
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        if (v instanceof Number n) {
+            return n.intValue() == 1;
+        }
+        return v != null && "true".equalsIgnoreCase(String.valueOf(v).strip());
+    }
+
+    /** 정수 배열, 쉼표로 이은 문자열, 또는 정수 하나. 정수가 아닌 값은 뺀다. */
+    static List<Integer> integers(Map<String, Object> args, String key) {
+        List<Integer> out = new ArrayList<>();
+        Object v = args.get(key);
+        if (v instanceof Number n) {
+            out.add(n.intValue());
+            return out;
+        }
+        for (String s : strings(args, key)) {
+            try {
+                out.add((int) Double.parseDouble(s));
+            } catch (NumberFormatException ignored) {
+                // 번호가 아니다
+            }
+        }
+        return out;
     }
 
     /** 배열 또는 쉼표로 이은 문자열. */

@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -59,10 +60,11 @@ public class DocumentService {
      *   <li>sections: 기사 종류(document.section) 정확 일치, 여럿이면 그중 하나. 사이트 하나에 기사 종류가 여럿이면 워커가 종류 이름
      *       ('정책뉴스'·'연설문'·'보도자료' …)을, 아니면 기사 페이지의 분류('스포츠'·'경제' …)를 적는다.</li>
      *   <li>site: 도메인 또는 사이트 이름 ({@link #matchSites}).</li>
+     *   <li>documentIds: 이 문서들 안에서만 (챗봇이 앞 답의 근거 안에서 다시 거를 때). 비면 걸지 않는다.</li>
      * </ul>
      */
     public record Filter(String since, Long sourceId, String topic, Long watchId, String keyword, List<String> sections,
-                         String site) {
+                         String site, List<Long> documentIds) {
 
         public static final Filter NONE = new Filter(null, null, null, null, null, List.of(), null);
 
@@ -70,6 +72,12 @@ public class DocumentService {
             sections = sections == null ? List.of()
                     : sections.stream().filter(s -> s != null && !s.isBlank()).map(String::strip).distinct().toList();
             site = site == null || site.isBlank() ? null : site.strip();
+            documentIds = documentIds == null ? List.of() : documentIds.stream().filter(Objects::nonNull).distinct().toList();
+        }
+
+        public Filter(String since, Long sourceId, String topic, Long watchId, String keyword, List<String> sections,
+                      String site) {
+            this(since, sourceId, topic, watchId, keyword, sections, site, List.of());
         }
     }
 
@@ -133,6 +141,10 @@ public class DocumentService {
         if (f.sourceId() != null) {
             sql.append(" AND d.source_id = ?");
             params.add(f.sourceId());
+        }
+        if (!f.documentIds().isEmpty()) {
+            sql.append(" AND d.id IN (").append(marks(f.documentIds().size())).append(")");
+            params.addAll(f.documentIds());
         }
         if (f.site() != null) {
             List<Long> ids = matchSites(f.site()).stream().map(SiteMatch::sourceId).toList();

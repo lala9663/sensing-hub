@@ -262,6 +262,25 @@ a.cite:hover, a.cite:focus-visible { background: var(--c-accent); color: #fff; t
 .msg-actions .icon-btn { width: 28px; height: 28px; border-radius: 8px; }
 .msg-actions .icon-btn.done { color: var(--green); }
 
+/* 추천 후속 질문 칩: 맨 아래 답의 것만 보인다 (앞 답의 "이 중 ~만"은 가리키는 목록이 달라진다. 생각 중에도 숨는다) */
+.follow-ups { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chat-log > .chat-msg:not(:last-child) .follow-ups { display: none; }
+.follow-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  padding: 5px 12px; border-radius: 999px; font-size: 12.5px; line-height: 1.35; cursor: pointer; text-align: left;
+  border: 1px solid var(--c-border-strong); background: var(--c-bg); color: var(--c-accent-text);
+  overflow-wrap: anywhere; text-decoration: none; transition: border-color 0.15s, background 0.15s;
+}
+.follow-chip:hover { border-color: var(--c-accent); background: var(--c-accent-soft); text-decoration: none; }
+.follow-chip.link { color: var(--c-muted); }
+
+/* 스트리밍 중인 답 초안: 끝에 깜빡이는 막대 */
+.chat-msg.streaming .msg-body > :last-child::after {
+  content: ''; display: inline-block; width: 7px; height: 1.05em; margin-left: 2px; vertical-align: text-bottom;
+  border-radius: 2px; background: var(--c-accent); opacity: 0.6; animation: chat-caret 1s steps(2, start) infinite;
+}
+@keyframes chat-caret { to { visibility: hidden; } }
+
 /* 오류 카드 (errorKind로 제목·도움말을 고른다) */
 .alert-card {
   display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: var(--c-radius-sm);
@@ -467,5 +486,7 @@ body.chat-popup-page .modal-overlay, body.chat-popup-page .error-banner { color:
   .chat-win.floating, .chat-fab, .chat-msg.enter, .example-card, .kw-chip, .composer .send, a.cite, .source { transition: none !important; animation: none !important; }
   .chat-win.floating { transform: none !important; }
   .dots i { animation: none; opacity: 0.6; }
+  .chat-msg.streaming .msg-body > :last-child::after { animation: none; }
+  .follow-chip { transition: none; }
   .chat-log { scroll-behavior: auto; }
 }

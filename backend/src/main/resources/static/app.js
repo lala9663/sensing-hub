@@ -206,6 +206,89 @@ const App = (() => {
     }
   }
 
+  /**
+   * SSE(text/event-stream)로 답하는 POST — 챗봇 스트리밍. EventSource는 POST·X-User 머리글을 못 쓰므로 fetch로 읽는다.
+   * onEvent(name, data)를 이벤트가 올 때마다 부른다 (data는 JSON이면 해석한 값). 스트림을 열기 전 실패는 api()와 같은 ApiError,
+   * 서버가 SSE가 아니라 JSON으로 답하면 그 값을 돌려준다 (이벤트 없이). SSE를 끝까지 읽으면 undefined.
+   * 읽다가 끊기면 ApiError(0, 'STREAM_BROKEN'). 조금씩 읽지 못하는 브라우저는 다 받은 뒤 한꺼번에 onEvent를 부른다.
+   */
+  async function apiStream(path, body, onEvent) {
+    const headers = { 'X-User': state.loginId, 'Content-Type': 'application/json', Accept: 'text/event-stream, application/json' };
+    loading(1);
+    try {
+      let res;
+      try {
+        res = await fetch(API + path, { method: 'POST', headers, body: JSON.stringify(body) });
+      } catch (e) {
+        throw new ApiError(0, 'NETWORK', '서버에 연결할 수 없습니다: ' + e.message);
+      }
+      const type = res.headers.get('content-type') || '';
+      if (!res.ok || !type.includes('text/event-stream')) {
+        const text = await res.text();
+        let data = null;
+        if (text) {
+          try { data = JSON.parse(text); } catch (e) { data = text; }
+        }
+        if (!res.ok) {
+          const err = data && typeof data === 'object' ? data : {};
+          const message = err.message || (typeof data === 'string' && data.length < 300 ? data : '') || `요청 실패 (HTTP ${res.status})`;
+          throw new ApiError(res.status, err.error || `HTTP_${res.status}`, message);
+        }
+        return data;
+      }
+      const dispatch = block => {
+        let name = 'message';
+        const data = [];
+        block.split('\n').forEach(line => {
+          if (!line || line.startsWith(':')) return;
+          const i = line.indexOf(':');
+          const field = i < 0 ? line : line.slice(0, i);
+          let value = i < 0 ? '' : line.slice(i + 1);
+          if (value.startsWith(' ')) value = value.slice(1);
+          if (field === 'event') name = value;
+          else if (field === 'data') data.push(value);
+        });
+        if (!data.length) return;
+        const raw = data.join('\n');
+        let parsed = raw;
+        try { parsed = JSON.parse(raw); } catch (e) { /* 글 그대로 */ }
+        onEvent(name, parsed);
+      };
+      let buf = '';
+      const drain = () => {
+        buf = buf.replace(/\r\n/g, '\n');
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          dispatch(block);
+        }
+      };
+      try {
+        if (res.body && res.body.getReader) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            drain();
+          }
+          buf += decoder.decode();
+        } else {
+          buf = await res.text();
+        }
+      } catch (e) {
+        throw new ApiError(0, 'STREAM_BROKEN', '답을 받다가 연결이 끊겼습니다: ' + (e.message || e));
+      }
+      buf += '\n\n';
+      drain();
+      return undefined;
+    } finally {
+      loading(-1);
+    }
+  }
+
   function qs(params) {
     const u = new URLSearchParams();
     Object.entries(params || {}).forEach(([k, v]) => {
@@ -460,7 +543,7 @@ const App = (() => {
   }
 
   return {
-    api, ApiError, qs, esc, html, badge, watchBadge, label, tags, fmtTime, fmtDateTime, fmtAgo, fmtSeconds, fmtNum,
+    api, apiStream, ApiError, qs, esc, html, badge, watchBadge, label, tags, fmtTime, fmtDateTime, fmtAgo, fmtSeconds, fmtNum,
     kstStartOfToday, parseList, domainOf, notice, showError, clearError, guard, modal, confirm, promptText,
     role, atLeast, isAdmin, loginId: () => state.loginId, route, go, render, every, start,
   };
