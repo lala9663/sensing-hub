@@ -1,14 +1,14 @@
 'use strict';
 
-/** 다이제스트: 구독 목록, 생성(채널·대상·시각·필터), 미리보기 모달, 즉시 전송, 보낸 기록. */
+/** 구독(일간 다이제스트): 구독 목록, 생성(채널·대상·시각·필터), 미리보기 모달, 즉시 전송, 보낸 기록. */
 App.route('/digests', async (view) => {
   const { api, esc, badge, html } = App;
 
   view.innerHTML = `
-    <h1>다이제스트</h1>
+    <h1>구독</h1>
     <div class="panel">
       <h2>새 구독</h2>
-      <p class="muted small">매일 정한 시각(KST)에 지난 다이제스트 이후 새로 수집된 문서를 감시별 → 토픽별로 묶어 메일 또는 웹훅으로 보냅니다.
+      <p class="muted small">매일 정한 시각(KST)에 지난번 보낸 뒤 새로 수집된 문서를 감시별 → 토픽별로 묶어 메일 또는 웹훅으로 보냅니다.
         필터는 하나라도 맞으면 포함하고, 모두 비우면 전체입니다.</p>
       <form id="create-form">
         <div class="form-grid">

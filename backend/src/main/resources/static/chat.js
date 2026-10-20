@@ -74,7 +74,7 @@ const Chat = (() => {
     '무엇', '뭐', '뭔', '어떻', '어떤', '어때', '어디', '언제', '누구', '누가', '얼마', '있어', '있나', '있니', '있을까',
     '없어', '했어', '했나', '됐어', '할까', '해봐', '해라', '만들어', '추가해', '삭제해', '지워', '비교해',
     '분석해', '알아봐', '가르쳐', '부탁'];
-  const STOP_WORDS = new Set(['왜', '뭘', '뭔가', '이슈', '이슈들', '감시', '등록', '진행', '상태', '목록', '요청', '다이제스트', '챗봇', '키워드',
+  const STOP_WORDS = new Set(['왜', '뭘', '뭔가', '이슈', '이슈들', '감시', '등록', '진행', '상태', '목록', '요청', '다이제스트', '구독', '챗봇', '키워드',
     '도움말', '도움', '사용법', '안녕', '안녕하세요', '하이', '헬로', '고마워', '고마워요', '감사', '감사합니다', '땡큐', '수고',
     '응', '네', '예', '아니', '아니요', '그래', '좋아', '오케이', 'ok', 'okay', 'yes', 'no', 'hi', 'hello', 'hey', 'help',
     'thanks', 'test', '테스트', 'what', 'why', 'how', 'who', 'when', 'where', 'show', 'find', 'search', 'list',
@@ -602,7 +602,7 @@ const Chat = (() => {
     status().then(s => {
       if (!s.configured) {
         warnEl.innerHTML = `${icon('key', 16)}<span>LLM이 설정되지 않아 질문에는 답할 수 없습니다 (키워드만 보내는 바로 검색과 "네이버 - 검색어"는 됩니다). `
-          + '관리자는 백엔드에 <span class="mono">SENSING_LLM_PROVIDER</span> 등을 설정해 주세요 (README "챗봇").</span>';
+          + '관리자는 백엔드에 <span class="mono">SENSING_LLM_PROVIDER</span> 등을 설정해 주세요 (docs/guide/llm.md).</span>';
         warnEl.hidden = false;
       } else if (infoEl) {
         infoEl.textContent = `${BOT_NAME} · ${s.provider}` + (s.search ? ` · 문서 검색 ${s.search}` : '');

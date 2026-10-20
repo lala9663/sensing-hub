@@ -28,7 +28,7 @@ services:
       SENSING_DB_PASSWORD: sensing
       # 공개 API 키(api_credential)를 암호화하는 대칭키. 워커와 같은 값. 운영에서는 반드시 바꾼다
       SENSING_SECRET_KEY: ${SENSING_SECRET_KEY:-sensing-dev-secret}
-      # 일간 다이제스트 메일(SMTP). 비우면 메일 구독은 FAILED로 남고 웹훅 구독만 보낸다 — README 참고
+      # 구독(일간 다이제스트) 메일(SMTP). 비우면 메일 구독은 FAILED로 남고 웹훅 구독만 보낸다 — docs/guide/07-subscriptions.md
       SENSING_MAIL_HOST: ${SENSING_MAIL_HOST:-}
       SENSING_MAIL_PORT: ${SENSING_MAIL_PORT:-587}
       SENSING_MAIL_USERNAME: ${SENSING_MAIL_USERNAME:-}
@@ -36,7 +36,7 @@ services:
       SENSING_MAIL_FROM: ${SENSING_MAIL_FROM:-}
       SENSING_MAIL_AUTH: ${SENSING_MAIL_AUTH:-true}
       SENSING_MAIL_STARTTLS: ${SENSING_MAIL_STARTTLS:-true}
-      # 네이버 뉴스 검색: display(기본, 표시 전용) | store(저장·분석, 법무 확인 뒤) | off. 워커와 같은 값 — README 참고
+      # 네이버 뉴스 검색: display(기본, 표시 전용) | store(저장·분석, 법무 확인 뒤) | off. 워커와 같은 값 — docs/guide/06-naver-news.md
       SENSING_NAVER_MODE: ${SENSING_NAVER_MODE:-display}
       SENSING_NAVER_API: ${SENSING_NAVER_API:-hub}
       JAVA_OPTS: "-Xmx1g"
@@ -55,7 +55,7 @@ services:
       # 네이버 뉴스 검색 사용 방식·주소 (백엔드와 같은 값). display에서는 워커가 네이버 결과를 수집·저장하지 않는다
       SENSING_NAVER_MODE: ${SENSING_NAVER_MODE:-display}
       SENSING_NAVER_API: ${SENSING_NAVER_API:-hub}
-      # 등록 시 LLM 레시피 생성 (비우면 휴리스틱 탐색만). none | anthropic | openai — README 워커 환경 변수 참고
+      # 등록 시 LLM 레시피 생성 (비우면 휴리스틱 탐색만). none | anthropic | openai — docs/guide/llm.md
       SENSING_LLM_PROVIDER: ${SENSING_LLM_PROVIDER:-}
       SENSING_LLM_MODEL: ${SENSING_LLM_MODEL:-}
       SENSING_LLM_BASE_URL: ${SENSING_LLM_BASE_URL:-}
