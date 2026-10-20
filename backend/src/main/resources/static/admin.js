@@ -49,7 +49,7 @@
 
   const ACTION_LABELS = {
     approve: '승인', reject: '반려', set_api_key: 'API 키 등록', recheck: '재점검', rediscover: '다시 탐색',
-    pause: '일시정지', resume: '재개', run: '지금 수집', exclude: '제외',
+    pause: '일시정지', resume: '재개', run: '지금 수집', exclude: '제외', reactivate: '다시 켜기',
   };
   // 과거 기사 채우기: 묶음 단위 이름("두 달 더")과 칩으로 바로 보여 줄 묶음 수 (나머지는 접는다)
   const UNIT_WORDS = { 1: '한 달', 2: '두 달', 3: '석 달' };
@@ -94,6 +94,11 @@
 
   async function sourceAction(sourceId, action) {
     if (action === 'exclude' && !await App.confirm(`소스 #${sourceId}을(를) 수집 대상에서 제외할까요? 대기 중이던 등록 요청은 반려 처리됩니다.`, '제외')) return null;
+    if (action === 'reactivate') {
+      // 제외한 키워드 감시만: 감시 API가 지금 모드(수집 기사 대조 / 네이버 함께)에 맞춰 다시 켠다
+      if (!await App.confirm(`감시 #${sourceId}을(를) 다시 켤까요? 새로 수집되는 기사부터 다시 대조합니다.`, '다시 켜기')) return null;
+      return api('POST', `/watches/${sourceId}/reactivate`);
+    }
     return api('POST', `/sources/${sourceId}/actions/${action}`);
   }
 
@@ -267,7 +272,7 @@
         BLOCKED: ['recheck', 'exclude'],
         REVIEW: ['rediscover', 'exclude'],
         PENDING: ['exclude'],
-        EXCLUDED: [],
+        EXCLUDED: s.kind === 'WATCH' ? ['reactivate'] : [],
       }[s.status] || ['exclude'];
 
       view.innerHTML = `

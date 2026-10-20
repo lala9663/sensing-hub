@@ -82,7 +82,7 @@ SENSING_DB_DSN=postgresql://sensing:sensing@localhost:5432/sensing sensing-worke
 | 문서 | 기간(오늘·3일·7일)·토픽 칩(건수), 검색어(전문 검색)·소스 필터, 목록(제목·출처·발행·토픽·요약·이슈 링크), 펼쳐 보는 본문 일부·첨부 |
 | 이슈 | 같은 사건을 다룬 기사 묶음. 기간·언론사 수(2곳+/3곳+/5곳+) 칩, 검색, 카드(대표 제목·언론사 N곳·기사 M건·기간·핵심 낱말), 펼쳐 보는 소속 기사 |
 | 거래처 | 회사 목록(사업자번호·신호 수·HIGH·최근 신호·감시 상태), 등록, CSV 붙여넣기 import, 회사 상세(최근 신호·연결 문서), 전체 신호(종류·심각도·기간) |
-| 키워드 감시 | 목록, 생성, 키워드·제외어 수정(설정 새 버전), 감시 행의 "네이버 실시간"(네이버 키가 있을 때, 표시 전용·출처 "NAVER 검색 결과") |
+| 키워드 감시 | 목록("감시": 공용 먼저 만든 순서, 그다음 내 감시, 행마다 "공용"/"내 감시" 표시), 생성, 키워드·제외어 수정(설정 새 버전, 공용은 관리자만), 감시 행의 "네이버 실시간"(네이버 키가 있을 때, 표시 전용·출처 "NAVER 검색 결과"), 관리자의 "제외"·"제외된 감시 보기"·"다시 켜기" |
 | 네이버 뉴스 | 검색창(Enter)·정렬(최신순·정확도순)·**주요 키워드** 빠른 검색 칩(관리자가 정한 짧은 목록), 결과(제목=원문 새 탭·언론사·발행 시각·요약 문장·"네이버에서 보기"), 결과 총수, 더 보기(1,000번째까지), 출처 "NAVER 검색 결과"·표시 전용 안내. 검색어는 주소(`#/naver?q=..`)에 남음. 키가 없거나 모드가 off면 안내만. 아래 "네이버 뉴스 탭" |
 | 다이제스트 | 구독 목록, 생성(채널·대상·시각·필터 체크), 미리보기(HTML), 지금 보내기, 보낸 기록 |
 | 챗봇 | **어느 화면에서나 오른쪽 아래 챗봇 버튼** → 화면 위 대화창(화면을 옮겨도 대화 유지, 새 대화·대화 목록·크게 보기·새 창으로). 메뉴 "챗봇"은 대화 목록이 왼쪽에 있는 전체 화면. 질문 입력(Enter 보내기·Shift+Enter 줄바꿈, 주요 키워드 칩·예시 질문), "생각 중" 표시, 답의 `[n]` → 근거 목록(원문 링크·이슈 화면), 사용한 도구와 화면 바로 가기. **키워드만 입력하면 LLM 없이 수집 기사를 바로 찾고, `네이버 - 검색어`는 네이버 결과만 임시 카드로**(표시 전용). 아래 "챗봇" |
@@ -210,6 +210,22 @@ config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"
 감시(REVIEW `API_KEY_REQUIRED`/`API_KEY_INVALID`)를 대조 모드로 옮겼습니다. 네이버 뉴스 웹은 robots.txt가 전체 차단이라 크롤링하지 않으며,
 `news.naver.com`을 사이트처럼 등록하면 "키워드 감시로 등록하세요"(`KEYWORDS_REQUIRED`)로 안내합니다.
 
+**공용 감시와 보는 범위.** 관리자(ADMIN 역할 사용자)가 만든 감시는 **공용**입니다. 모든 사용자의 목록에 "공용"으로 보이고, 키워드 칩(키워드별 기사)·문서 수
+링크(`#/documents?watch=`)·"네이버 실시간"을 누구나 쓸 수 있지만 수정·제외는 관리자만 합니다(공용 감시를 다른 사람이 `PUT`하면 403). 일반 사용자가 만든
+감시는 지금처럼 만든 사람과 관리자만 봅니다(남이 보면 404). 목록(`GET /api/v1/watches`)은 공용을 먼저 만든 순서로, 그다음 내 감시를 주며
+(관리자에게는 다른 사용자의 개인 감시도 "개인"으로), 응답 행마다 `shared`·`mine`·`editable`이 붙습니다. 단건(`GET /api/v1/watches/{id}`)과
+네이버 실시간도 같은 규칙입니다. 지금 공용 감시는 네이버 뉴스 탭 주요 키워드와 같은 9개(반도체, 메타넷, 메타넷 글로벌, 삼성전자, DS, DX, DSR, 테슬라,
+하이닉스)이고, 예전 감시 12개(자사 보도·반도체 동향·회사 감시 9개·개인 감시 1개)는 제외해 두었습니다. 관리자가 만든 회사 감시(`회사:<이름>`)도 공용입니다.
+
+**제외와 다시 켜기.** 감시를 끄는 것은 관리자의 소스 조치 "제외"(`POST /api/v1/sources/{id}/actions/exclude`, 감사 로그 `SOURCE_EXCLUDE`)이고, 감시 화면
+행의 "제외" 버튼도 이것을 부릅니다. 제외한 감시는 목록에서 빠지고 워커도 대조하지 않지만, 이미 걸린 기사(`document_watch`)와 단건 조회는 남습니다.
+관리자는 목록의 **"제외된 감시 보기"**(`?include_excluded=true`, 관리자가 아니면 무시)로 함께 보고, 제외된 행의 **"다시 켜기"**
+(`POST /api/v1/watches/{id}/reactivate`, ADMIN만, 감사 로그 `WATCH_REACTIVATED`)로 되돌립니다. 다시 켜면 만들 때와 같은 모드 규칙을 따릅니다:
+수집 기사 대조 모드는 `ACTIVE` + `next_run_at` NULL(작업 없음), 네이버 저장·분석 모드(store + 키)는 `ACTIVE`로 두고 ONBOARD(MANUAL)를 넣어 워커가 키를
+확인합니다. 마지막 등록 요청에는 "관리자가 감시를 다시 켰습니다." 결과를 적습니다. 같은 이름의 감시가 이미 켜져 있거나 보관(ARCHIVED)한 회사의 감시면
+409입니다. 관리자 소스 화면(`#/admin/sources/{id}`)의 제외된 감시에도 같은 "다시 켜기"가 있습니다. 회사는 그대로인데 회사 감시만 제외하면 거래처 화면의
+감시 상태가 "제외"로 보이고, 새 기사는 그 회사에 연결되지 않습니다.
+
 ### 네이버 뉴스 검색 — NAVER API HUB, 기본 표시 전용
 
 네이버 개발자센터 검색 API는 2026-07-31 신규 발급이 끝나(기존 키 2027-06-30 지원 종료) 네이버클라우드 **NAVER API HUB**로 연결합니다
@@ -222,7 +238,7 @@ config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"
   제목에 있으면 숨김). 결과는 `document`·`document_watch`·임베딩·요약·다이제스트·챗봇 어디에도 넣지 않고, 서버 메모리 캐시도 두지 않으며
   응답은 `Cache-Control: no-store`입니다. DB에 쓰는 것은 키 상태(`api_credential.status`)뿐입니다. 키를 넣어도 감시에 저장 수집을 붙이지 않고
   (`attachedWatches` 0), 워커도 네이버 모드 감시를 수집하지 않습니다(이중 차단). 키가 없거나 INVALID이거나 모드가 `off`면 이 보기는 화면에서 숨겨집니다.
-  API: `GET /api/v1/naver/status`, `GET /api/v1/watches/{id}/naver-news?keyword=&start=&display=`(내 감시, ADMIN은 전체),
+  API: `GET /api/v1/naver/status`, `GET /api/v1/watches/{id}/naver-news?keyword=&start=&display=`(공용 감시는 누구나, 내 감시, ADMIN은 전체),
   `POST /api/v1/api-credentials/naver_news/verify`(관리자 시험 호출, 검색어 "뉴스" 1건).
 - 저장·분석(`store`, **법무 확인 뒤에만**): 예전 동작입니다. 쓸 수 있는 키가 있으면 감시를 만들 때 네이버 검색도 함께 붙여(화면 "네이버 검색 함께")
   60분(회사 감시 360분)마다 검색어별 최신 기사 제목·링크·발행일을 `document`에 저장합니다. 키를 나중에 넣으면 대조 모드 감시에 네이버 검색을
@@ -397,7 +413,7 @@ HIGH(회생절차·파산·영업정지·상장폐지·감사의견 거절·부�
 | --- | --- | --- |
 | `search_documents` | 하이브리드 검색(낱말 모두 포함 + 뜻이 가까운 문서, RRF 관련도순)·기간(`days`·`since`)·토픽·감시·사이트(`site`: 도메인 또는 이름)·기사 종류(`section`: 연설문·보도자료·정책뉴스, 언론사 섹션)로 문서 찾기, 최대 20건. 문서마다 `match`(낱말·의미·낱말+의미)와 `section`. 검색어 없이 사이트·종류만 주면 최신순. 임베딩이 없으면 전문 검색(최신순) | `HybridSearch.search` |
 | `list_issues` | 최근 주요 이슈 (언론사 많은 순, 기본 최근 3일·2곳 이상) | `IssueService.list` |
-| `list_watches` | 내 키워드 감시 (관리자는 전체) | `WatchService.list` |
+| `list_watches` | 공용 감시 + 내 키워드 감시 (관리자는 전체, 제외된 감시는 뺌) | `WatchService.list` |
 | `create_watch` | 키워드 감시 만들기 — 화면과 같은 규칙 (VIEWER는 승인 대기), 등록 요청 채널 `CHAT` | `WatchService.create(..., Channel.CHAT)` |
 | `register_source` | 사이트 주소 등록 — 중복·권한 판정, ONBOARD 작업 trigger `CHAT` | `RegistrationService.register(..., Channel.CHAT)` |
 | `get_source_status` | 등록·감시 요청 진행 상태와 소스 상태. API 키 대기면 발급 안내(등록 메시지)와 관리자 'API 키' 화면 링크 | `RegistrationService` + 소스 상태 |
@@ -547,7 +563,10 @@ curl localhost:8080/api/v1/ops/overview -H 'X-User: admin'   # 관리자 운영 
 
 # 키워드 감시 등록 (수집 기사 대조. SENSING_NAVER_MODE=store이고 네이버 키가 있으면 네이버 검색도 60분 주기로. VIEWER는 승인 대기) · 내 감시 · 키워드 수정(설정 새 버전)
 curl -X POST localhost:8080/api/v1/watches -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"name":"자사 보도","keywords":["메타넷","메타넷글로벌"],"exclude":["채용"]}'
-curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
+curl localhost:8080/api/v1/watches -H 'X-User: registrar'   # 공용 + 내 감시. PUT /api/v1/watches/1 -d '{"keywords":["메타넷","신사업"]}'
+# 관리자: 제외된 감시까지 보기 · 제외(소스 조치) · 다시 켜기
+curl 'localhost:8080/api/v1/watches?include_excluded=true' -H 'X-User: admin'
+curl -X POST localhost:8080/api/v1/watches/1/reactivate -H 'X-User: admin'   # 제외: POST /api/v1/sources/1/actions/exclude
 # 네이버 뉴스 실시간 (표시 전용: 저장하지 않음, Cache-Control no-store) · 네이버 뉴스 탭 검색(감시와 무관, 요약 포함, 사용자별 초당 2회) · 사용 방식·키 상태
 curl 'localhost:8080/api/v1/watches/1/naver-news?keyword=%EB%A9%94%ED%83%80%EB%84%B7&display=20&start=1' -H 'X-User: registrar'
 curl 'localhost:8080/api/v1/naver/news?query=%EB%B0%98%EB%8F%84%EC%B2%B4&sort=sim&start=1&display=20' -H 'X-User: viewer'
@@ -746,6 +765,9 @@ M2에서 한 일:
 - [x] 네이버 뉴스 탭 (2026-10-19): 왼쪽 메뉴 "네이버 뉴스"(`#/naver?q=..`)에서 감시와 무관한 검색어로 네이버 뉴스를 검색해 보여 준다
   (`GET /api/v1/naver/news`, 최신순·정확도순, 요약 문장, 더 보기 1,000번째까지, 내 감시 키워드 칩). 표시 전용 그대로 — 저장·캐싱·LLM 없음,
   `Cache-Control: no-store`, 감사 로그에는 검색어만. VIEWER 이상, 사용자별 초당 2회·display 50 상한. 키가 없거나 모드가 off면 안내만
+- [x] 감시 목록 정리·공용 감시 (2026-10-20): 관리자가 만든 감시는 공용(누구나 읽기 전용: 목록·키워드별 기사·네이버 실시간, 수정·제외는 관리자만),
+  목록은 공용 먼저 → 내 감시. 제외(EXCLUDED)한 감시는 목록에서 빼고 관리자는 "제외된 감시 보기"(`include_excluded`)와 "다시 켜기"
+  (`POST /api/v1/watches/{id}/reactivate`, 모드 규칙대로, 감사 로그). 감시를 주요 키워드 9개로 바꾸고 예전 감시 12개는 제외
 - [x] 수집 시점 요약·분류: 워커 보강 단계(`enrich.py`, 큐가 비었을 때 묶음 10건을 LLM 한 번에, `SENSING_ENRICH_*`)가
   `document_enrichment`(V6)에 토픽·태그·요약을 두고, `GET /api/v1/documents`(since·topic·keyword·source_id 필터, 상세, 토픽별 건수)로
   읽는다. 언론 기사는 제목만 분류하고 요약을 저장하지 않으며, LLM 장애·검증 실패는 수집에 번지지 않는다

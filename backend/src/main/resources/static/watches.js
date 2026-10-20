@@ -1,10 +1,16 @@
 'use strict';
 
-/** 키워드 감시: 목록, 생성, 키워드·제외어·이름 수정(설정 새 버전), 네이버 뉴스 실시간 보기(표시 전용). */
+/**
+ * 키워드 감시: 목록, 생성, 키워드·제외어·이름 수정(설정 새 버전), 네이버 뉴스 실시간 보기(표시 전용).
+ * 목록은 공용 감시(관리자가 만든 것, 누구나 읽기 전용)를 먼저, 그다음 내 감시. 제외된 감시는 숨기고, 관리자는 "제외된 감시 보기"로
+ * 함께 보고 "다시 켜기"를 누를 수 있다. 제외는 관리자만(소스 조치).
+ */
 App.route('/watches', async (view) => {
   const { api, esc, badge, tags, html } = App;
   let naver = null;   // GET /naver/status — 키가 없거나 모드가 off면 liveAvailable false (실시간 보기를 숨긴다)
   const open = new Set();   // 네이버 실시간을 펼친 감시 id (새로 고침해도 유지)
+  const admin = App.isAdmin();
+  let showExcluded = false;   // 관리자만: 제외된 감시도 목록에 (include_excluded=true)
 
   view.innerHTML = `
     <h1>키워드 감시</h1>
@@ -21,9 +27,20 @@ App.route('/watches', async (view) => {
       </form>
     </div>
     <div class="panel">
-      <div class="row"><h2 style="flex:1">내 감시${App.isAdmin() ? ' (전체)' : ''}</h2><button type="button" id="refresh" class="small">새로 고침</button></div>
+      <div class="row"><h2 style="flex:1">감시</h2>
+        ${admin ? '<label class="small nowrap"><input type="checkbox" id="show-excluded"> 제외된 감시 보기</label>' : ''}
+        <button type="button" id="refresh" class="small">새로 고침</button></div>
+      <p class="muted small">공용 감시는 관리자가 정한 감시로 모두가 함께 봅니다(키워드별 기사·네이버 실시간). 고치거나 끄는 것은 관리자만 합니다.${admin
+        ? ' 관리자에게는 다른 사용자의 개인 감시도 보입니다.' : ' 내 감시는 나와 관리자만 봅니다.'}</p>
       <div id="list"></div>
     </div>`;
+
+  /** 공용 / 내 감시 / (관리자에게) 다른 사용자의 개인 감시 */
+  function scopeBadge(w) {
+    if (w.shared) return '<span class="badge badge-blue" title="관리자가 만든 감시: 모든 사용자가 봅니다">공용</span>';
+    if (w.mine) return '<span class="badge badge-green" title="내가 만든 감시: 나와 관리자만 봅니다">내 감시</span>';
+    return `<span class="badge badge-grey" title="${esc(w.requestedBy || '')}의 개인 감시">개인</span>`;
+  }
 
   /** 키워드 태그를 누르면 이 감시에서 그 키워드로 걸린 기사 목록으로 간다 (걸린 기사가 없으면 태그만). */
   function watchKeywords(w) {
@@ -51,7 +68,8 @@ App.route('/watches', async (view) => {
   }
 
   async function load() {
-    const list = await api('GET', '/watches');
+    // 서버가 공용(만든 순서) → 내 감시 순으로 준다
+    const list = await api('GET', '/watches' + App.qs({ include_excluded: showExcluded ? 'true' : '' }));
     const el = view.querySelector('#list');
     if (!list.length) {
       el.innerHTML = '<div class="empty">아직 감시가 없습니다.</div>';
@@ -62,8 +80,8 @@ App.route('/watches', async (view) => {
       <table>
         <thead><tr><th>이름</th><th>키워드</th><th>제외어</th><th>상태</th><th class="right">문서</th><th>마지막 성공</th><th>등록 요청</th><th></th></tr></thead>
         <tbody>${list.map(w => `
-          <tr data-id="${w.id}">
-            <td><b>${esc(w.name)}</b><div class="muted small">#${w.id}${w.naver ? ` · 네이버 ${w.intervalMinutes}분` : ''} · 설정 v${w.configVersion || '-'}${w.requestedBy ? ' · ' + esc(w.requestedBy) : ''}</div></td>
+          <tr data-id="${w.id}"${w.status === 'EXCLUDED' ? ' class="excluded"' : ''}>
+            <td>${scopeBadge(w)} <b>${esc(w.name)}</b><div class="muted small">#${w.id}${w.naver ? ` · 네이버 ${w.intervalMinutes}분` : ''} · 설정 v${w.configVersion || '-'}${w.requestedBy ? ' · ' + esc(w.requestedBy) : ''}</div></td>
             <td>${watchKeywords(w)}</td>
             <td>${tags(w.exclude) || '<span class="muted">-</span>'}</td>
             <td>${App.watchBadge(w.status, w.naver)}${w.statusReason ? `<div class="muted small">${esc(w.statusReason)}</div>` : ''}</td>
@@ -73,18 +91,25 @@ App.route('/watches', async (view) => {
             <td class="nowrap">${App.fmtTime(w.lastSuccessAt)}</td>
             <td>${w.registrationStatus ? badge(w.registrationStatus) : ''}${w.registrationMessage ? `<div class="muted small">${esc(w.registrationMessage)}</div>` : ''}</td>
             <td class="actions">
-              ${live ? `<button type="button" class="small naver" aria-expanded="false" title="이 감시 키워드로 네이버 최신 뉴스를 불러옵니다 (저장하지 않음)">네이버 실시간</button>` : ''}
-              <button type="button" class="small edit">수정</button>
-              ${App.isAdmin() ? `<a class="small" href="#/admin/sources/${w.id}">소스</a>` : ''}
+              ${live && w.status !== 'EXCLUDED' ? `<button type="button" class="small naver" aria-expanded="false" title="이 감시 키워드로 네이버 최신 뉴스를 불러옵니다 (저장하지 않음)">네이버 실시간</button>` : ''}
+              ${w.editable ? '<button type="button" class="small edit">수정</button>' : ''}
+              ${admin && w.status !== 'EXCLUDED' ? '<button type="button" class="small danger exclude" title="감시를 끕니다. 목록에서 숨기고 새 기사를 대조하지 않습니다">제외</button>' : ''}
+              ${admin && w.status === 'EXCLUDED' ? '<button type="button" class="small primary reactivate">다시 켜기</button>' : ''}
+              ${admin ? `<a class="small" href="#/admin/sources/${w.id}">소스</a>` : ''}
             </td>
           </tr>
-          ${live ? `<tr class="naver-row" data-for="${w.id}" hidden><td colspan="8"><div class="naver-live"></div></td></tr>` : ''}`).join('')}
+          ${live && w.status !== 'EXCLUDED' ? `<tr class="naver-row" data-for="${w.id}" hidden><td colspan="8"><div class="naver-live"></div></td></tr>` : ''}`).join('')}
         </tbody>
       </table>`;
 
     el.querySelectorAll('tr[data-id]').forEach(tr => {
       const w = list.find(x => String(x.id) === tr.dataset.id);
-      tr.querySelector('.edit').addEventListener('click', () => edit(w));
+      const editBtn = tr.querySelector('.edit');
+      if (editBtn) editBtn.addEventListener('click', () => edit(w));
+      const excludeBtn = tr.querySelector('.exclude');
+      if (excludeBtn) excludeBtn.addEventListener('click', () => App.guard(() => exclude(w)));
+      const reactivateBtn = tr.querySelector('.reactivate');
+      if (reactivateBtn) reactivateBtn.addEventListener('click', () => App.guard(() => reactivate(w)));
       const btn = tr.querySelector('.naver');
       if (btn) {
         btn.addEventListener('click', () => toggleNaver(w, btn));
@@ -152,6 +177,23 @@ App.route('/watches', async (view) => {
     if (more) more.addEventListener('click', () => renderNaver(box, w, keyword, r.nextStart, true));
   }
 
+  /** 관리자: 감시 끄기 = 소스 제외 조치(감사 로그 SOURCE_EXCLUDE). 걸린 기사 기록은 남는다. */
+  async function exclude(w) {
+    if (!await App.confirm(`감시 "${w.name}"을(를) 제외할까요? 목록에서 숨기고 새로 수집되는 기사에 더는 대조하지 않습니다(이미 걸린 기사는 남습니다). "제외된 감시 보기"에서 다시 켤 수 있습니다.`, '제외')) return;
+    await api('POST', `/sources/${w.id}/actions/exclude`);
+    open.delete(w.id);
+    App.notice(`감시 "${w.name}"을(를) 제외했습니다.`);
+    await load();
+  }
+
+  /** 관리자: 제외한 감시를 다시 켠다 (지금 모드에 맞춰 수집 기사 대조 / 네이버 함께). */
+  async function reactivate(w) {
+    if (!await App.confirm(`감시 "${w.name}"을(를) 다시 켤까요? 새로 수집되는 기사부터 다시 대조합니다.`, '다시 켜기')) return;
+    const r = await api('POST', `/watches/${w.id}/reactivate`);
+    App.notice(`감시 "${r.name}": ${r.registrationMessage || '다시 켰습니다.'}`);
+    await load();
+  }
+
   async function edit(w) {
     const body = html(`
       <div>
@@ -197,6 +239,13 @@ App.route('/watches', async (view) => {
     });
   });
   view.querySelector('#refresh').addEventListener('click', () => App.guard(async () => { await loadNaverStatus(); await load(); }));
+  const toggle = view.querySelector('#show-excluded');
+  if (toggle) {
+    toggle.addEventListener('change', () => {
+      showExcluded = toggle.checked;
+      App.guard(load);
+    });
+  }
 
   await loadNaverStatus();
   await App.guard(load);
