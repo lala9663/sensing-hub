@@ -27,7 +27,7 @@ const App = (() => {
     ARCHIVED: '보관', NONE: '-',
     HIGH: '높음', MEDIUM: '중간', LOW: '낮음',
     APPROVAL: '승인 대기', API_KEY: 'API 키 필요',
-    EMAIL: '메일', WEBHOOK: '웹훅',
+    EMAIL: '메일', WEBHOOK: 'Teams',
     SITE: '사이트', WATCH: '키워드 감시', CHECK: '회사 점검',
     BIZ_STATUS: '사업자 상태', DEBARMENT: '부정당업자', DISCLOSURE: '공시', NEWS: '뉴스', FINANCIAL: '재무',
     PROBE: '사전 점검', DISCOVERY: '자동 탐색', FIRST_CRAWL: '첫 수집', DONE: '완료',

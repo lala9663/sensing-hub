@@ -38,7 +38,8 @@ import io.sensinghub.digest.DigestComposer.WatchHit;
  * 지난 다이제스트 이후(last_sent_at, 없으면 24시간 전) 새로 수집된(collected_at) 문서를 묶어 보낸다.
  * <ul>
  *   <li>필터 {@code {"watch_ids":[...],"source_ids":[...],"topics":[...],"company_ids":[...]}}: 네 목록 중 하나라도 맞으면 포함(합집합),
- *       모두 비면 전체. watch_ids는 {@code document_watch.source_id}(어느 감시에 걸렸나), source_ids는 {@code document.source_id}, topics는
+ *       모두 비면 전체. 만들거나 필터를 바꿀 때는 watch_ids가 하나 이상 있어야 한다(400, 감시 없이 만든 예전 구독은 그대로 보낸다).
+ *       watch_ids는 {@code document_watch.source_id}(어느 감시에 걸렸나), source_ids는 {@code document.source_id}, topics는
  *       보강 토픽 포함 여부, company_ids는 {@code document_company}(어느 회사에 연결됐나)다. 상한 200건(발행일 내림차순).</li>
  *   <li>회사 신호(M3, {@code company_signal}, 기간 안에 새로 기록된 것)는 전체 구독이거나 company_ids를 지정한 구독에 "거래처 신호" 절로
  *       맨 앞에 들어간다. 신호가 있으면 문서가 0건이어도 보낸다.</li>
@@ -54,6 +55,7 @@ public class DigestService {
     static final int MAX_DOCUMENTS = 200;
     static final int MAX_SIGNALS = 200;
     static final Duration FIRST_PERIOD = Duration.ofHours(24);
+    static final String WATCH_REQUIRED = "키워드 감시를 하나 이상 골라 주세요.";
     static final Set<String> CHANNELS = Set.of("EMAIL", "WEBHOOK");
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
     private static final TypeReference<List<String>> STRINGS = new TypeReference<>() { };
@@ -127,7 +129,7 @@ public class DigestService {
         String cleanChannel = cleanChannel(channel);
         String cleanTarget = cleanTarget(cleanChannel, target);
         int hour = cleanHour(hourKst == null ? 8 : hourKst);
-        Filters cleanFilters = cleanFilters(filters == null ? Filters.empty() : filters);
+        Filters cleanFilters = cleanFilters(requireWatch(filters == null ? Filters.empty() : filters));
         long id = jdbc.sql("""
                 INSERT INTO digest_subscription (user_id, name, channel, target, hour_kst, filters)
                 VALUES (?, ?, ?, ?, ?, CAST(? AS jsonb)) RETURNING id
@@ -139,7 +141,10 @@ public class DigestService {
         return get(user, id);
     }
 
-    /** 생략한(null) 필드는 그대로 둔다. */
+    /**
+     * 생략한(null) 필드는 그대로 둔다. filters를 보내면 키워드 감시가 하나 이상 있어야 한다. 감시 없이 만든 예전 구독도
+     * filters를 생략한 수정(켜기·끄기, 이름·시각만)은 그대로 되고 발송도 계속된다.
+     */
     @Transactional
     public SubscriptionView update(CurrentUser user, long id, String name, String channel, String target,
                                    Integer hourKst, Filters filters, Boolean enabled) {
@@ -149,7 +154,7 @@ public class DigestService {
         String newTarget = target == null && newChannel.equals(current.channel()) ? current.target()
                 : cleanTarget(newChannel, target == null ? current.target() : target);
         int newHour = hourKst == null ? current.hourKst() : cleanHour(hourKst);
-        Filters newFilters = filters == null ? current.filters() : cleanFilters(filters);
+        Filters newFilters = filters == null ? current.filters() : cleanFilters(requireWatch(filters));
         boolean newEnabled = enabled == null ? current.enabled() : enabled;
         jdbc.sql("""
                 UPDATE digest_subscription
@@ -387,7 +392,7 @@ public class DigestService {
     static String cleanTarget(String channel, String target) {
         String t = target == null ? "" : target.strip();
         if (t.isEmpty()) {
-            throw bad(channel.equals("EMAIL") ? "받을 메일 주소를 넣어 주세요." : "웹훅 URL을 넣어 주세요.");
+            throw bad(channel.equals("EMAIL") ? "받을 메일 주소를 넣어 주세요." : "Teams 웹후크 주소를 넣어 주세요.");
         }
         if (t.length() > 500) {
             throw bad("target은 500자 이하여야 합니다.");
@@ -399,7 +404,7 @@ public class DigestService {
             return t;
         }
         if (!t.contains("://")) {
-            throw bad("웹훅 URL은 http:// 또는 https://로 시작하는 절대 주소여야 합니다.");
+            throw bad("Teams 웹후크 주소는 http:// 또는 https://로 시작하는 절대 주소여야 합니다.");
         }
         UrlNormalizer.normalize(t);   // 형식·http(s)·내부망 검사. 아니면 400 INVALID_URL
         return t;
@@ -410,6 +415,14 @@ public class DigestService {
             throw bad("hourKst는 0~23이어야 합니다.");
         }
         return hour;
+    }
+
+    /** 구독을 만들거나 필터를 바꿀 때 키워드 감시는 필수다 (하루 문서가 많아 전체 구독은 상한에서 잘린다). */
+    static Filters requireWatch(Filters f) {
+        if (f.watchIds().isEmpty()) {
+            throw bad(WATCH_REQUIRED);
+        }
+        return f;
     }
 
     Filters cleanFilters(Filters f) {

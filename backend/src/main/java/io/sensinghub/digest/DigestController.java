@@ -27,8 +27,9 @@ import jakarta.validation.constraints.Size;
 
 /**
  * 일간 다이제스트 구독 (VIEWER 이상, 본인 것. ADMIN은 전체).
- * channel EMAIL은 메일 주소, WEBHOOK은 http(s) 절대 URL(내부망 거부). hourKst 0~23(기본 8).
- * filters {"watchIds":[...],"sourceIds":[...],"topics":[...],"companyIds":[...]}는 하나라도 맞으면 포함, 모두 비면 전체.
+ * channel EMAIL은 메일 주소, WEBHOOK은 http(s) 절대 URL(내부망 거부, 화면 이름은 "Teams"). hourKst 0~23(기본 8).
+ * filters {"watchIds":[...],"sourceIds":[...],"topics":[...],"companyIds":[...]}는 하나라도 맞으면 포함.
+ * 만들 때와 filters를 바꿀 때 watchIds는 하나 이상 필수(400). 감시 없이 만든 예전 구독(모두 비면 전체)은 그대로 보낸다.
  * 회사 신호(거래처 신호 절)는 전체 구독이거나 companyIds를 지정한 구독에 들어간다.
  */
 @RestController

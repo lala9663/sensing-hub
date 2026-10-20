@@ -86,7 +86,7 @@ SENSING_DB_DSN=postgresql://sensing:sensing@127.0.0.1:5432/sensing sensing-worke
 | 거래처 | [04-companies.md](docs/guide/04-companies.md) | 거래처 마스터, 위험 신호(국세청·DART 공시·조달청·보도), 케이던시아 연동(목업) |
 | 키워드 감시 | [05-watches.md](docs/guide/05-watches.md) | 키워드로 수집 기사 대조, 공용 감시, 제외·다시 켜기 |
 | 네이버 뉴스 | [06-naver-news.md](docs/guide/06-naver-news.md) | 네이버 뉴스 검색(표시 전용), 감시의 네이버 실시간, 주요 키워드 칩 |
-| 구독 | [07-subscriptions.md](docs/guide/07-subscriptions.md) | 구독(일간 다이제스트): 매일 정한 시각에 메일·웹훅으로 새 기사 보고 |
+| 구독 | [07-subscriptions.md](docs/guide/07-subscriptions.md) | 구독(일간 다이제스트): 매일 정한 시각에 메일·Teams로 새 기사 보고 (키워드 감시 필수) |
 | 챗봇 | [08-chatbot.md](docs/guide/08-chatbot.md) | 도구 호출형 챗봇, 근거 링크, 키워드 바로 검색, 의미 검색 |
 | 관리자 | [09-admin.md](docs/guide/09-admin.md) | 처리 대기 큐, 소스(과거 기사 채우기), 운영 지표, API 키 |
 | (공통) | [llm.md](docs/guide/llm.md) | LLM 연결 설정, Gemini 무료 등급 실측, 하루 한도 나눠 쓰기 |
@@ -136,7 +136,7 @@ cd backend && SENSING_IT_DB_URL=jdbc:postgresql://127.0.0.1:5432/sensing_it ./gr
 1. M3 마무리: DART 재무 신호(FINANCIAL), 회사별 구독 화면, 실제 케이던시아 API 연결(SDS가 API를 주면 주소·매핑만 교체).
 2. M4: Playwright 동적 수집, HWP/PDF 첨부 텍스트 추출(공공기관 보도자료 본문), 원문 삭제 감지.
 3. M5: 대화 요약·답 피드백, 운영 데이터 임베딩(유료 등급 또는 사내 임베딩 모델 결정).
-4. M6: 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면. 작은 것: 네이버 API 쿼터 추적, Teams 웹훅 형식.
+4. M6: 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면. 작은 것: 네이버 API 쿼터 추적, Teams 카드(Adaptive Card) 형식.
 
 **코드 밖에서 결정돼야 하는 것** — 안티봇 범위 합의안 서명, 언론 기사 본문 저장 범위와 네이버 저장·분석 전환(법무), 뉴스 저작권 이용 계약,
 정부 사이트 본문 저장 기준, 케이던시아 API·데이터 반출 보안 검토, 운영 담당자 ([요건 문서](docs/requirements-mapping.md) 끝 체크리스트).

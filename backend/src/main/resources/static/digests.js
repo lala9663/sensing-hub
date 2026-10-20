@@ -1,20 +1,33 @@
 'use strict';
 
-/** 구독(일간 다이제스트): 구독 목록, 생성(채널·대상·시각·필터), 미리보기 모달, 즉시 전송, 보낸 기록. */
+/**
+ * 구독(일간 다이제스트): 구독 목록, 생성(채널·대상·시각·필터), 미리보기 모달, 즉시 전송, 보낸 기록.
+ * 채널은 화면에서 "메일"(EMAIL)·"Teams"(WEBHOOK)로 보인다. 발송 형식은 웹훅 그대로({"text": ...})이고 이름만 Teams다.
+ * 키워드 감시는 필수(서버도 400). 감시 없이 만든 예전 구독은 계속 발송되고, 수정할 때 감시를 고르게 안내한다.
+ */
 App.route('/digests', async (view) => {
   const { api, esc, badge, html } = App;
+
+  const WATCH_REQUIRED = '키워드 감시를 하나 이상 골라 주세요.';
+
+  function channelOptions(selected) {
+    return [['EMAIL', '메일'], ['WEBHOOK', 'Teams']]
+      .map(([v, l]) => `<option value="${v}" ${v === selected ? 'selected' : ''}>${l}</option>`).join('');
+  }
+
+  const hasWatch = f => !!(f && f.watchIds && f.watchIds.length);
 
   view.innerHTML = `
     <h1>구독</h1>
     <div class="panel">
       <h2>새 구독</h2>
-      <p class="muted small">매일 정한 시각(KST)에 지난번 보낸 뒤 새로 수집된 문서를 감시별 → 토픽별로 묶어 메일 또는 웹훅으로 보냅니다.
-        필터는 하나라도 맞으면 포함하고, 모두 비우면 전체입니다.</p>
+      <p class="muted small">매일 정한 시각(KST)에 지난번 보낸 뒤 새로 수집된 문서를 감시별 → 토픽별로 묶어 메일 또는 Teams로 보냅니다.
+        키워드 감시를 하나 이상 골라야 하고, 토픽·거래처·소스는 더 받고 싶을 때 고릅니다 (하나라도 맞으면 포함).</p>
       <form id="create-form">
         <div class="form-grid">
           <label class="field"><span>이름</span><input type="text" name="name" class="wide" placeholder="아침 보고" required></label>
-          <label class="field"><span>채널</span><select name="channel" class="wide"><option value="EMAIL">메일</option><option value="WEBHOOK">웹훅 (Slack·Mattermost 형식)</option></select></label>
-          <label class="field"><span>대상 (메일 주소 또는 웹훅 URL)</span><input type="text" name="target" class="wide" placeholder="me@example.com" required></label>
+          <label class="field"><span>채널</span><select name="channel" class="wide">${channelOptions('EMAIL')}</select></label>
+          <label class="field"><span>대상 (메일 주소 또는 Teams 웹후크 주소)</span><input type="text" name="target" class="wide" placeholder="me@example.com" required></label>
           <label class="field"><span>시각 (KST)</span><select name="hourKst" class="wide">${Array.from({ length: 24 }, (_, h) => `<option value="${h}" ${h === 8 ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`).join('')}</select></label>
         </div>
         <div id="filters" class="mt"><span class="muted small">필터 항목을 불러오는 중…</span></div>
@@ -45,19 +58,29 @@ App.route('/digests', async (view) => {
   function filterBoxes(selected) {
     const sel = selected || {};
     const has = (arr, v) => (arr || []).map(String).includes(String(v));
+    const checks = (name, items) => items.map(([v, l]) => `<label class="small"><input type="checkbox" name="${name}" value="${esc(v)}" ${has(sel[name], v) ? 'checked' : ''}> ${esc(l)}</label>`).join('');
     const group = (title, name, items) => items.length ? `
       <div class="mt"><div class="muted small">${title}</div>
-        <div class="row">${items.map(([v, l]) => `<label class="small"><input type="checkbox" name="${name}" value="${esc(v)}" ${has(sel[name], v) ? 'checked' : ''}> ${esc(l)}</label>`).join('')}</div></div>` : '';
-    return group('키워드 감시', 'watchIds', options.watches.map(w => [w.id, w.name]))
-      + group('토픽', 'topics', options.topics.map(t => [t, t]))
-      + group('거래처 (회사 신호 포함)', 'companyIds', options.companies.map(c => [c.id, c.name]))
-      + group('소스', 'sourceIds', options.sources.map(s => [s.id, s.domain]))
-      || '<div class="muted small">선택할 필터 항목이 아직 없습니다 (전체 문서).</div>';
+        <div class="row">${checks(name, items)}</div></div>` : '';
+    // 키워드 감시(필수)는 항목이 없어도 보인다. 공용(관리자가 만든) 감시도 목록에 있다.
+    // 이미 고른 감시가 목록에 없으면(제외됐거나 볼 수 없는 감시) 그대로 남겨 두어 저장할 때 조용히 빠지지 않게 한다
+    const watchItems = options.watches.map(w => [w.id, w.shared ? `${w.name} (공용)` : w.name])
+      .concat((sel.watchIds || []).filter(id => !options.watches.some(w => w.id === id)).map(id => [id, `감시 #${id} (목록에 없음)`]));
+    const watchGroup = `
+      <div class="mt"><div class="small"><b>키워드 감시 <span style="color:var(--red)" title="필수">*</span></b></div>
+        ${watchItems.length ? `<div class="row">${checks('watchIds', watchItems)}</div>`
+          : '<div class="muted small">고를 수 있는 키워드 감시가 없습니다. <a href="#/watches">감시</a> 메뉴에서 먼저 만들어 주세요.</div>'}</div>`;
+    return watchGroup
+      + group('토픽 (선택)', 'topics', options.topics.map(t => [t, t]))
+      + group('거래처 (선택, 회사 신호 포함)', 'companyIds', options.companies.map(c => [c.id, c.name]))
+      + group('소스 (선택)', 'sourceIds', options.sources.map(s => [s.id, s.domain]));
   }
 
   function readFilters(root) {
     const pick = (name, num) => Array.from(root.querySelectorAll(`input[name=${name}]:checked`)).map(i => num ? Number(i.value) : i.value);
-    return { watchIds: pick('watchIds', true), sourceIds: pick('sourceIds', true), topics: pick('topics', false), companyIds: pick('companyIds', true) };
+    const filters = { watchIds: pick('watchIds', true), sourceIds: pick('sourceIds', true), topics: pick('topics', false), companyIds: pick('companyIds', true) };
+    if (!hasWatch(filters)) throw new Error(WATCH_REQUIRED);   // 저장 전에 안내 (서버도 같은 문장으로 400)
+    return filters;
   }
 
   function describeFilters(f) {
@@ -86,7 +109,7 @@ App.route('/digests', async (view) => {
             <td><b>${esc(d.name)}</b><div class="muted small">#${d.id}${App.isAdmin() && d.owner ? ' · ' + esc(d.owner) : ''}</div></td>
             <td>${badge(d.channel)} <span class="mono small">${esc(d.target)}</span></td>
             <td class="nowrap">${String(d.hourKst).padStart(2, '0')}:00</td>
-            <td class="small">${esc(describeFilters(d.filters))}</td>
+            <td class="small">${esc(describeFilters(d.filters))}${hasWatch(d.filters) ? '' : ' <span class="badge badge-orange" title="감시 없이 만든 예전 구독: 발송은 계속됩니다. 수정할 때 키워드 감시를 골라 주세요.">감시 선택 필요</span>'}</td>
             <td>${d.enabled ? '<span class="badge badge-green">켜짐</span>' : '<span class="badge badge-grey">꺼짐</span>'}</td>
             <td class="nowrap">${App.fmtTime(d.lastSentAt)}</td>
             <td class="actions">
@@ -176,10 +199,11 @@ App.route('/digests', async (view) => {
       <div>
         <div class="form-grid">
           <label class="field"><span>이름</span><input type="text" name="name" class="wide" value="${esc(d.name)}"></label>
-          <label class="field"><span>채널</span><select name="channel" class="wide"><option value="EMAIL" ${d.channel === 'EMAIL' ? 'selected' : ''}>메일</option><option value="WEBHOOK" ${d.channel === 'WEBHOOK' ? 'selected' : ''}>웹훅</option></select></label>
-          <label class="field"><span>대상</span><input type="text" name="target" class="wide" value="${esc(d.target)}"></label>
+          <label class="field"><span>채널</span><select name="channel" class="wide">${channelOptions(d.channel)}</select></label>
+          <label class="field"><span>대상 (메일 주소 또는 Teams 웹후크 주소)</span><input type="text" name="target" class="wide" value="${esc(d.target)}"></label>
           <label class="field"><span>시각 (KST)</span><select name="hourKst" class="wide">${Array.from({ length: 24 }, (_, h) => `<option value="${h}" ${h === d.hourKst ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`).join('')}</select></label>
         </div>
+        ${hasWatch(d.filters) ? '' : '<p class="small mt" style="color:var(--orange)">이 구독은 키워드 감시 없이 만들어졌습니다. 지금도 발송되지만, 저장하려면 키워드 감시를 하나 이상 골라 주세요.</p>'}
         <div class="filters">${filterBoxes(d.filters)}</div>
       </div>`);
     const saved = await App.modal({
@@ -197,6 +221,9 @@ App.route('/digests', async (view) => {
 
   // ---------------------------------------------------------------- 생성
   const form = view.querySelector('#create-form');
+  form.channel.addEventListener('change', () => {
+    form.target.placeholder = form.channel.value === 'EMAIL' ? 'me@example.com' : 'Teams 채널 워크플로에서 복사한 웹후크 주소 (https://…)';
+  });
   form.addEventListener('submit', e => {
     e.preventDefault();
     App.guard(async () => {
@@ -209,6 +236,7 @@ App.route('/digests', async (view) => {
       });
       App.notice(`구독 "${d.name}" 생성 (#${d.id})`);
       form.reset();
+      form.channel.dispatchEvent(new Event('change'));
       view.querySelector('#filters').innerHTML = filterBoxes(null);
       await load();
     });
