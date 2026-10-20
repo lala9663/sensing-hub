@@ -1366,6 +1366,84 @@ def test_crawled_articles_are_matched_against_keyword_watches(env):
     assert q(store, "SELECT status FROM source WHERE id = %s", source_id)["status"] == "ACTIVE"
 
 
+def test_backfill_watch_recheck_removes_hits_inside_english_words(env, monkeypatch, caplog):
+    """--recheck: 예전 규칙(부분 문자열)으로 "applauds" 속 "ds"에 걸린 기록을 지우고(회사 연결·NEWS 신호 포함), 다른 키워드가 걸리면
+    검색어만 고치고, 새로 걸리는 것은 더한다. 근거(저장된 글)가 없는 기록, 네이버에서 받은 문서, 제외된 감시, 기간 밖 문서는 그대로 둔다.
+    --dry-run은 셈만 하고 쓰지 않는다. --drop-unverifiable이면 근거 없는 기록도 영문 키워드면 지운다 (한글 키워드는 둔다)."""
+    import json as _json
+    import logging
+    from sensing_worker.backfill_watch import main as backfill_main, recheck
+    store, _, _, _ = env
+    press = site_source(store, "press.example.com", "NEWS")
+    gov = site_source(store, "gov.example.go.kr", "PUBLIC")
+    ds = register_watch(store, "DS", ["DS"], naver=False)
+    chips = register_watch(store, "반도체 DS", ["DS", "반도체"], naver=False)
+    company, cw = register_company(store, "디에스", ["DS"], None)
+    old = register_watch(store, "옛 감시", ["DS"], naver=False)
+    store.conn.execute("UPDATE source SET status = 'EXCLUDED' WHERE id = %s", (old,))
+
+    applauds = add_doc(store, press, "https://press/1", "Yoon applauds chip makers", 2)
+    real = add_doc(store, press, "https://press/2", "삼성전자 DS부문 실적", 3)
+    funds = add_doc(store, press, "https://press/3", "Funds flow into 반도체", 4)
+    body_only = add_doc(store, press, "https://press/4", "본문에서 걸린 기사", 5)            # 언론 기사: 본문 미저장
+    fresh = add_doc(store, gov, "https://gov/5", "지원사업 공지", 6, body="DS 사업부 지원 안내")
+    naver = add_doc(store, ds, "https://press/6", "Leads 상승", 1)                          # 네이버에서 받은 문서
+    stale = add_doc(store, press, "https://press/8", "Exporters applauds", 2)
+    store.conn.execute("UPDATE document SET collected_at = now() - interval '40 days' WHERE id = %s", (stale,))
+    hits = [(applauds, ds), (applauds, chips), (applauds, cw), (applauds, old), (real, ds), (real, chips), (real, cw),
+            (funds, ds), (funds, chips), (body_only, ds), (naver, ds), (stale, ds)]
+    for document_id, watch_id in hits:
+        store.add_watch_hit(document_id, watch_id, "DS")
+    store.add_watch_hit(body_only, chips, "반도체")                                       # 본문에서 걸린 한글 키워드
+    for document_id in (applauds, real):
+        store.add_document_company(document_id, company, "WATCH")
+        store.conn.execute(
+            "INSERT INTO company_signal (company_id, kind, severity, fingerprint, title, detail, observed_at, document_id) "
+            "VALUES (%s, 'NEWS', 'MEDIUM', %s, '기사', %s::jsonb, now(), %s)",
+            (company, f"fp{document_id}", _json.dumps({"matched_by": "WATCH"}), document_id))
+
+    def snapshot():
+        return (store.conn.execute("SELECT document_id, source_id, keyword FROM document_watch ORDER BY 1, 2").fetchall(),
+                store.conn.execute("SELECT document_id, company_id, matched_by FROM document_company ORDER BY 1, 2").fetchall(),
+                store.conn.execute("SELECT document_id FROM company_signal ORDER BY 1").fetchall())
+
+    before = snapshot()
+    dry = recheck(store, 30, dry_run=True)
+    assert (dry.removed, dry.rekeyed, dry.added, dry.kept, dry.company_links_removed, dry.signals_removed) == (4, 1, 3, 2, 1, 1)
+    assert dict(dry.removed_by_watch) == {ds: 2, chips: 1, cw: 1} and dry.removed_unverifiable == 0
+    assert set(dry.samples) == {(ds, "DS", "Yoon applauds chip makers", True), (chips, "DS", "Yoon applauds chip makers", True),
+                                (cw, "DS", "Yoon applauds chip makers", True), (ds, "DS", "Funds flow into 반도체", True)}
+    assert snapshot() == before                                                         # 셈만 했다
+    monkeypatch.setenv("SENSING_DB_DSN", DSN)
+    with caplog.at_level(logging.INFO, logger="sensing_worker.backfill_watch"):
+        backfill_main(["--recheck", "--dry-run", "--days", "30"])
+    assert "dry run, nothing written" in caplog.text and "removed=4" in caplog.text and "applauds" in caplog.text
+    assert snapshot() == before
+
+    done = recheck(store, 30)
+    assert (done.removed, done.rekeyed, done.added, done.kept, done.company_links_removed, done.signals_removed) == (4, 1, 3, 2, 1, 1)
+    rows = {(r["document_id"], r["source_id"]): r["keyword"]
+            for r in store.conn.execute("SELECT document_id, source_id, keyword FROM document_watch")}
+    assert rows == {(applauds, old): "DS",                                              # 제외된 감시는 보지 않는다
+                    (real, ds): "DS", (real, chips): "DS", (real, cw): "DS",            # "DS부문"은 그대로
+                    (funds, chips): "반도체",                                            # 검색어만 고침
+                    (body_only, ds): "DS", (body_only, chips): "반도체",                 # 근거 없음 → 둠
+                    (fresh, ds): "DS", (fresh, chips): "DS", (fresh, cw): "DS",         # 새로 걸림 (공공 문서 본문)
+                    (naver, ds): "DS", (stale, ds): "DS"}                               # 네이버 문서, 기간 밖
+    links = store.conn.execute("SELECT document_id, company_id, matched_by FROM document_company ORDER BY 1").fetchall()
+    assert [(l["document_id"], l["company_id"], l["matched_by"]) for l in links] == [(real, company, "WATCH"), (fresh, company, "WATCH")]
+    assert [r["document_id"] for r in signals(store, company)] == [real]
+
+    again = recheck(store, 30)                                                          # 두 번 돌려도 바뀌는 것 없음
+    assert (again.removed, again.rekeyed, again.added, again.kept) == (0, 0, 0, 2)
+
+    drop = recheck(store, 30, drop_unverifiable=True)                                   # 근거 없는 "DS"만 지운다
+    assert (drop.removed, drop.removed_unverifiable, drop.rekeyed, drop.added, drop.kept) == (1, 1, 0, 0, 1)
+    assert drop.samples == [(ds, "DS", "본문에서 걸린 기사", False)]
+    left = store.conn.execute("SELECT source_id, keyword FROM document_watch WHERE document_id = %s", (body_only,)).fetchall()
+    assert [(r["source_id"], r["keyword"]) for r in left] == [(chips, "반도체")]
+
+
 def test_embed_pending_fills_vectors_for_titles_and_public_bodies_only(env):
     """의미 검색 임베딩: 언론 기사는 제목, 공공 문서는 제목 + 제목을 붙인 본문 조각, AI 봇을 막은 사이트는 제목만 보낸다."""
     from fakeembed import FakeEmbedder, unavailable, vector_for

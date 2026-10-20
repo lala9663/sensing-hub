@@ -204,6 +204,19 @@ JSON 형식은 모델에 맡기지 않습니다. 제공자가 스키마 강제(`
 (다이제스트가 이 표를 읽습니다). 이것이 기본 동작인 **수집 기사 대조 모드**이고, 감시는 만들자마자 `ACTIVE`(화면 "수집 기사 대조 중")가 되지만
 스스로 수집하지 않으므로 `next_run_at`이 비어 있어 스케줄러가 작업을 넣지 않고, 관리자 키 큐에도 쌓이지 않습니다. 새로 수집되는 기사부터 대조하며,
 이미 쌓인 기사는 `python -m sensing_worker.backfill_watch --days 30`으로 한 번 대조할 수 있습니다. 커버리지는 등록 언론사 수가 정합니다.
+대조는 대소문자·공백 차이를 무시하고, 영문·숫자로 시작하거나 끝나는 키워드는 그 끝 바로 바깥이 라틴 문자·숫자가 아니어야 걸립니다
+("DS"는 "삼성전자 DS부문"·"DS투자증권"·"(DS)"에 걸리고 "applauds"·"MDS테크"·"GADS"·"DSR"에는 안 걸림, 한글 쪽 끝은 조사 때문에 부분 문자열,
+제외어도 같은 규칙). 이 규칙(2026-10-20) 전에 남은 기록은 다시 판정해 정리합니다. 먼저 `--dry-run`으로 지울 건수와 예시를 보고 실행합니다:
+
+```bash
+SENSING_DB_DSN=postgresql://sensing:sensing@127.0.0.1:5433/sensing python -m sensing_worker.backfill_watch --recheck --days 30 --dry-run
+SENSING_DB_DSN=postgresql://sensing:sensing@127.0.0.1:5433/sensing python -m sensing_worker.backfill_watch --recheck --days 30
+```
+
+검색어가 저장된 제목·본문에 단어 속으로만 있던 기록을 지우고(회사 감시면 그 회사 연결 `document_company` WATCH와 그 연결로 생긴 NEWS 신호도),
+같은 감시의 다른 키워드가 걸리면 검색어만 고치고, 새로 걸리는 것은 더합니다(트랜잭션 하나, 다시 돌려도 바뀌는 것 없음). 언론 기사는 본문을 저장하지
+않아 본문에서만 걸린 기록은 근거가 없어 두며, `--drop-unverifiable`을 붙이면 그중 영문 키워드 기록도 지웁니다(본문에 제대로 된 검색어가 있던
+기록도 함께 지워질 수 있음). 네이버에서 받은 문서와 제외된 감시의 기록은 보지 않습니다.
 감시 하나는 `source` 한 행(`kind = WATCH`, `watch_name`)이고 키워드는 설정 버전
 config(`{"method":"API","provider":"naver_news","naver":false,"keywords":[...],"exclude":[...]}`, `naver`가 없으면 V13 이전 감시로 네이버 모드)에
 두므로, 키워드 수정은 설정 새 버전 활성화이고 롤백·일시정지·제외 같은 소스 조치를 그대로 씁니다. V13 마이그레이션이 키 없이 멈춰 있던

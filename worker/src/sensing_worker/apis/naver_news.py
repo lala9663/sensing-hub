@@ -15,7 +15,7 @@
   두 값 모두 로그·오류 메시지·증거 어디에도 남기지 않는다 (_mask).
 - 응답 items[]: title(HTML 태그 <b>·엔티티 포함), originallink(언론사 원문), link(네이버 링크, 없으면 원문), description, pubDate(RFC 1123).
   ApiItem은 url=originallink(비면 link), title=태그 제거·엔티티 복원, published_at=UTC, body=None (언론 기사: 제목·링크만),
-  keyword=걸린 검색어. exclude 목록의 단어가 제목에 있으면 버린다.
+  keyword=걸린 검색어. exclude 목록의 단어가 제목에 있으면 버린다 (watchmatch와 같은 영문 단어 경계 규칙).
 - 오류 (describe_error): 401/403 → API_KEY_INVALID, 429(하루 허용량 초과) → API_ERROR(재시도), 400 SE01~SE04·SE06 / 404 SE05 /
   300(API 없음) → API_ERROR(재시도 안 함), 5xx(SE99) → API_ERROR(재시도). 오류 본문은 두 형식이 있다:
   검색 API {"errorCode": "SE02", "errorMessage": "..."}, API Gateway {"error": {"errorCode": "200", "message": "...", "details": "..."}}.
@@ -34,6 +34,7 @@ from urllib.parse import urlencode
 
 from ..codes import Code, CrawlFailure, MESSAGES
 from ..fetcher import EVIDENCE_CHARS, PoliteFetcher
+from ..watchmatch import contains, normalize
 from .base import ApiItem, mask_secret
 
 log = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ class NaverNewsConnector:
         if not keywords:
             raise CrawlFailure(Code.KEYWORDS_REQUIRED, "감시에 키워드가 없습니다. 키워드를 넣으면 다음 주기에 수집합니다.",
                                stage="LIST")
-        exclude = [e.lower() for e in _clean_terms(config.get("exclude"))]
+        exclude = _clean_terms(config.get("exclude"))
         cutoff = datetime.combine(since, time.min, tzinfo=timezone.utc)
 
         items: list[ApiItem] = []
@@ -204,7 +205,7 @@ class NaverNewsConnector:
                         break
                     if item.url in seen:
                         continue
-                    if exclude and item.title and any(e in item.title.lower() for e in exclude):
+                    if exclude and item.title and any(contains(normalize(item.title), e) for e in exclude):
                         continue
                     seen.add(item.url)
                     items.append(item)

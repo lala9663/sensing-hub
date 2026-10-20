@@ -28,6 +28,7 @@ import io.sensinghub.common.ApiException;
 import io.sensinghub.naver.NaverSearchClient.Kind;
 import io.sensinghub.naver.NaverSearchClient.NaverSearchException;
 import io.sensinghub.naver.NaverSearchClient.Sort;
+import io.sensinghub.watch.KeywordMatch;
 import io.sensinghub.watch.WatchService;
 import io.sensinghub.watch.WatchService.WatchView;
 
@@ -153,7 +154,6 @@ public class NaverNewsService {
         NaverSearchClient.Page page = call(key, term, size, from, Sort.DATE);
         markValidIfNeeded();
 
-        List<String> exclude = watch.exclude().stream().map(e -> e.toLowerCase(Locale.ROOT)).toList();
         Map<String, String> pressNames = pressNames(page.items());
         List<LiveItem> items = new ArrayList<>();
         int excluded = 0;
@@ -162,8 +162,8 @@ public class NaverNewsService {
             if (original == null) {
                 continue;
             }
-            String lowered = it.title() == null ? "" : it.title().toLowerCase(Locale.ROOT);
-            if (exclude.stream().anyMatch(lowered::contains)) {
+            String title = KeywordMatch.normalize(it.title());
+            if (watch.exclude().stream().anyMatch(e -> KeywordMatch.contains(title, e))) {   // 워커 대조와 같은 제외어 규칙
                 excluded++;
                 continue;
             }
