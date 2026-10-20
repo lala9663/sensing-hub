@@ -100,8 +100,7 @@ App.route('/naver', async (view, params, query) => {
         <button type="submit" class="primary">검색</button>
       </form>
       <div class="chips naver-chips" id="naver-chips"></div>
-      <p class="naver-display-only small">표시 전용 — 네이버 검색 결과를 화면에 보여 주기만 하고 <b>저장하지 않습니다</b>
-        (문서·요약·챗봇·구독 메일에 쓰지 않음). 제목을 누르면 언론사 원문이 새 탭에서 열립니다.</p>
+      <p class="naver-display-only small">네이버 뉴스는 현재 따로 저장하고 있지 않습니다.</p>
     </div>
     <div class="panel" id="naver-results" hidden>
       <div class="naver-summary" id="naver-summary"></div>
