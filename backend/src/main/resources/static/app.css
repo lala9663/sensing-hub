@@ -228,6 +228,19 @@ button.naver.active { background: var(--blue-bg); }
 .kw-add input { flex: 1; min-width: 160px; }
 .kw-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 
+/* 관리자 자사·경쟁사 (admin.js, 회사 관계 목록) */
+.notice-warn { padding: 8px 12px; margin: 8px 0 12px; border-radius: 4px; background: var(--orange-bg); color: var(--orange); }
+.rel-table td { overflow-wrap: anywhere; }
+.rel-table td:first-child, .rel-table td:nth-child(2) { white-space: nowrap; overflow-wrap: normal; }
+.rel-table td:nth-child(5) { min-width: 140px; }
+.rel-form select { min-width: 140px; }
+@media (max-width: 720px) {
+  .rel-table thead { display: none; }
+  .rel-table tr { display: block; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .rel-table td { display: block; border: 0; padding: 2px 4px; }
+  .rel-table td:empty { display: none; }
+}
+
 /* 네이버 뉴스 탭 (naver.js, 표시 전용) */
 .naver-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
 .naver-title h1 { margin: 0; }

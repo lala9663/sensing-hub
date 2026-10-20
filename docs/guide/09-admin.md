@@ -9,6 +9,7 @@
 | 운영 지표 | `#/admin/ops` | [운영 지표](#운영-지표) |
 | API 키 | `#/admin/credentials` | [API 키](#api-키) |
 | 주요 키워드 | `#/admin/keywords` | [06-naver-news.md의 주요 키워드](06-naver-news.md#주요-키워드-빠른-검색-칩) |
+| 자사·경쟁사 | `#/admin/relations` | [자사·경쟁사](#자사경쟁사) |
 | 케이던시아 연동 | `#/admin/caidentia` | [04-companies.md의 케이던시아 연동](04-companies.md#케이던시아-연동-목업) |
 
 ## 이 탭에서 하는 일
@@ -24,6 +25,8 @@
   **LLM 사용량 (오늘)**. 30초마다 갱신합니다.
 - **API 키**: 제공자(`dart` · `naver_news` · `data_go_kr`)·키·메모를 등록하고(naver_news는 NAVER API HUB Client ID·Client Secret 두 칸과 콘솔 경로 안내),
   저장 뒤 이 키를 기다리다 다시 진행된 소스 수를 보여 줍니다. 등록된 키 목록(비밀 값은 보이지 않음)·삭제, naver_news 시험 호출.
+- **자사·경쟁사**: 문서 분류의 자사·경쟁사·고객사·협력사를 붙이는 회사 관계 목록. 회사마다 이름·관계·별칭·제외어·메모를 추가·수정·삭제하고,
+  아래 "최근 변경"에서 누가 언제 무엇을 바꿨는지(감사 로그) 봅니다. 경쟁사가 비어 있으면 화면이 알려 줍니다.
 - **주요 키워드**·**케이던시아 연동**은 위 표의 문서에 있습니다.
 
 ## 어떻게 동작하나
@@ -72,6 +75,30 @@
 - 키 발급은 사람이 합니다(자동 가입·약관 동의 대행 없음).
 - 키는 pgcrypto로 암호화해 `api_credential`에만 두고 응답·로그·오류 메시지·증거 파일 어디에도 남기지 않습니다. 챗봇은 키를 채팅으로 받지 않습니다.
 - 네이버(`naver_news`) 키를 넣고 확인하는 순서는 [06-naver-news.md](06-naver-news.md#키를-넣고-확인하는-순서).
+
+### 자사·경쟁사
+
+문서 분류의 **자사·경쟁사·고객사·협력사**는 LLM이 고르지 않고 이 목록(`company_relation`, V20)으로 워커가 붙입니다. 뜻과 대조 규칙은
+[02-documents.md](02-documents.md#어떻게-동작하나)에 있습니다.
+
+- **기본값**: 자사 = 삼성전자(별칭 Samsung Electronics, 삼성 DS, 삼성 DX, DS부문, DX부문). 고객이 삼성 DS이고 이벤트 센싱 예시가
+  "삼성전자 관련 중요 뉴스"라서입니다(최종 업무 정의서 2026-10-19). 메타넷은 개발사라 넣지 않았습니다.
+- **‘삼성’ 단독은 기본에서 뺐습니다**: 2026-10-20 운영 DB 제목 중 ‘삼성’이 든 292건에서 ‘삼성전자’는 79건이고, 나머지에는 삼성전기(20)·삼성물산(14)·
+  삼성바이오에피스(11)·삼성화재(8)·삼성SDI(7)·삼성생명(5) 같은 계열사와 프로야구 삼성 라이온즈("구자욱 복귀", "가을야구")·삼성역("덕정~삼성")이
+  섞여 있었습니다. ‘삼성 갤럭시 버즈’처럼 삼성전자 제품 기사도 ‘삼성’으로만 쓰는 경우가 있어 일부를 놓치지만, 계열사·야구 기사가 자사로 붙는 쪽이
+  더 해롭다고 봤습니다. 필요하면 ‘갤럭시’ 같은 제품명보다 기사에서 실제로 쓰는 사업부 이름을 별칭으로 더하세요(‘갤럭시’는 LA 갤럭시·갤럭시아에도 걸림).
+- **경쟁사**는 비워 두었습니다. 예: SK하이닉스, 마이크론, TSMC, 인텔 — 현업이 확정해 넣습니다. ‘인텔’은 한글 부분 일치라 ‘인텔리전스’에도
+  걸리므로 제외어에 ‘인텔리전스’를 넣으세요. ‘하이닉스’처럼 줄여 쓰는 이름은 별칭으로 더합니다.
+- **검사**: 이름·별칭은 목록 전체에서 하나뿐(대소문자·공백 무시)이어야 하고, 한 글자 이름·별칭은 받지 않습니다(거의 모든 문서에 걸림). 별칭·제외어는
+  20개, 이름은 100자까지입니다.
+- **감사 로그**: 추가·수정·삭제마다 `COMPANY_RELATION_CREATE`·`UPDATE`·`DELETE`(대상 `company_relation`, 전후 값)를 남기고, 같은 내용으로 다시 저장하면
+  남기지 않습니다. 화면 아래 "최근 변경"이 최근 30건을 보여 줍니다.
+- **반영 시점**: 바꾸면 새로 수집·보강하는 문서부터 반영됩니다(워커는 작업마다 목록을 다시 읽음). 이미 보강한 문서는 운영자가 다시 라벨링 명령으로
+  고칩니다 — `python -m sensing_worker.relabel --dry-run`(바뀔 건수·예시만), `python -m sensing_worker.relabel`(한 트랜잭션, `--days N`이면 최근 N일).
+  항목을 지우면 수집 때 남긴 본문 일치 기록도 함께 지워집니다.
+- **거래처(회사) 마스터와의 관계**: 거래처(`company`)는 공급사 리스크(케이던시아) 대상이고 이 목록은 고객(삼성전자) 입장의 관계라 따로 둡니다.
+  같은 회사가 양쪽에 있게 되면, 관계 항목에 `company_id`(선택)를 두고 화면에서 "거래처에서 가져오기"로 이름·별칭을 채우는 방식을 제안합니다
+  (아직 만들지 않음 — 거래처는 목업 회사뿐이라 겹치는 회사가 없습니다).
 
 ### 운영 지표
 
@@ -129,6 +156,13 @@ curl http://127.0.0.1:8080/api/v1/sources/1/backfills -H 'X-User: registrar'
 curl -X POST http://127.0.0.1:8080/api/v1/sources/1/backfills/1/extend -H 'X-User: registrar' -H 'Content-Type: application/json' -d '{"segments":1}'   # 두 달 더
 curl -X POST http://127.0.0.1:8080/api/v1/sources/1/backfills/1/cancel -H 'X-User: registrar'
 
+# 자사·경쟁사 (회사 관계 목록). 읽기는 VIEWER 이상, 바꾸기·변경 기록은 ADMIN. relation: OWN(자사)|COMPETITOR(경쟁사)|CUSTOMER(고객사)|PARTNER(협력사)
+curl http://127.0.0.1:8080/api/v1/company-relations -H 'X-User: viewer'
+curl -X POST http://127.0.0.1:8080/api/v1/company-relations -H 'X-User: admin' -H 'Content-Type: application/json'      -d '{"name":"SK하이닉스","relation":"COMPETITOR","aliases":["하이닉스","SK hynix"],"exclude":[],"note":"메모리"}'
+curl -X PUT http://127.0.0.1:8080/api/v1/company-relations/2 -H 'X-User: admin' -H 'Content-Type: application/json'      -d '{"name":"인텔","relation":"COMPETITOR","aliases":["Intel"],"exclude":["인텔리전스"]}'
+curl -X DELETE http://127.0.0.1:8080/api/v1/company-relations/2 -H 'X-User: admin'
+curl http://127.0.0.1:8080/api/v1/company-relations/history -H 'X-User: admin'   # 최근 변경 30건 (감사 로그)
+
 # 공개 API 키 등록 (암호화 저장 후 이 키를 기다리던 소스가 자동으로 다시 진행된다) · 조회(비밀 없음) · 삭제
 curl -X POST http://127.0.0.1:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"dart","secret":"<발급받은 키>","label":"공시 API"}'
 curl -X POST http://127.0.0.1:8080/api/v1/api-credentials -H 'X-User: admin' -H 'Content-Type: application/json' -d '{"provider":"data_go_kr","secret":"<공공데이터포털 서비스키>","label":"공공데이터포털"}'
@@ -142,5 +176,6 @@ curl -X DELETE http://127.0.0.1:8080/api/v1/api-credentials/dart -H 'X-User: adm
 
 - 과거 기사 채우기는 느립니다(사이트 하나에 시간당 약 1,400~1,800건). 여러 언론사의 긴 기간이 필요하면 뉴스 DB 계약(빅카인즈 등)이 더 빠릅니다.
 - 보관 사이트맵이 없거나 목록이 짧은 사이트는 과거 기사를 채울 수 없는 범위가 있습니다([../archive-sitemap-survey.md](../archive-sitemap-survey.md)).
-- 남은 것(M6): 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면. 네이버 API 쿼터 추적.
+- 남은 것(M6): 레시피 수정·미리보기 화면, 설정 백필, 감사 로그 화면(자사·경쟁사 화면의 "최근 변경"만 있음). 네이버 API 쿼터 추적.
+- 자사·경쟁사 목록을 바꿔도 이미 보강된 문서는 다시 라벨링 명령을 돌리기 전까지 예전 라벨 그대로입니다.
 - 키 값은 관리자 화면(또는 API)에만 넣고 채팅·파일·커밋에 붙이지 않습니다.

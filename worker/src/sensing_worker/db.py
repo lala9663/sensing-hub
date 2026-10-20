@@ -411,6 +411,31 @@ class Store:
             ORDER BY s.id
             """).fetchall()
 
+    # ------------------------------------------------------------------ 회사 관계 (자사·경쟁사·고객사·협력사 라벨)
+    def load_company_relations(self) -> list[dict]:
+        """관리자가 정한 회사 관계 목록 (relations.from_rows로 넘긴다)."""
+        return self.conn.execute(
+            "SELECT id, name, aliases, exclude, relation FROM company_relation ORDER BY id").fetchall()
+
+    def add_relation_hit(self, document_id: int, relation_id: int, matched: str) -> bool:
+        """수집 때 걸린 관계 기록. 같은 문서·항목 쌍은 처음 걸린 이름만 남긴다. 새로 남겼으면 True."""
+        return self.conn.execute(
+            """
+            INSERT INTO document_relation (document_id, relation_id, matched) VALUES (%s, %s, %s)
+            ON CONFLICT (document_id, relation_id) DO NOTHING RETURNING document_id
+            """, (document_id, relation_id, matched[:100])).fetchone() is not None
+
+    def load_relation_hits(self, document_ids: list[int]) -> dict[int, list[tuple[int, str]]]:
+        """문서별 수집 때 걸린 (관계 항목 id, 걸린 이름) 목록."""
+        if not document_ids:
+            return {}
+        out: dict[int, list[tuple[int, str]]] = {}
+        for r in self.conn.execute(
+                "SELECT document_id, relation_id, matched FROM document_relation WHERE document_id = ANY(%s) "
+                "ORDER BY document_id, relation_id", (document_ids,)):
+            out.setdefault(r["document_id"], []).append((r["relation_id"], r["matched"]))
+        return out
+
     # ------------------------------------------------------------------ 회사 (M3)
     def company_of_watch(self, source_id: int) -> int | None:
         """이 키워드 감시가 어느 회사의 감시(company.watch_source_id)인지. 아니면 None."""

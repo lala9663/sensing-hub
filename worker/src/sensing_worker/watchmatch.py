@@ -63,6 +63,12 @@ def contains(text: str, keyword: str) -> bool:
     return p is not None and p.search(text) is not None
 
 
+def mask(text: str, keyword: str) -> str:
+    """정규화한 text에서 keyword가 규칙대로 든 자리를 공백 하나로 바꾼다 (회사 관계 목록의 제외어 — relations)."""
+    p = _pattern(keyword)
+    return text if p is None else p.sub(" ", text)
+
+
 def from_configs(rows: list[dict]) -> list[WatchKeywords]:
     """db.load_watch_keywords 결과({"id", "config"}) → WatchKeywords (빈 키워드 감시는 뺀다)."""
     out: list[WatchKeywords] = []

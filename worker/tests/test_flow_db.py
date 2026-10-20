@@ -1670,3 +1670,88 @@ def test_list_url_adds_new_kind_to_legacy_source_without_waking_a_paused_one(env
     store.conn.execute("UPDATE source SET status = 'ACTIVE' WHERE id = %s", (source_id,))
     assert crawl(store, runner, settings, source_id) == "SUCCESS"
     assert sections_count(store) == {"pressReleaseView": 8, "정책뉴스": 6}
+
+
+# ---------------------------------------------------------------------- 회사 관계 라벨 (자사·경쟁사)
+
+def relation_id(store: Store, name: str) -> int:
+    return q(store, "SELECT id FROM company_relation WHERE name = %s", name)["id"]
+
+
+def test_crawl_records_relation_hits_from_press_bodies_and_enrich_labels_them(env):
+    """언론 기사는 본문을 저장하지 않지만 수집 때(감시 대조와 같은 시점) 본문에서 걸린 관계를 document_relation에 남기고,
+    보강은 그 기록으로 자사를 붙인다. LLM이 보낸 경쟁사는 버린다. 기본 목록(V20)은 자사 = 삼성전자 하나다."""
+    from fakellm import BatchFakeLlm
+    from fakesite import BODY
+    from sensing_worker.enrich import enrich_pending
+    store, runner, settings, sites = env
+    assert [(r["name"], r["relation"]) for r in store.load_company_relations()] == [("삼성전자", "OWN")]
+    routes = news_site_routes(range(101, 104))
+    for idxno, lead in ((102, "삼성전자 DS부문이 "), (103, "삼성바이오로직스가 ")):
+        key = f"/news/articleView.html?idxno={idxno}"
+        status, ctype, html = routes[key]
+        routes[key] = (status, ctype, html.replace(f"<p>{BODY}</p>", f"<p>{lead}{BODY}</p>", 1))
+    site = Site(routes); sites.append(site)
+    register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"
+
+    hits = store.conn.execute("SELECT d.url, r.relation_id, r.matched, d.body_text FROM document_relation r "
+                              "JOIN document d ON d.id = r.document_id").fetchall()
+    assert [(h["url"].rsplit("=", 1)[1], h["relation_id"], h["matched"], h["body_text"]) for h in hits] == [
+        ("102", relation_id(store, "삼성전자"), "삼성전자", None)]                       # 본문은 저장하지 않았다
+
+    llm = BatchFakeLlm(lambda idx, prompt: {"idx": idx, "summary": None, "topics": ["경쟁사", "산업동향"], "tags": []})
+    assert enrich_pending(store, llm, settings, limit=10).done == 3
+    rows = store.conn.execute("SELECT d.url, e.topics FROM document_enrichment e JOIN document d ON d.id = e.document_id").fetchall()
+    assert {r["url"].rsplit("=", 1)[1]: r["topics"] for r in rows} == {
+        "101": ["산업동향"], "102": ["산업동향", "자사"], "103": ["산업동향"]}
+    assert "· 자사:" not in llm.calls[0][0]
+
+    # 관계 항목을 지우면 수집 때 기록도 함께 지워진다
+    store.conn.execute("DELETE FROM company_relation WHERE name = '삼성전자'")
+    assert q(store, "SELECT count(*) AS c FROM document_relation")["c"] == 0
+
+
+def test_relabel_replaces_llm_relation_labels_with_list_labels(env):
+    """다시 라벨링: LLM이 붙인 자사·경쟁사를 지우고 목록으로 다시 붙인다 (제목·저장된 본문·수집 때 기록). --dry-run은 셈만 한다.
+    FAILED 보강은 그대로 두고, 다시 돌리면 바뀌는 것이 없고, 별칭을 빼면 그 별칭으로 남은 기록은 쓰지 않는다."""
+    from sensing_worker.relabel import relabel
+    store, _, _, _ = env
+    press = site_source(store, "press.example.com", "NEWS")
+    gov = site_source(store, "gov.example.go.kr", "PUBLIC")
+    store.conn.execute("INSERT INTO company_relation (name, aliases, relation) VALUES ('SK하이닉스', '[\"하이닉스\"]', 'COMPETITOR')")
+    samsung = relation_id(store, "삼성전자")
+    kd = add_doc(store, press, "https://press/1", "광동제약, 창립 63주년", 1)
+    ikea = add_doc(store, press, "https://press/2", "이케아, 어린이 컬렉션 출시", 2)
+    own = add_doc(store, press, "https://press/3", "삼성전자, HBM4 양산 돌입", 3)
+    body = add_doc(store, press, "https://press/4", "메모리 업황 반등", 4)
+    notice = add_doc(store, gov, "https://gov/5", "반도체 지원사업 공고", 5, body="SK하이닉스 협력사를 대상으로 한다")
+    plain = add_doc(store, press, "https://press/6", "기준금리 동결", 6)
+    failed = add_doc(store, press, "https://press/7", "삼성전자 노조 파업", 7)
+    old = add_doc(store, press, "https://press/8", "삼성전자 신제품", 8)
+    store.conn.execute("UPDATE document SET collected_at = now() - interval '40 days' WHERE id = %s", (old,))
+    for doc, topics in ((kd, ["자사"]), (ikea, ["경쟁사", "산업동향"]), (own, ["산업동향", "자사"]), (body, ["산업동향"]),
+                        (notice, ["지원사업"]), (plain, ["정책·규제"]), (old, ["경쟁사"])):
+        store.save_enrichment(doc, 1, summary=None, topics=topics, tags=[], model="m")
+    store.save_enrichment(failed, 1, summary=None, topics=[], tags=[], model="m", status="FAILED", error="x")
+    store.add_relation_hit(body, samsung, "DS부문")                                       # 수집 때 본문에서 걸렸다
+
+    def topics() -> dict[int, list[str]]:
+        return {r["document_id"]: r["topics"] for r in store.conn.execute("SELECT document_id, topics FROM document_enrichment")}
+    before = topics()
+    dry = relabel(store, dry_run=True, days=30)
+    assert topics() == before                                                               # 아무것도 쓰지 않았다
+    assert (dry.checked, dry.changed, dry.became_other) == (6, 4, 1)                        # 40일 전 문서·FAILED는 안 본다
+    assert (dry.before["자사"], dry.after["자사"], dry.removed["자사"], dry.added["자사"]) == (2, 2, 1, 1)
+    assert (dry.before["경쟁사"], dry.after["경쟁사"]) == (1, 1) and dry.added["경쟁사"] == 1
+    assert {s[0] for s in dry.samples} == {kd, ikea, body, notice}
+
+    r = relabel(store)
+    assert r.changed == 5 and r.skipped == 0                                                # 기간 없이: 40일 전 문서도
+    assert topics() == {kd: ["기타"], ikea: ["산업동향"], own: ["산업동향", "자사"], body: ["산업동향", "자사"],
+                        notice: ["지원사업", "경쟁사"], plain: ["정책·규제"], failed: [], old: ["자사"]}
+    assert relabel(store).changed == 0
+
+    store.conn.execute("UPDATE company_relation SET aliases = '[]' WHERE id = %s", (samsung,))
+    again = relabel(store, dry_run=True)
+    assert again.changed == 1 and again.samples[0][:3] == (body, ["산업동향", "자사"], ["산업동향"])

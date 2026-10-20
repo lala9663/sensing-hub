@@ -28,8 +28,12 @@ import org.springframework.stereotype.Component;
 public class DigestComposer {
 
     public static final ZoneId KST = ZoneId.of("Asia/Seoul");
+    /**
+     * 분류 체계 (워커 enrich.TOPICS와 같은 순서). 자사·경쟁사·고객사·협력사는 LLM이 아니라 회사 관계 목록
+     * (관리자 메뉴 "자사·경쟁사", {@link io.sensinghub.relation.CompanyRelationService})으로 워커가 붙이고, 나머지 7개는 LLM이 고른다.
+     */
     public static final List<String> TOPIC_ORDER = List.of(
-            "정책·규제", "입찰·공고", "지원사업", "자사", "경쟁사", "산업동향", "인사·조직", "사건·사고", "기타");
+            "정책·규제", "입찰·공고", "지원사업", "자사", "경쟁사", "고객사", "협력사", "산업동향", "인사·조직", "사건·사고", "기타");
     static final String UNCLASSIFIED = "분류 전";
     static final String FOOTER = "sensing-hub 다이제스트";
     static final String COMPANY_HEADING = "거래처 신호";

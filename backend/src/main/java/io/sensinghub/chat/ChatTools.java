@@ -244,7 +244,8 @@ public class ChatTools {
                                         + "결과에 온다. 여럿이면 쉼표로"),
                                 "days", prop("integer", "최근 며칠 동안 수집한 문서만 (1~90)"),
                                 "since", prop("string", "이 날짜(YYYY-MM-DD, 한국 시각) 이후 수집한 문서만. days보다 우선"),
-                                "topic", enumProp("분류 (이 값 중 하나)", DigestComposer.TOPIC_ORDER),
+                                "topic", enumProp("분류 (이 값 중 하나). 자사·경쟁사·고객사·협력사는 관리자가 정한 회사 관계 목록"
+                                        + "(기본 자사: 삼성전자)의 이름이 나온 문서", DigestComposer.TOPIC_ORDER),
                                 "watch_id", prop("integer", "이 키워드 감시(list_watches의 id)에 걸린 문서만"),
                                 "limit", prop("integer", "최대 개수 (기본 10, 최대 20)"),
                                 "within_previous", prop("boolean", "true면 새로 찾지 않고 바로 앞 답의 근거 목록 안에서만 거른다 "

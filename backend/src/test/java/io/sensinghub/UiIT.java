@@ -55,6 +55,9 @@ class UiIT {
         assertThat(index.getBody()).contains("href=\"#/naver\"").contains("naver.js");
         // 관리자 메뉴: 주요 키워드 (네이버 탭·챗봇 칩)
         assertThat(index.getBody()).contains("href=\"#/admin/keywords\"");
+        // 관리자 메뉴: 자사·경쟁사 (분류 라벨을 붙이는 회사 관계 목록)
+        assertThat(index.getBody()).contains("href=\"#/admin/relations\"");
+        assertThat(http.getForEntity("/admin.js", String.class).getBody()).contains("'/admin/relations'").contains("/company-relations");
         // 일간 다이제스트 메뉴의 이름은 "구독" (주소 #/digests와 API 경로는 그대로)
         assertThat(index.getBody()).contains("data-path=\"/digests\">구독</a>").doesNotContain(">다이제스트</a>");
     }
