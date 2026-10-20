@@ -59,7 +59,8 @@ import io.sensinghub.watch.WatchService.WatchView;
  *       맞지 않았는데 검색어에 사이트·종류 이름이 있으면 site·section으로 거르라고 note로 알려 준다.</li>
  *   <li>앞 결과 안에서 다시 거르기: search_documents의 within_previous(·previous_refs)면 새로 찾지 않고 앞 답의 근거({@link Context#previous})
  *       안에서만 기존 조건(검색어·분류·사이트·종류·기간·감시)으로 거른다. 문서 id는 서버가 chat_citation에서 꺼낸다 — LLM은 표시와 근거 번호만 쓴다.
- *       이슈 근거는 그 이슈에 묶인 문서로 넓힌다. 이때는 의미 검색 없이 낱말·태그·회사·사이트 이름이 맞는 문서만, 앞 답의 순서로 준다.</li>
+ *       이슈 근거는 그 이슈에 묶인 문서로 넓힌다. 이때는 의미 검색 없이 낱말·태그·회사·사이트 이름이 맞는 문서만, 앞 답의 순서와 앞 답의 근거 번호로 준다
+ *       (실측: Gemini는 거른 답에도 앞 목록의 번호를 쓴다 — 번호를 새로 매기면 답의 [n]과 근거가 어긋난다).</li>
  *   <li>도구는 결과와 함께 추천 후속 질문용 요약({@link Outcome#facts()}, {@link ChatFollowUps})을 남긴다.</li>
  * </ul>
  */
@@ -112,27 +113,37 @@ public class ChatTools {
                       OffsetDateTime publishedAt) {
     }
 
-    /** 한 턴 동안 도구 결과에 붙인 근거 번호. 같은 문서·이슈는 같은 번호를 받는다. */
+    /**
+     * 한 턴 동안 도구 결과에 붙인 근거 번호. 같은 문서·이슈는 같은 번호를 받는다. 새 번호는 지금까지 쓴 가장 큰 번호 다음이다.
+     * 앞 답의 근거 안에서 거를 때는 앞 답의 번호를 그대로 쓴다 ({@link #document(int, long, String, String, String, OffsetDateTime)}).
+     */
     public static final class Refs {
         private final Map<String, Ref> byKey = new LinkedHashMap<>();
         private final Map<Integer, Ref> byNo = new HashMap<>();
+        private int max;
 
         int document(long id, String title, String url, String sourceLabel, OffsetDateTime publishedAt) {
-            return add("D" + id, no -> new Ref(no, "DOCUMENT", id, null, title, url, sourceLabel, publishedAt));
+            return document(0, id, title, url, sourceLabel, publishedAt);
+        }
+
+        /** wanted: 이 번호를 쓰고 싶다 (앞 답의 번호). 0이거나 이번 턴에 이미 다른 근거가 쓴 번호면 새 번호. */
+        int document(int wanted, long id, String title, String url, String sourceLabel, OffsetDateTime publishedAt) {
+            return add("D" + id, wanted, no -> new Ref(no, "DOCUMENT", id, null, title, url, sourceLabel, publishedAt));
         }
 
         int issue(long id, String title, String sourceLabel, OffsetDateTime lastSeenAt) {
-            return add("I" + id, no -> new Ref(no, "ISSUE", null, id, title, "#/issues/" + id, sourceLabel, lastSeenAt));
+            return add("I" + id, 0, no -> new Ref(no, "ISSUE", null, id, title, "#/issues/" + id, sourceLabel, lastSeenAt));
         }
 
-        private int add(String key, java.util.function.IntFunction<Ref> make) {
+        private int add(String key, int wanted, java.util.function.IntFunction<Ref> make) {
             Ref existing = byKey.get(key);
             if (existing != null) {
                 return existing.no();
             }
-            Ref ref = make.apply(byKey.size() + 1);
+            Ref ref = make.apply(wanted > 0 && !byNo.containsKey(wanted) ? wanted : max + 1);
             byKey.put(key, ref);
             byNo.put(ref.no(), ref);
+            max = Math.max(max, ref.no());
             return ref.no();
         }
 
@@ -248,7 +259,7 @@ public class ChatTools {
                                 "watch_id", prop("integer", "이 키워드 감시(list_watches의 id)에 걸린 문서만"),
                                 "limit", prop("integer", "최대 개수 (기본 10, 최대 20)"),
                                 "within_previous", prop("boolean", "true면 새로 찾지 않고 바로 앞 답의 근거 목록 안에서만 거른다 "
-                                        + "(앞 답의 순서대로, 번호는 새로 매긴다). 앞 목록을 가리키는 말('그중', '이 중', '위 기사 중')에 쓴다"),
+                                        + "(앞 답의 순서대로, 앞 답의 근거 번호를 그대로 쓴다). 앞 목록을 가리키는 말('그중', '이 중', '위 기사 중')에 쓴다"),
                                 "previous_refs", Map.of("type", "array", "items", Map.of("type", "integer"),
                                         "description", "앞 답의 근거 번호 중 이것만 (within_previous와 함께). 이슈 번호면 그 이슈에 묶인 기사들")),
                                 List.of())),
@@ -358,6 +369,7 @@ public class ChatTools {
 
         // 앞 답의 근거 안에서 다시 거르기: 문서 id는 서버가 앞 답의 chat_citation에서 꺼낸다 (LLM은 표시만 준다)
         List<Long> base = null;
+        Map<Long, Integer> previousNo = new HashMap<>();   // 앞 답의 문서 번호 (거른 결과도 같은 번호로 가리킨다)
         if (within) {
             List<Ref> previous = context.previous();
             List<Ref> picked = previousRefs.isEmpty() ? previous
@@ -368,6 +380,7 @@ public class ChatTools {
                             .collect(Collectors.joining(", ")) + "입니다. previous_refs를 그 안에서 고르세요."
                     : null;
             base = problem == null ? previousDocuments(picked) : List.of();
+            picked.stream().filter(r -> r.documentId() != null).forEach(r -> previousNo.putIfAbsent(r.documentId(), r.no()));
             if (problem == null && base.isEmpty()) {
                 problem = "앞 답의 근거에 기사·문서가 없습니다. 새로 찾으려면 within_previous 없이 다시 찾으세요.";
             }
@@ -385,7 +398,7 @@ public class ChatTools {
         // 사이트·기사 종류: 이름을 실제 값으로 맞추고, 못 맞추면 고를 수 있는 이름을 돌려준다 (LLM이 이름을 정확히 모를 수 있다)
         Map<String, Object> scope = new LinkedHashMap<>();
         if (within) {
-            scope.put("within_previous", "앞 답의 근거 " + base.size() + "건 안에서 (앞 답의 순서)");
+            scope.put("within_previous", "앞 답의 근거 " + base.size() + "건 안에서 (앞 답의 순서, ref는 앞 답의 번호 그대로)");
         }
         Map<String, Long> siteSections = Map.of();
         if (siteArg != null) {
@@ -424,7 +437,7 @@ public class ChatTools {
             DocumentRow d = hit.row();
             SiteInfo site = sites.getOrDefault(d.sourceId(), new SiteInfo("UNKNOWN", null, false));
             String source = site.name() != null && !site.name().isBlank() ? site.name() : d.domain();
-            int ref = refs.document(d.id(), d.title(), d.url(), source, d.publishedAt());
+            int ref = refs.document(previousNo.getOrDefault(d.id(), 0), d.id(), d.title(), d.url(), source, d.publishedAt());
             List<String> linked = companies.getOrDefault(d.id(), List.of());
             docFacts.add(new DocFacts(d.id(), source, d.section(), d.topics(), d.tags(), linked));
             Map<String, Object> doc = new LinkedHashMap<>();
