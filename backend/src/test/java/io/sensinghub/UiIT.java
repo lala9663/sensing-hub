@@ -55,6 +55,8 @@ class UiIT {
         assertThat(index.getBody()).contains("href=\"#/naver\"").contains("naver.js");
         // 관리자 메뉴: 주요 키워드 (네이버 탭·챗봇 칩)
         assertThat(index.getBody()).contains("href=\"#/admin/keywords\"");
+        // 일간 다이제스트 메뉴의 이름은 "구독" (주소 #/digests와 API 경로는 그대로)
+        assertThat(index.getBody()).contains("data-path=\"/digests\">구독</a>").doesNotContain(">다이제스트</a>");
     }
 
     /** 챗봇만 있는 새 창: 메뉴 없이 같은 app.js(X-User)와 챗봇 공통 부품을 쓴다. */

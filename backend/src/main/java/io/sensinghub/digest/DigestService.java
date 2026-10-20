@@ -183,9 +183,9 @@ public class DigestService {
     public SubscriptionView get(CurrentUser user, long id) {
         user.require(Role.VIEWER);
         SubscriptionView s = jdbc.sql(SELECT + " WHERE s.id = ?").param(id).query(this::mapSubscription).optional()
-                .orElseThrow(() -> ApiException.notFound("다이제스트 구독"));
+                .orElseThrow(() -> ApiException.notFound("구독"));
         if (!user.role().atLeast(Role.ADMIN) && s.userId() != user.id()) {
-            throw ApiException.notFound("다이제스트 구독");
+            throw ApiException.notFound("구독");
         }
         return s;
     }

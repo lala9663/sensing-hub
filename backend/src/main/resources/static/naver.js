@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 네이버 뉴스 탭 (표시 전용): 검색어로 네이버 뉴스를 불러와 보여 주기만 한다 (GET /naver/news — 저장·요약·챗봇·다이제스트에 쓰지 않음).
+ * 네이버 뉴스 탭 (표시 전용): 검색어로 네이버 뉴스를 불러와 보여 주기만 한다 (GET /naver/news — 저장·요약·챗봇·구독 메일에 쓰지 않음).
  * #/naver?q=<검색어>(&sort=sim): 검색어·정렬을 주소에 남겨 새로 고침·공유가 된다. 검색할 때는 history로 주소만 바꾸고(화면을 다시
  * 그리지 않음), 뒤로 가기나 링크로 주소가 바뀌면 라우터가 다시 그린다. 처음에는 빈 검색창과 주요 키워드(관리자가 정한 짧은 목록,
  * GET /featured-keywords — 감시 키워드 전체는 너무 많아 쓰지 않는다)를 빠른 검색 칩으로 보여 준다.
@@ -101,7 +101,7 @@ App.route('/naver', async (view, params, query) => {
       </form>
       <div class="chips naver-chips" id="naver-chips"></div>
       <p class="naver-display-only small">표시 전용 — 네이버 검색 결과를 화면에 보여 주기만 하고 <b>저장하지 않습니다</b>
-        (문서·요약·챗봇·다이제스트에 쓰지 않음). 제목을 누르면 언론사 원문이 새 탭에서 열립니다.</p>
+        (문서·요약·챗봇·구독 메일에 쓰지 않음). 제목을 누르면 언론사 원문이 새 탭에서 열립니다.</p>
     </div>
     <div class="panel" id="naver-results" hidden>
       <div class="naver-summary" id="naver-summary"></div>

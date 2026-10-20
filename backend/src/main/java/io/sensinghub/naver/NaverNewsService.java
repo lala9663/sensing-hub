@@ -134,7 +134,7 @@ public class NaverNewsService {
         String notice = switch (settings.mode()) {
             case OFF -> "네이버 뉴스 검색을 쓰지 않습니다 (SENSING_NAVER_MODE=off).";
             case STORE -> "네이버 검색 결과를 저장·분석합니다 (SENSING_NAVER_MODE=store, 법무 확인 뒤에만 켭니다).";
-            case DISPLAY -> "네이버 검색 결과는 표시 전용입니다: 화면에 보여 주기만 하고 저장·요약·챗봇·다이제스트에 쓰지 않습니다.";
+            case DISPLAY -> "네이버 검색 결과는 표시 전용입니다: 화면에 보여 주기만 하고 저장·요약·챗봇·구독 메일에 쓰지 않습니다.";
         };
         return new Status(settings.mode().name().toLowerCase(Locale.ROOT), settings.api(), keyStatus != null, keyStatus, live,
                 NaverSettings.SOURCE_LABEL, notice);
