@@ -141,17 +141,33 @@ class DigestIT {
         }
     }
 
-    /** 구독을 만들고 id를 돌려준다. 웹훅 구독은 검증(내부망 거부)을 지나기 위해 공개 주소로 만든 뒤 DB에서 테스트 서버로 바꾼다. */
+    /**
+     * 구독을 만들고 id를 돌려준다. 웹훅 구독은 검증(내부망 거부)을 지나기 위해 공개 주소로 만든 뒤 DB에서 테스트 서버로 바꾼다.
+     * 키워드 감시가 없는 필터(null이면 전체)는 감시가 필수가 되기 전에 만든 예전 구독이다. API로는 만들 수 없으므로 아무 감시로
+     * 만든 뒤 DB에서 필터를 그 값으로 바꾼다 (그래서 이 도우미를 쓰는 테스트는 예전 구독이 계속 발송되는지도 함께 확인한다).
+     */
     private long subscribe(String user, String name, String channel, String target, String filtersJson) {
+        boolean legacy = filtersJson == null || !filtersJson.contains("watchIds");
         ResponseEntity<String> res = post(user, "/api/v1/digests", "{\"name\":\"" + name + "\",\"channel\":\"" + channel
                 + "\",\"target\":\"" + (channel.equals("WEBHOOK") ? "https://hooks.example.com/services/T/B/x" : target)
-                + "\",\"hourKst\":8" + (filtersJson == null ? "" : ",\"filters\":" + filtersJson) + "}");
+                + "\",\"hourKst\":8,\"filters\":" + (legacy ? "{\"watchIds\":[" + anyWatch() + "]}" : filtersJson) + "}");
         assertThat(res.getStatusCode()).as(res.getBody()).isEqualTo(HttpStatus.CREATED);
         long id = read(res.getBody()).get("id").asLong();
         if (channel.equals("WEBHOOK")) {
             jdbc.sql("UPDATE digest_subscription SET target = ? WHERE id = ?").params(target, id).update();
         }
+        if (legacy) {
+            String stored = filtersJson == null ? "{}"
+                    : filtersJson.replace("sourceIds", "source_ids").replace("companyIds", "company_ids");
+            jdbc.sql("UPDATE digest_subscription SET filters = CAST(? AS jsonb) WHERE id = ?").params(stored, id).update();
+        }
         return id;
+    }
+
+    /** 아무 키워드 감시 id (없으면 하나 만든다). */
+    private long anyWatch() {
+        long id = jdbc.sql("SELECT COALESCE(min(id), 0) FROM source WHERE kind = 'WATCH'").query(Long.class).single();
+        return id > 0 ? id : watch(siteSource("watch.example.com", "NEWS"), "아무 감시");
     }
 
     // ------------------------------------------------------------------ 자료 도우미 (RegistrationFlowIT와 같은 모양)
@@ -220,9 +236,11 @@ class DigestIT {
 
     @Test
     void subscriptionCrudAndOwnership() {
+        long w = watch(siteSource("news.example.com", "NEWS"), "자사 보도");
+        String watch = "\"watchIds\":[" + w + "]";
         ResponseEntity<String> created = post("viewer", "/api/v1/digests",
                 "{\"name\":\" 아침  보고 \",\"channel\":\"email\",\"target\":\"viewer@example.com\",\"hourKst\":7,"
-                        + "\"filters\":{\"topics\":[\"정책·규제\",\"정책·규제\"]}}");
+                        + "\"filters\":{" + watch + ",\"topics\":[\"정책·규제\",\"정책·규제\"]}}");
         assertThat(created.getStatusCode()).as(created.getBody()).isEqualTo(HttpStatus.CREATED);
         JsonNode sub = read(created.getBody());
         long id = sub.get("id").asLong();
@@ -233,31 +251,45 @@ class DigestIT {
         assertThat(sub.get("lastSentAt").isNull()).isTrue();
         assertThat(sub.get("owner").asText()).isEqualTo("일반 사용자");
         assertThat(sub.get("filters").toString())
-                .isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[\"정책·규제\"],\"companyIds\":[]}");
+                .isEqualTo("{\"watchIds\":[" + w + "],\"sourceIds\":[],\"topics\":[\"정책·규제\"],\"companyIds\":[]}");
         assertThat(jdbc.sql("SELECT filters::text FROM digest_subscription WHERE id = ?").param(id).query(String.class).single())
-                .isEqualTo("{\"topics\": [\"정책·규제\"], \"watch_ids\": [], \"source_ids\": [], \"company_ids\": []}");
+                .isEqualTo("{\"topics\": [\"정책·규제\"], \"watch_ids\": [" + w + "], \"source_ids\": [], \"company_ids\": []}");
 
-        // 기본값: hourKst 8, filters 전체
+        // 기본값: hourKst 8 (감시만 고르면 토픽·거래처·소스는 빈 목록)
         JsonNode defaults = read(post("registrar", "/api/v1/digests",
-                "{\"name\":\"웹훅\",\"channel\":\"WEBHOOK\",\"target\":\"https://hooks.example.com/services/T/B/x\"}").getBody());
+                "{\"name\":\"웹훅\",\"channel\":\"WEBHOOK\",\"target\":\"https://hooks.example.com/services/T/B/x\","
+                        + "\"filters\":{" + watch + "}}").getBody());
         assertThat(defaults.get("hourKst").asInt()).isEqualTo(8);
-        assertThat(defaults.get("filters").toString()).isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[],\"companyIds\":[]}");
+        assertThat(defaults.get("filters").toString())
+                .isEqualTo("{\"watchIds\":[" + w + "],\"sourceIds\":[],\"topics\":[],\"companyIds\":[]}");
 
         // 검증: 메일 형식, 웹훅은 절대 http(s) URL, 내부망 주소 거부, 시각 범위, 체계 밖 토픽, 없는 감시 id
+        // (감시 필수에 먼저 걸리지 않게 모두 감시를 고른다)
         for (String body : List.of(
-                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"not-an-address\"}",
-                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"hooks.example.com/x\"}",
-                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"ftp://hooks.example.com/x\"}",
-                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"http://localhost:8080/hook\"}",
-                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"http://10.0.0.5/hook\"}",
-                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"http://169.254.169.254/latest\"}",
-                "{\"name\":\"x\",\"channel\":\"SMS\",\"target\":\"010\"}",
-                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"hourKst\":24}",
-                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"topics\":[\"없는토픽\"]}}",
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"not-an-address\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"hooks.example.com/x\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"ftp://hooks.example.com/x\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"http://localhost:8080/hook\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"http://10.0.0.5/hook\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"http://169.254.169.254/latest\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"SMS\",\"target\":\"010\",\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"hourKst\":24,\"filters\":{%W%}}",
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{%W%,\"topics\":[\"없는토픽\"]}}",
                 "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"watchIds\":[999]}}",
-                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"companyIds\":[999]}}",
-                "{\"name\":\" \",\"channel\":\"EMAIL\",\"target\":\"a@b.co\"}")) {
-            assertThat(post("viewer", "/api/v1/digests", body).getStatusCode()).as(body).isEqualTo(HttpStatus.BAD_REQUEST);
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{%W%,\"companyIds\":[999]}}",
+                "{\"name\":\" \",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{%W%}}")) {
+            String b = body.replace("%W%", watch);
+            assertThat(post("viewer", "/api/v1/digests", b).getStatusCode()).as(b).isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+        // 키워드 감시는 필수: 필터 없음, 감시 없이 토픽만, 빈 감시 목록 → 400과 안내 문장
+        for (String body : List.of(
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\"}",
+                "{\"name\":\"x\",\"channel\":\"EMAIL\",\"target\":\"a@b.co\",\"filters\":{\"topics\":[\"정책·규제\"]}}",
+                "{\"name\":\"x\",\"channel\":\"WEBHOOK\",\"target\":\"https://hooks.example.com/services/T/B/x\","
+                        + "\"filters\":{\"watchIds\":[],\"sourceIds\":[1]}}")) {
+            ResponseEntity<String> res = post("viewer", "/api/v1/digests", body);
+            assertThat(res.getStatusCode()).as(body).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(read(res.getBody()).get("message").asText()).isEqualTo("키워드 감시를 하나 이상 골라 주세요.");
         }
         assertThat(jdbc.sql("SELECT count(*) FROM digest_subscription").query(Long.class).single()).isEqualTo(2L);
 
@@ -275,7 +307,7 @@ class DigestIT {
 
         // 수정: 생략한 필드는 그대로, 채널을 바꾸면 target도 새 채널로 검사한다
         ResponseEntity<String> updated = call("viewer", HttpMethod.PUT, "/api/v1/digests/" + id,
-                "{\"hourKst\":9,\"enabled\":false,\"filters\":{\"topics\":[\"입찰·공고\"]}}");
+                "{\"hourKst\":9,\"enabled\":false,\"filters\":{" + watch + ",\"topics\":[\"입찰·공고\"]}}");
         assertThat(updated.getStatusCode()).as(updated.getBody()).isEqualTo(HttpStatus.OK);
         JsonNode u = read(updated.getBody());
         assertThat(u.get("name").asText()).isEqualTo("아침 보고");
@@ -283,6 +315,13 @@ class DigestIT {
         assertThat(u.get("hourKst").asInt()).isEqualTo(9);
         assertThat(u.get("enabled").asBoolean()).isFalse();
         assertThat(u.get("filters").get("topics").toString()).isEqualTo("[\"입찰·공고\"]");
+        // 필터를 바꿀 때도 감시는 필수: 감시를 빼면 400, 구독은 그대로
+        ResponseEntity<String> noWatch = call("viewer", HttpMethod.PUT, "/api/v1/digests/" + id,
+                "{\"filters\":{\"topics\":[\"정책·규제\"]}}");
+        assertThat(noWatch.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(read(noWatch.getBody()).get("message").asText()).isEqualTo("키워드 감시를 하나 이상 골라 주세요.");
+        assertThat(get("viewer", "/api/v1/digests/" + id).get("filters").toString())
+                .isEqualTo("{\"watchIds\":[" + w + "],\"sourceIds\":[],\"topics\":[\"입찰·공고\"],\"companyIds\":[]}");
         assertThat(call("viewer", HttpMethod.PUT, "/api/v1/digests/" + id, "{\"channel\":\"WEBHOOK\"}").getStatusCode())
                 .isEqualTo(HttpStatus.BAD_REQUEST);                                     // 메일 주소는 웹훅 URL이 아니다
         assertThat(call("viewer", HttpMethod.PUT, "/api/v1/digests/" + id,
@@ -419,6 +458,42 @@ class DigestIT {
                 .contains("새 문서 0건 · 거래처 신호 1건");
         // 그 뒤에는 신호도 없어 EMPTY
         assertThat(read(post("registrar", "/api/v1/digests/" + hook + "/send-now", "").getBody()).get("status").asText()).isEqualTo("EMPTY");
+    }
+
+    @Test
+    void legacySubscriptionWithoutWatchKeepsSendingAndOnlyFilterEditsNeedAWatch() {
+        Sample s = sample();
+        long id = subscribe("registrar", "예전 전체", "WEBHOOK", hookUrl(), null);   // 감시 필수 전에 만든 구독 (필터 없음 = 전체)
+        assertThat(get("registrar", "/api/v1/digests/" + id).get("filters").toString())
+                .isEqualTo("{\"watchIds\":[],\"sourceIds\":[],\"topics\":[],\"companyIds\":[]}");
+
+        // 발송은 그대로: 미리보기·즉시 전송 모두 전체 4건
+        assertThat(read(post("registrar", "/api/v1/digests/" + id + "/preview", "").getBody()).get("documentCount").asInt())
+                .isEqualTo(4);
+        JsonNode run = read(post("registrar", "/api/v1/digests/" + id + "/send-now", "").getBody());
+        assertThat(run.get("status").asText()).isEqualTo("SENT");
+        assertThat(run.get("documentCount").asInt()).isEqualTo(4);
+        assertThat(hookBodies).hasSize(1);
+
+        // 필터를 건드리지 않는 수정(끄기·이름·시각)은 된다. 필터는 그대로 비어 있다
+        ResponseEntity<String> renamed = call("registrar", HttpMethod.PUT, "/api/v1/digests/" + id,
+                "{\"name\":\"예전 전체 (수정)\",\"hourKst\":9,\"enabled\":false}");
+        assertThat(renamed.getStatusCode()).as(renamed.getBody()).isEqualTo(HttpStatus.OK);
+        assertThat(read(renamed.getBody()).get("filters").get("watchIds").toString()).isEqualTo("[]");
+        assertThat(read(renamed.getBody()).get("enabled").asBoolean()).isFalse();
+
+        // 필터를 보내면 감시가 있어야 한다
+        ResponseEntity<String> topicsOnly = call("registrar", HttpMethod.PUT, "/api/v1/digests/" + id,
+                "{\"filters\":{\"topics\":[\"정책·규제\"]}}");
+        assertThat(topicsOnly.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(read(topicsOnly.getBody()).get("message").asText()).isEqualTo("키워드 감시를 하나 이상 골라 주세요.");
+        ResponseEntity<String> withWatch = call("registrar", HttpMethod.PUT, "/api/v1/digests/" + id,
+                "{\"enabled\":true,\"filters\":{\"watchIds\":[" + s.watchOwn() + "]}}");
+        assertThat(withWatch.getStatusCode()).as(withWatch.getBody()).isEqualTo(HttpStatus.OK);
+        jdbc.sql("UPDATE digest_subscription SET last_sent_at = NULL WHERE id = ?").param(id).update();
+        JsonNode p = read(post("registrar", "/api/v1/digests/" + id + "/preview", "").getBody());
+        assertThat(p.get("documentCount").asInt()).isEqualTo(2);                     // 자사 보도 감시에 걸린 2건
+        assertThat(p.get("text").asText()).contains("*감시: 자사 보도*").doesNotContain("지원사업 공고");
     }
 
     @Test
