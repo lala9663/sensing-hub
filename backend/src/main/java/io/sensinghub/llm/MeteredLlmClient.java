@@ -55,6 +55,25 @@ public class MeteredLlmClient implements LlmClient {
 
     @Override
     public Response chat(String system, List<Message> messages, List<Tool> tools, boolean allowTools) {
+        return metered(() -> inner.chat(system, messages, tools, allowTools));
+    }
+
+    /**
+     * 스트리밍도 호출 한 번으로 같게 센다 (쉬는 중 확인·예약·429 쉬기·토큰). 스트리밍이 실패해 한 번에 받기로 다시 보내면
+     * ({@link LlmClient#chatStreaming}) 그 호출도 따로 센다 — 실패한 스트림은 errors, 다시 보낸 호출은 calls.
+     */
+    @Override
+    public Response stream(String system, List<Message> messages, List<Tool> tools, boolean allowTools,
+                           StreamListener listener) {
+        return metered(() -> inner.stream(system, messages, tools, allowTools, listener));
+    }
+
+    @Override
+    public boolean streams() {
+        return inner.streams();
+    }
+
+    private Response metered(Supplier<Response> call) {
         Optional<Pause> pause = safely(() -> ledger.cooldown(model)).flatMap(p -> p);
         if (pause.isPresent()) {
             throw new LlmException(Kind.RATE_LIMITED, message(pause.get(), ZonedDateTime.now(KST)), null,
@@ -63,7 +82,7 @@ public class MeteredLlmClient implements LlmClient {
         LocalDate day = safely(() -> ledger.reserve(model, purpose)).orElse(null);
         Response r;
         try {
-            r = inner.chat(system, messages, tools, allowTools);
+            r = call.get();
         } catch (LlmException e) {
             if (e.kind() == Kind.RATE_LIMITED && e.rateLimit() != null) {
                 write(day, () -> ledger.rateLimited(day, model, purpose));

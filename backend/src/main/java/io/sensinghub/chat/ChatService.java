@@ -13,7 +13,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -30,6 +29,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
+import io.sensinghub.chat.ChatFollowUps.FollowUp;
 import io.sensinghub.chat.ChatTools.Outcome;
 import io.sensinghub.chat.ChatTools.Ref;
 import io.sensinghub.chat.ChatTools.Refs;
@@ -58,6 +58,12 @@ import io.sensinghub.llm.LlmException;
  *       (USER와 답 두 줄, 답 meta.mode KEYWORD·llmCalls 0). 하루 호출 한도를 아끼고 답이 바로 나온다.</li>
  *   <li>"네이버 - 검색어" 형식({@link ChatShortcuts#naverQuery})은 화면이 네이버 결과를 직접 보여 준다 (표시 전용).
  *       이 경로로 오면 저장·LLM 호출 없이 400 NAVER_DISPLAY_ONLY.</li>
+ *   <li>스트리밍({@link #begin} → {@link #run} with stream): 같은 턴을 돌리며 {@link TurnEvents}로 단계(질문을 살펴보는 중 → 도구별
+ *       "수집 기사 검색 중…" → 근거를 정리하는 중)와 답 글 조각을 흘려보낸다. 저장·근거·답은 한 번에 받기와 똑같다 (끝나면 화면이 최종 답으로 바꾼다).
+ *       도구 호출로 끝난 LLM 응답에 섞여 온 글은 reset으로 버린다. 키워드 바로 검색·오류 안내는 조각 없이 바로 답한다.</li>
+ *   <li>답마다 추천 후속 질문 칩({@link ChatFollowUps}, LLM 호출 없이 규칙)을 meta.followUps에 저장한다. 오류 답에는 없다.</li>
+ *   <li>도구에는 앞 답의 근거({@link #previousCitations})를 넘겨, "그중 ~만"이 새로 찾지 않고 그 안에서 거르게 한다
+ *       (search_documents within_previous).</li>
  * </ul>
  */
 @Service
@@ -101,7 +107,30 @@ public class ChatService {
      * 등, 오류가 아니면 null). 화면은 안내 문구가 아니라 이 값으로 오류 카드의 제목·도움말을 고른다 (문구는 바뀔 수 있다).
      */
     public record MessageView(long id, String role, String content, OffsetDateTime createdAt, boolean error,
-                              List<CitationView> citations, List<ToolUseView> tools, String mode, String errorKind) {
+                              List<CitationView> citations, List<ToolUseView> tools, String mode, String errorKind,
+                              List<FollowUp> followUps) {
+    }
+
+    /**
+     * 스트리밍 턴의 중간 알림 ({@link #run}). stage: READING(질문을 살펴보는 중) | TOOL(도구 실행 — tool에 이름) | COMPOSING(근거를 정리하는 중).
+     * delta: 답 글 조각. reset: 지금까지 보낸 조각을 버린다 (도구 호출로 끝났거나 스트림이 끊겨 한 번에 받기로 다시 받는다).
+     */
+    public interface TurnEvents {
+
+        TurnEvents NONE = new TurnEvents() { };
+
+        default void stage(String stage, String tool, String label) {
+        }
+
+        default void delta(String text) {
+        }
+
+        default void reset() {
+        }
+    }
+
+    /** 검사를 마치고 대화를 잡은(같은 대화에 다른 질문을 받지 않는) 질문. {@link #run} 또는 {@link #cancel}로 놓는다. */
+    public record Pending(CurrentUser user, SessionView session, String text) {
     }
 
     public record SessionDetail(SessionView session, List<MessageView> messages) {
@@ -122,12 +151,15 @@ public class ChatService {
     private final FeaturedKeywordService featuredKeywords;
     private final int maxToolRounds;
     private final int historyTurns;
-    private final Map<Long, ReentrantLock> locks = new ConcurrentHashMap<>();
+    private final boolean streaming;
+    /** 답하는 중인 대화 (스트리밍은 받은 스레드와 답하는 스레드가 달라 스레드에 묶인 잠금 대신 집합으로 잡는다). */
+    private final Set<Long> busy = ConcurrentHashMap.newKeySet();
 
     public ChatService(JdbcClient jdbc, ObjectMapper json, LlmClient llm, ChatTools tools,
                        FeaturedKeywordService featuredKeywords,
                        @Value("${sensing.chat.max-tool-rounds:4}") int maxToolRounds,
-                       @Value("${sensing.chat.history-turns:6}") int historyTurns) {
+                       @Value("${sensing.chat.history-turns:6}") int historyTurns,
+                       @Value("${sensing.chat.stream:true}") boolean streaming) {
         this.jdbc = jdbc;
         this.json = json;
         this.llm = llm;
@@ -135,6 +167,7 @@ public class ChatService {
         this.featuredKeywords = featuredKeywords;
         this.maxToolRounds = Math.max(1, maxToolRounds);
         this.historyTurns = Math.max(0, historyTurns);
+        this.streaming = streaming;
     }
 
     public Status status(CurrentUser user) {
@@ -178,7 +211,16 @@ public class ChatService {
 
     // ------------------------------------------------------------------ 메시지 보내기
 
+    /** 질문 하나 → 답 하나 (한 번에 받기, POST /messages). */
     public TurnResult send(CurrentUser user, long sessionId, String content) {
+        return run(begin(user, sessionId, content), TurnEvents.NONE, false);
+    }
+
+    /**
+     * 보내기 전 검사(세션 404, 빈 글·길이·네이버 형식 400)를 하고 대화를 잡는다 (같은 대화에 답하는 중이면 409).
+     * 스트리밍은 이 검사를 요청 스레드에서 끝내 오류를 보통 JSON 응답으로 돌려준 뒤 답은 다른 스레드에서 {@link #run}한다.
+     */
+    public Pending begin(CurrentUser user, long sessionId, String content) {
         SessionView session = session(user, sessionId);
         String text = content == null ? "" : content.strip();
         if (text.isEmpty()) {
@@ -191,23 +233,36 @@ public class ChatService {
         if (ChatShortcuts.naverQuery(text).isPresent()) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "NAVER_DISPLAY_ONLY", NAVER_DISPLAY_ONLY);
         }
-        ReentrantLock lock = locks.computeIfAbsent(sessionId, k -> new ReentrantLock());
-        if (!lock.tryLock()) {
+        if (!busy.add(sessionId)) {
             throw ApiException.conflict("앞 질문에 답하는 중입니다. 답이 온 뒤에 다시 보내 주세요.");
         }
+        return new Pending(user, session, text);
+    }
+
+    /**
+     * 잡아 둔 질문에 답하고 대화를 놓는다.
+     * @param stream true면 LLM 답 글을 스트리밍으로 받아 events.delta로 흘려보낸다 (설정 sensing.chat.stream=false면 한 번에 받는다)
+     */
+    public TurnResult run(Pending pending, TurnEvents events, boolean stream) {
         try {
-            return turn(user, session, text);
+            return turn(pending.user(), pending.session(), pending.text(), events == null ? TurnEvents.NONE : events,
+                    stream && streaming);
         } finally {
-            lock.unlock();
+            busy.remove(pending.session().id());
         }
+    }
+
+    /** 잡아 둔 질문을 답하지 않고 놓는다 (스트리밍을 시작하지 못했을 때). */
+    public void cancel(Pending pending) {
+        busy.remove(pending.session().id());
     }
 
     /** 한 턴의 답. mode: null(LLM 답) 또는 {@link #MODE_KEYWORD}. meta.error가 있으면 오류 안내 답이다. */
     private record Answer(String content, List<Ref> cited, List<ToolUseView> uses, Map<String, Object> meta,
-                          String mode) {
+                          String mode, List<FollowUp> followUps) {
     }
 
-    private TurnResult turn(CurrentUser user, SessionView session, String text) {
+    private TurnResult turn(CurrentUser user, SessionView session, String text, TurnEvents events, boolean stream) {
         long sessionId = session.id();
         SecretMasker.Result masked = SecretMasker.mask(text);
         // 키로 보이는 값을 지운 글은 LLM 경로로 보낸다 (저장하지 않았다고 안내한다)
@@ -225,7 +280,7 @@ public class ChatService {
 
         Answer answer = keyword.isPresent()
                 ? keywordAnswer(user, masked.text(), keyword.get())
-                : llmAnswer(user, sessionId, history, masked.text());
+                : llmAnswer(user, sessionId, history, masked.text(), events, stream);
         long answerId = insert(sessionId, "ASSISTANT", answer.content(), null, answer.meta());
         for (Ref ref : answer.cited()) {
             jdbc.sql("""
@@ -241,10 +296,11 @@ public class ChatService {
 
         OffsetDateTime now = OffsetDateTime.now();
         MessageView userView = new MessageView(userMessageId, "USER", masked.text(), now, false, List.of(), List.of(),
-                null, null);
+                null, null, List.of());
         String errorKind = errorKind(answer.meta());
         MessageView answerView = new MessageView(answerId, "ASSISTANT", answer.content(), now, errorKind != null,
-                answer.cited().stream().map(ChatService::citationView).toList(), answer.uses(), answer.mode(), errorKind);
+                answer.cited().stream().map(ChatService::citationView).toList(), answer.uses(), answer.mode(), errorKind,
+                answer.followUps());
         return new TurnResult(session(user, sessionId), userView, answerView,
                 masked.masked() > 0 ? SECRET_NOTICE : null);
     }
@@ -297,8 +353,40 @@ public class ChatService {
         meta.put("linkLabel", "문서 화면에서 더 보기");
         List<ToolUseView> uses = List.of(new ToolUseView(ChatTools.SEARCH_DOCUMENTS,
                 ChatTools.label(ChatTools.SEARCH_DOCUMENTS), true, (String) meta.get("link"), (String) meta.get("linkLabel")));
-        return new Answer(out.toString(), found.hits().stream().map(ChatTools.QuickHit::ref).toList(), uses, meta,
-                MODE_KEYWORD);
+        List<Ref> cited = found.hits().stream().map(ChatTools.QuickHit::ref).toList();
+        List<FollowUp> followUps = ChatFollowUps.suggest(List.of(found.facts()), cited);
+        putFollowUps(meta, followUps);
+        return new Answer(out.toString(), cited, uses, meta, MODE_KEYWORD, followUps);
+    }
+
+    /** meta.followUps: [{text, url?}] (화면이 대화를 다시 열 때 그린다). */
+    private static void putFollowUps(Map<String, Object> meta, List<FollowUp> followUps) {
+        if (followUps.isEmpty()) {
+            return;
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (FollowUp f : followUps) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("text", f.text());
+            if (f.url() != null) {
+                m.put("url", f.url());
+            }
+            out.add(m);
+        }
+        meta.put("followUps", out);
+    }
+
+    private static List<FollowUp> followUps(Map<String, Object> meta) {
+        if (!(meta.get("followUps") instanceof List<?> list)) {
+            return List.of();
+        }
+        List<FollowUp> out = new ArrayList<>();
+        for (Object o : list) {
+            if (o instanceof Map<?, ?> m && m.get("text") instanceof String text && !text.isBlank()) {
+                out.add(new FollowUp(text, m.get("url") instanceof String url ? url : null));
+            }
+        }
+        return out;
     }
 
     /** "[1] 제목 — 언론사 · 2026-10-16 09:00" (화면은 이 줄을 원문 링크가 달린 근거 줄로 바꿔 그린다). */
@@ -317,25 +405,67 @@ public class ChatService {
         return line.toString();
     }
 
-    /** LLM 경로: (도구 호출 → 실행)을 최대 maxToolRounds번 한 뒤 답. 중간 단계(도구 호출·결과)는 바로 저장한다. */
-    private Answer llmAnswer(CurrentUser user, long sessionId, List<Message> history, String text) {
+    static final String STAGE_READING = "READING";
+    static final String STAGE_TOOL = "TOOL";
+    static final String STAGE_COMPOSING = "COMPOSING";
+
+    /** 스트림 조각을 TurnEvents로 넘긴다. 조각을 보낸 뒤에만 reset을 보낸다. */
+    private static final class Relay implements LlmClient.StreamListener {
+
+        private final TurnEvents events;
+        private boolean sent;
+
+        Relay(TurnEvents events) {
+            this.events = events;
+        }
+
+        @Override
+        public void text(String delta) {
+            if (delta != null && !delta.isEmpty()) {
+                sent = true;
+                events.delta(delta);
+            }
+        }
+
+        @Override
+        public void reset() {
+            if (sent) {
+                sent = false;
+                events.reset();
+            }
+        }
+    }
+
+    /**
+     * LLM 경로: (도구 호출 → 실행)을 최대 maxToolRounds번 한 뒤 답. 중간 단계(도구 호출·결과)는 바로 저장한다.
+     * stream이면 LLM을 스트리밍으로 부르고 단계·글 조각을 events로 보낸다 (스트리밍이 안 되면 LlmClient가 한 번에 받기로 바꾼다).
+     */
+    private Answer llmAnswer(CurrentUser user, long sessionId, List<Message> history, String text, TurnEvents events,
+                             boolean stream) {
         List<Message> convo = new ArrayList<>(history);
         convo.add(Message.user(text));
 
         String system = ChatPrompt.system(user, ZonedDateTime.now());
         List<LlmClient.Tool> definitions = tools.definitions();
+        ChatTools.Context context = new ChatTools.Context(previousCitations(sessionId));
         Refs refs = new Refs();
         List<ToolUseView> uses = new ArrayList<>();
+        List<ChatFollowUps.Facts> facts = new ArrayList<>();
+        Relay relay = new Relay(events);
         int inputTokens = 0;
         int outputTokens = 0;
         int calls = 0;
         int rounds = 0;
         String answer;
         String error = null;
+        if (stream) {
+            events.stage(STAGE_READING, null, "질문을 살펴보는 중…");
+        }
         try {
             while (true) {
                 boolean allowTools = rounds < maxToolRounds;
-                LlmClient.Response r = llm.chat(system, convo, definitions, allowTools);
+                LlmClient.Response r = stream ? llm.chatStreaming(system, convo, definitions, allowTools, relay)
+                        : llm.chat(system, convo, definitions, allowTools);
                 calls++;
                 inputTokens += number(r.usage(), "inputTokens");
                 outputTokens += number(r.usage(), "outputTokens");
@@ -348,6 +478,7 @@ public class ChatService {
                     }
                     break;
                 }
+                relay.reset();   // 도구 호출과 함께 온 글은 답이 아니다
                 rounds++;
                 List<ToolCall> run = requested.size() > MAX_CALLS_PER_ROUND
                         ? requested.subList(0, MAX_CALLS_PER_ROUND) : requested;
@@ -356,7 +487,13 @@ public class ChatService {
                 insert(sessionId, "ASSISTANT", r.text() == null ? "" : r.text(), toolCallsJson(run), roundMeta);
                 convo.add(Message.assistant(r.text(), run));
                 for (ToolCall call : run) {
-                    Outcome outcome = tools.execute(user, call, refs);
+                    if (stream) {
+                        events.stage(STAGE_TOOL, call.name(), ChatTools.stageLabel(call));
+                    }
+                    Outcome outcome = tools.execute(user, call, refs, context);
+                    if (outcome.facts() != null) {
+                        facts.add(outcome.facts());
+                    }
                     Map<String, Object> meta = new LinkedHashMap<>();
                     meta.put("toolCallId", call.id());
                     meta.put("name", call.name());
@@ -370,6 +507,9 @@ public class ChatService {
                     uses.add(new ToolUseView(call.name(), ChatTools.label(call.name()), outcome.ok(), outcome.link(),
                             outcome.linkLabel()));
                 }
+                if (stream) {
+                    events.stage(STAGE_COMPOSING, null, "근거를 정리하는 중…");
+                }
             }
         } catch (LlmException e) {
             log.warn("chat LLM call failed: {} (HTTP {}) {}", e.kind(), e.httpStatus(), e.detail());
@@ -379,16 +519,21 @@ public class ChatService {
 
         // 도구를 하나도 부르지 않은 후속 답만 앞 답의 번호를 이어 쓴다 (등록·상태 답에 붙은 엉뚱한 [1]이 옛 기사로 이어지지 않게)
         List<Ref> cited = error != null ? List.of()
-                : rounds == 0 ? carriedCitations(sessionId, answer) : citations(answer, refs);
+                : rounds == 0 ? carriedCitations(context.previous(), answer) : citations(answer, refs);
+        List<FollowUp> followUps = error != null ? List.of() : ChatFollowUps.suggest(facts, cited);
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("model", llm.describe());
         meta.put("llmCalls", calls);
         meta.put("toolRounds", rounds);
         meta.put("usage", Map.of("inputTokens", inputTokens, "outputTokens", outputTokens));
+        if (stream) {
+            meta.put("streamed", true);
+        }
         if (error != null) {
             meta.put("error", error);
         }
-        return new Answer(answer, cited, uses, meta, null);
+        putFollowUps(meta, followUps);
+        return new Answer(answer, cited, uses, meta, null, followUps);
     }
 
     /**
@@ -419,29 +564,38 @@ public class ChatService {
      * 도구를 부르지 않은 후속 답("1번 기사는 어디 거야?")의 [n]은 화면에 보이던 앞 답의 번호다: 근거가 있는 가장 최근 답에서 같은 번호를 가져온다.
      * 번호를 쓰지 않았으면 근거 없음.
      */
-    private List<Ref> carriedCitations(long sessionId, String answer) {
+    private static List<Ref> carriedCitations(List<Ref> previous, String answer) {
         Set<Integer> used = refNumbers(answer);
-        if (used.isEmpty()) {
+        if (used.isEmpty() || previous.isEmpty()) {
             return List.of();
         }
+        Map<Integer, Ref> byNo = new LinkedHashMap<>();
+        previous.forEach(r -> byNo.put(r.no(), r));
+        return used.stream().map(byNo::get).filter(Objects::nonNull).toList();
+    }
+
+    /**
+     * 앞 답의 근거: 이 대화에서 근거가 있는 가장 최근 답의 chat_citation (번호 순). 키워드 바로 검색 답도 근거를 남기므로 포함된다.
+     * 도구 없이 앞 번호를 이어 쓴 답("1번은 어디 기사야?" → [1]만)은 건너뛴다: 그 답이 가리킨 목록은 그 앞 답의 것이다.
+     * 후속 답의 [n] 이어 쓰기와 "그중 ~만"(search_documents within_previous)이 쓴다.
+     */
+    List<Ref> previousCitations(long sessionId) {
         Long messageId = jdbc.sql("""
                 SELECT c.message_id FROM chat_citation c JOIN chat_message m ON m.id = c.message_id
-                WHERE m.session_id = ? ORDER BY c.message_id DESC LIMIT 1
+                WHERE m.session_id = ?
+                  AND (m.meta->>'mode' IS NOT NULL OR COALESCE((m.meta->>'toolRounds')::int, 1) > 0)
+                ORDER BY c.message_id DESC LIMIT 1
                 """).param(sessionId).query(Long.class).optional().orElse(null);
         if (messageId == null) {
             return List.of();
         }
-        Map<Integer, Ref> previous = new LinkedHashMap<>();
-        jdbc.sql("""
+        return jdbc.sql("""
                 SELECT ref_no, kind, document_id, issue_id, title_snapshot, url_snapshot, source_label, published_at
-                FROM chat_citation WHERE message_id = ?
-                """).param(messageId).query(rs -> {
-                    previous.put(rs.getInt("ref_no"), new Ref(rs.getInt("ref_no"), rs.getString("kind"),
-                            rs.getObject("document_id", Long.class), rs.getObject("issue_id", Long.class),
-                            rs.getString("title_snapshot"), rs.getString("url_snapshot"), rs.getString("source_label"),
-                            rs.getObject("published_at", OffsetDateTime.class)));
-                });
-        return used.stream().map(previous::get).filter(Objects::nonNull).toList();
+                FROM chat_citation WHERE message_id = ? ORDER BY ref_no
+                """).param(messageId).query((rs, n) -> new Ref(rs.getInt("ref_no"), rs.getString("kind"),
+                        rs.getObject("document_id", Long.class), rs.getObject("issue_id", Long.class),
+                        rs.getString("title_snapshot"), rs.getString("url_snapshot"), rs.getString("source_label"),
+                        rs.getObject("published_at", OffsetDateTime.class))).list();
     }
 
     /** 답 meta.error (오류 종류 이름, 없으면 null). 문자열이 아닌 값이 들어 있어도 종류를 모르는 오류로 본다. */
@@ -552,7 +706,7 @@ public class ChatService {
                 case "USER" -> {
                     pending = new ArrayList<>();
                     out.add(new MessageView(r.id(), "USER", r.content(), r.createdAt(), false, List.of(), List.of(), null,
-                            null));
+                            null, List.of()));
                 }
                 case "TOOL" -> {
                     String name = String.valueOf(r.meta().get("name"));
@@ -568,7 +722,8 @@ public class ChatService {
                         }
                         String errorKind = errorKind(r.meta());
                         out.add(new MessageView(r.id(), "ASSISTANT", r.content(), r.createdAt(), errorKind != null,
-                                citations.getOrDefault(r.id(), List.of()), List.copyOf(pending), mode, errorKind));
+                                citations.getOrDefault(r.id(), List.of()), List.copyOf(pending), mode, errorKind,
+                                followUps(r.meta())));
                         pending = new ArrayList<>();
                     }
                 }

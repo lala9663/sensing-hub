@@ -18,6 +18,15 @@ keyword	반도체?	NONE
 keyword	반도체 알려 줘	NONE
 keyword	반도체 기사 찾아줘	NONE
 keyword	테슬라 어때	NONE
+# 앞 답의 목록을 가리키는 말은 키워드가 아니다 (LLM이 search_documents within_previous로 앞 근거 안에서 거른다). 붙여 쓴 낱말(이중고)은 그대로
+keyword	이 중 삼성전자 관련만	NONE
+keyword	그중에서 이데일리	NONE
+keyword	위 기사 중 이데일리 것만	NONE
+keyword	앞 결과에서 반도체만	NONE
+keyword	이 중 정책·규제만	NONE
+keyword	방금 목록 반도체	NONE
+keyword	반도체 이중고	반도체 이중고
+keyword	이중국적	이중국적
 keyword	뭐야	NONE
 keyword	오늘 이슈	NONE
 keyword	주요 이슈	NONE

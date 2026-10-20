@@ -1,6 +1,9 @@
 package io.sensinghub.llm;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -13,6 +16,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -101,6 +109,164 @@ final class LlmHttp {
                 continue;
             }
             throw error(status, response.body(), response.headers().firstValue("retry-after").orElse(null));
+        }
+    }
+
+    /** SSE 이벤트 하나. event: 이벤트 이름 (없으면 null — OpenAI 호환은 이름 없이 data만 보낸다). */
+    interface SseHandler {
+        void event(String event, String data);
+    }
+
+    /** 스트리밍이 형식 문제(400·스트림 해석 실패)로 실패한 뒤 스트리밍을 쉬는 시간. 그동안은 한 번에 받기만 한다 (호출을 두 번 쓰지 않게). */
+    static final Duration STREAM_PAUSE = Duration.ofMinutes(10);
+    private static final ScheduledExecutorService WATCHDOG = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "llm-stream-watchdog");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile long streamPausedUntil = System.nanoTime();
+
+    /** 스트리밍을 쉬는 중이 아닌가 ({@link #streamFailed}). */
+    boolean streamingAvailable() {
+        return System.nanoTime() - streamPausedUntil >= 0;
+    }
+
+    /**
+     * 스트리밍 실패를 알린다. 요청 자체를 거절했거나(BAD_REQUEST — 스트리밍을 모르는 게이트웨이) 스트림을 해석하지 못했으면(BAD_RESPONSE)
+     * {@link #STREAM_PAUSE} 동안 스트리밍을 끈다. 서버 오류·연결 끊김은 일시적이라 끄지 않는다.
+     */
+    void streamFailed(LlmException e) {
+        if (e.kind() == Kind.BAD_REQUEST || e.kind() == Kind.BAD_RESPONSE) {
+            streamPausedUntil = System.nanoTime() + STREAM_PAUSE.toNanos();
+            log.warn("llm streaming paused for {} min after {}: {}", STREAM_PAUSE.toMinutes(), e.kind(), e.detail());
+        }
+    }
+
+    /**
+     * SSE로 답하는 POST. 이벤트를 받는 대로 handler에 넘긴다 (handler가 던진 LlmException은 그대로 나간다).
+     * 2xx가 아니면 {@link #post}와 같은 오류를 던진다 (재시도하지 않는다 — 5xx면 {@link LlmClient#chatStreaming}이 한 번에 받기로 다시 보낸다).
+     * 제공자가 stream을 무시하고 JSON으로 답했으면 그 JSON을 돌려주고(호출자가 한 번에 받은 답처럼 해석한다), SSE를 다 읽었으면 null.
+     * 제한 시간은 요청부터 스트림 끝까지 전체다: 넘으면 스트림을 닫고 TIMEOUT.
+     */
+    JsonNode stream(String url, Map<String, String> headers, Object body, SseHandler handler) {
+        String payload;
+        try {
+            payload = json.writeValueAsString(body);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+        long started = System.nanoTime();
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(timeout)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8));
+        headers.forEach(request::header);
+        HttpResponse<InputStream> response;
+        try {
+            response = client.send(request.build(), HttpResponse.BodyHandlers.ofInputStream());
+        } catch (HttpTimeoutException e) {
+            log.warn("llm {} (stream) timed out after {}s", url, timeout.toSeconds());
+            throw timeoutError(e.toString());
+        } catch (IOException e) {
+            log.warn("llm {} (stream) connection failed: {}", url, e.toString());
+            throw new LlmException(Kind.NETWORK, "LLM 서버에 연결하지 못했습니다. 잠시 후 다시 시도하거나 관리자에게 알려 주세요.",
+                    null, e.toString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new LlmException(Kind.NETWORK, "LLM 호출이 중단되었습니다.", null, e.toString());
+        }
+        int status = response.statusCode();
+        InputStream in = response.body();
+        if (status < 200 || status >= 300) {
+            String text = readAll(in);
+            log.warn("llm {} (stream) HTTP {}: {}", url, status, head(text));
+            throw error(status, text, response.headers().firstValue("retry-after").orElse(null));
+        }
+        String type = response.headers().firstValue("content-type").orElse("").toLowerCase(Locale.ROOT);
+        if (!type.contains("text/event-stream")) {
+            String text = readAll(in);
+            try {
+                return json.readTree(text);
+            } catch (JsonProcessingException e) {
+                throw new LlmException(Kind.BAD_RESPONSE, "LLM 응답을 해석하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                        status, head(text));
+            }
+        }
+        long left = timeout.toNanos() - (System.nanoTime() - started);
+        AtomicBoolean timedOut = new AtomicBoolean();
+        ScheduledFuture<?> watchdog = WATCHDOG.schedule(() -> {
+            timedOut.set(true);
+            closeQuietly(in);
+        }, Math.max(1, left), TimeUnit.NANOSECONDS);
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            String event = null;
+            StringBuilder data = null;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isEmpty()) {
+                    if (data != null) {
+                        handler.event(event, data.toString());
+                    }
+                    event = null;
+                    data = null;
+                    continue;
+                }
+                if (line.startsWith(":")) {
+                    continue;   // 주석 (keep-alive)
+                }
+                int colon = line.indexOf(':');
+                String field = colon < 0 ? line : line.substring(0, colon);
+                String value = colon < 0 ? "" : line.substring(colon + 1);
+                if (value.startsWith(" ")) {
+                    value = value.substring(1);
+                }
+                if ("event".equals(field)) {
+                    event = value;
+                } else if ("data".equals(field)) {
+                    data = data == null ? new StringBuilder(value) : data.append('\n').append(value);
+                }
+            }
+            if (timedOut.get()) {   // 닫힌 스트림은 끝(EOF)처럼 읽히기도 한다
+                log.warn("llm {} (stream) timed out after {}s", url, timeout.toSeconds());
+                throw timeoutError("stream closed by watchdog");
+            }
+            if (data != null) {
+                handler.event(event, data.toString());
+            }
+            return null;
+        } catch (IOException e) {
+            if (timedOut.get()) {
+                log.warn("llm {} (stream) timed out after {}s", url, timeout.toSeconds());
+                throw timeoutError(e.toString());
+            }
+            log.warn("llm {} (stream) broke: {}", url, e.toString());
+            throw new LlmException(Kind.NETWORK, "LLM 응답을 받다가 연결이 끊겼습니다. 잠시 후 다시 시도해 주세요.", status, e.toString());
+        } finally {
+            watchdog.cancel(false);
+        }
+    }
+
+    private LlmException timeoutError(String detail) {
+        return new LlmException(Kind.TIMEOUT, "LLM 응답이 " + timeout.toSeconds()
+                + "초 안에 오지 않았습니다. 잠시 후 다시 시도해 주세요.", null, detail);
+    }
+
+    /** 오류 본문 (앞 64KB만). */
+    private static String readAll(InputStream in) {
+        try (InputStream body = in) {
+            byte[] bytes = body.readNBytes(64 * 1024);
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    private static void closeQuietly(InputStream in) {
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // 이미 닫혔다
         }
     }
 

@@ -24,7 +24,16 @@ import com.sun.net.httpserver.HttpServer;
  */
 public final class MockLlmServer implements AutoCloseable {
 
-    public record Reply(int status, String body, Map<String, String> headers, long delayMillis) {
+    /**
+     * events가 있으면 SSE(text/event-stream)로 답한다: 이벤트마다 빈 줄을 붙여 보내고 flush, 사이에 eventDelayMillis만큼 쉰다
+     * (스트리밍이 정말 조금씩 오는지 볼 수 있게). 이벤트는 "data: {...}" 또는 "event: x\ndata: {...}" 글 그대로다.
+     */
+    public record Reply(int status, String body, Map<String, String> headers, long delayMillis, List<String> events,
+                        long eventDelayMillis) {
+
+        public Reply(int status, String body, Map<String, String> headers, long delayMillis) {
+            this(status, body, headers, delayMillis, null, 0);
+        }
 
         public static Reply ok(String body) {
             return new Reply(200, body, Map.of(), 0);
@@ -32,6 +41,14 @@ public final class MockLlmServer implements AutoCloseable {
 
         public static Reply status(int status, String body) {
             return new Reply(status, body, Map.of(), 0);
+        }
+
+        public static Reply sse(List<String> events) {
+            return sse(0, events);
+        }
+
+        public static Reply sse(long eventDelayMillis, List<String> events) {
+            return new Reply(200, "", Map.of(), 0, List.copyOf(events), eventDelayMillis);
         }
     }
 
@@ -91,9 +108,29 @@ public final class MockLlmServer implements AutoCloseable {
                         Thread.currentThread().interrupt();
                     }
                 }
+                reply.headers().forEach((k, v) -> exchange.getResponseHeaders().add(k, v));
+                if (reply.events() != null) {
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    try {
+                        exchange.sendResponseHeaders(reply.status(), 0);   // chunked
+                        try (OutputStream os = exchange.getResponseBody()) {
+                            for (int i = 0; i < reply.events().size(); i++) {
+                                if (i > 0 && reply.eventDelayMillis() > 0) {
+                                    Thread.sleep(reply.eventDelayMillis());
+                                }
+                                os.write((reply.events().get(i) + "\n\n").getBytes(StandardCharsets.UTF_8));
+                                os.flush();
+                            }
+                        }
+                    } catch (IOException e) {
+                        // 클라이언트가 먼저 끊었다
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return;
+                }
                 byte[] out = reply.body().getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().add("Content-Type", "application/json");
-                reply.headers().forEach((k, v) -> exchange.getResponseHeaders().add(k, v));
                 try {
                     exchange.sendResponseHeaders(reply.status(), out.length);
                     try (OutputStream os = exchange.getResponseBody()) {
@@ -178,6 +215,80 @@ public final class MockLlmServer implements AutoCloseable {
         choice.put("finish_reason", "tool_calls");
         root.putObject("usage").put("prompt_tokens", 100).put("completion_tokens", 10);
         return root.toString();
+    }
+
+    // ------------------------------------------------------------------ OpenAI 호환 스트리밍 (SSE chat.completion.chunk)
+
+    /** 글 조각마다 delta.content, 끝에 finish_reason stop, 사용량만 든 조각, [DONE]. */
+    public static List<String> openAiStreamText(String... pieces) {
+        List<String> events = new ArrayList<>();
+        for (int i = 0; i < pieces.length; i++) {
+            ObjectNode chunk = chunk();
+            ObjectNode delta = ((ObjectNode) chunk.get("choices").get(0)).putObject("delta");
+            if (i == 0) {
+                delta.put("role", "assistant");
+            }
+            delta.put("content", pieces[i]);
+            events.add("data: " + chunk);
+        }
+        ObjectNode last = chunk();
+        ((ObjectNode) last.get("choices").get(0)).putObject("delta");
+        ((ObjectNode) last.get("choices").get(0)).put("finish_reason", "stop");
+        events.add("data: " + last);
+        events.add("data: " + usageChunk(120, 30));
+        events.add("data: [DONE]");
+        return events;
+    }
+
+    /**
+     * 도구 호출 하나를 여러 조각으로: 첫 조각에 id·이름(과 Gemini thought_signature가 있으면 extra_content), 이어서 arguments 조각들.
+     * Gemini처럼 index 없이 줄 수도 있다 (withIndex false).
+     */
+    public static List<String> openAiStreamToolCall(String id, String name, String thoughtSignature, boolean withIndex,
+                                                    String... argumentParts) {
+        List<String> events = new ArrayList<>();
+        for (int i = 0; i < Math.max(1, argumentParts.length); i++) {
+            ObjectNode chunk = chunk();
+            ObjectNode delta = ((ObjectNode) chunk.get("choices").get(0)).putObject("delta");
+            ObjectNode call = delta.putArray("tool_calls").addObject();
+            if (withIndex) {
+                call.put("index", 0);
+            }
+            ObjectNode fn = call.putObject("function");
+            if (i == 0) {
+                delta.put("role", "assistant");
+                call.put("id", id);
+                call.put("type", "function");
+                fn.put("name", name);
+                if (thoughtSignature != null) {
+                    call.putObject("extra_content").putObject("google").put("thought_signature", thoughtSignature);
+                }
+            }
+            fn.put("arguments", argumentParts.length == 0 ? "{}" : argumentParts[i]);
+            events.add("data: " + chunk);
+        }
+        ObjectNode last = chunk();
+        ((ObjectNode) last.get("choices").get(0)).putObject("delta");
+        ((ObjectNode) last.get("choices").get(0)).put("finish_reason", "tool_calls");
+        events.add("data: " + last);
+        events.add("data: " + usageChunk(100, 10));
+        events.add("data: [DONE]");
+        return events;
+    }
+
+    private static ObjectNode chunk() {
+        ObjectNode root = JSON.createObjectNode();
+        root.put("object", "chat.completion.chunk");
+        root.putArray("choices").addObject().put("index", 0);
+        return root;
+    }
+
+    private static ObjectNode usageChunk(int prompt, int completion) {
+        ObjectNode root = JSON.createObjectNode();
+        root.put("object", "chat.completion.chunk");
+        root.putArray("choices");
+        root.putObject("usage").put("prompt_tokens", prompt).put("completion_tokens", completion);
+        return root;
     }
 
     /** OpenAI 호환 /embeddings 응답. Gemini처럼 첫 항목의 index(0)는 빼고 준다. */

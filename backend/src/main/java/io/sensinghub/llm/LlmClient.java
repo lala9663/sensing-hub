@@ -73,6 +73,57 @@ public interface LlmClient {
         return chat(system, messages, tools, true);
     }
 
+    /** 스트리밍으로 받는 답 글 조각 ({@link #stream}). */
+    interface StreamListener {
+
+        StreamListener NONE = delta -> { };
+
+        /** 답 글 조각 (도착한 차례대로). */
+        void text(String delta);
+
+        /** 지금까지 보낸 조각을 버린다: 스트림이 중간에 끊겨 같은 요청을 한 번에 받기로 다시 보낸다 ({@link #chatStreaming}). */
+        default void reset() {
+        }
+    }
+
+    /** 지금 스트리밍으로 부를 수 있는가. 기본은 아니다 (스트리밍을 지원하지 않는 구현·잠시 꺼 둔 구현). */
+    default boolean streams() {
+        return false;
+    }
+
+    /**
+     * {@link #chat}과 같은 요청을 스트리밍으로 보내고, 답 글 조각을 받는 대로 listener에 넘긴다. 돌려주는 답은 chat과 같다
+     * (글 전체·도구 호출·사용량). 실패하면 LlmException을 던질 뿐 한 번에 받기로 바꾸지 않는다 — 그건 {@link #chatStreaming}이 한다.
+     * 기본 구현은 스트리밍 없이 chat (조각을 보내지 않는다).
+     */
+    default Response stream(String system, List<Message> messages, List<Tool> tools, boolean allowTools,
+                            StreamListener listener) {
+        return chat(system, messages, tools, allowTools);
+    }
+
+    /**
+     * 챗봇 스트리밍 경로: 스트리밍할 수 있으면 {@link #stream}, 스트리밍이 실패하면({@link LlmException#streamFallback})
+     * listener.reset() 뒤 같은 요청을 한 번에 받기({@link #chat})로 다시 보낸다. 스트리밍을 못 하면 처음부터 chat.
+     * 429·키 오류·시간 초과는 바꾸지 않고 그대로 던진다.
+     */
+    default Response chatStreaming(String system, List<Message> messages, List<Tool> tools, boolean allowTools,
+                                   StreamListener listener) {
+        if (!streams()) {
+            return chat(system, messages, tools, allowTools);
+        }
+        try {
+            return stream(system, messages, tools, allowTools, listener);
+        } catch (LlmException e) {
+            if (!e.streamFallback()) {
+                throw e;
+            }
+            org.slf4j.LoggerFactory.getLogger(LlmClient.class).warn("llm streaming failed ({}: {}), retrying without streaming",
+                    e.kind(), e.detail() == null ? e.getMessage() : e.detail());
+            listener.reset();
+            return chat(system, messages, tools, allowTools);
+        }
+    }
+
     /** 설정돼 있어 실제로 부를 수 있는가 (화면 안내용). */
     default boolean configured() {
         return true;
