@@ -139,7 +139,7 @@ public class NaverNewsService {
                 NaverSettings.SOURCE_LABEL, notice);
     }
 
-    /** 감시 키워드 하나로 네이버 최신 뉴스(날짜순) 한 쪽. 감시를 볼 수 있는 사람만(내 감시, ADMIN은 전체). */
+    /** 감시 키워드 하나로 네이버 최신 뉴스(날짜순) 한 쪽. 감시를 볼 수 있는 사람만(공용 감시는 누구나, 내 감시, ADMIN은 전체). */
     public LiveResult live(CurrentUser user, long watchId, String keyword, Integer display, Integer start) {
         WatchView watch = watches.get(user, watchId);
         if (!settings.enabled()) {

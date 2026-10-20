@@ -192,7 +192,9 @@
           <dt>태그</dt><dd>${tags(c.tags) || '-'}</dd>
           <dt>감시</dt><dd>${App.watchBadge(c.watchStatus, c.watchNaver)} ${c.watchStatusReason ? `<span class="muted small">${esc(c.watchStatusReason)}</span>` : ''}
             ${c.watchSourceId ? `<a class="small" href="#/documents${App.qs({ watch: c.watchSourceId })}">감시에 걸린 기사</a>` : ''}
-            ${c.watchSourceId && App.isAdmin() ? `<a class="small" href="#/admin/sources/${c.watchSourceId}">소스 #${c.watchSourceId}</a>` : ''}</dd>
+            ${c.watchSourceId && App.isAdmin() ? `<a class="small" href="#/admin/sources/${c.watchSourceId}">소스 #${c.watchSourceId}</a>` : ''}
+            ${c.watchStatus === 'EXCLUDED' && c.status === 'ACTIVE' ? `<div class="muted small">감시가 꺼져 있어 새로 수집되는 기사를 이 회사에 연결하지 않습니다${App.isAdmin()
+              ? ' (키워드 감시 화면의 "제외된 감시 보기" 또는 소스 화면에서 다시 켤 수 있습니다)' : ''}.</div>` : ''}</dd>
           <dt>신호 / HIGH</dt><dd>${App.fmtNum(c.signalCount)} / ${App.fmtNum(c.highSignalCount)}</dd>
           <dt>연결 문서</dt><dd>${App.fmtNum(c.documentCount)}</dd>
           ${biz ? `<dt>사업자 상태</dt><dd class="small">${esc(biz)}</dd>` : ''}

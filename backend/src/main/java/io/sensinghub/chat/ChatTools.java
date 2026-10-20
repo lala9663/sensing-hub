@@ -206,7 +206,7 @@ public class ChatTools {
                                 "limit", prop("integer", "최대 개수 (기본 10, 최대 20)")),
                                 List.of())),
                 new LlmClient.Tool(LIST_WATCHES,
-                        "내 키워드 감시 목록 (관리자는 전체): id, 이름, 키워드, 상태, 걸린 문서 수. "
+                        "키워드 감시 목록 (공용 감시 + 내 감시, 관리자는 전체. 제외된 감시는 뺌): id, 이름, 키워드, 상태, 걸린 문서 수. "
                                 + "감시 문서를 찾을 때 search_documents의 watch_id로 쓴다.",
                         object(Map.of(), List.of())),
                 new LlmClient.Tool(CREATE_WATCH,
@@ -541,14 +541,14 @@ public class ChatTools {
     }
 
     private Outcome listWatches(CurrentUser user) {
-        List<WatchView> list = watches.list(user).stream().filter(w -> !"EXCLUDED".equals(w.status())).toList();
+        List<WatchView> list = watches.list(user);   // 제외(EXCLUDED)된 감시는 빠져 있다
         List<Map<String, Object>> out = new ArrayList<>();
         for (WatchView w : list.stream().limit(MAX_WATCHES).toList()) {
             out.add(watchJson(w));
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("ok", true);
-        result.put("scope", user.role().atLeast(Role.ADMIN) ? "전체 감시 (관리자)" : "내가 만든 감시");
+        result.put("scope", user.role().atLeast(Role.ADMIN) ? "전체 감시 (관리자)" : "공용 감시(관리자가 만든 것) + 내가 만든 감시");
         result.put("count", list.size());
         result.put("watches", out);
         if (out.isEmpty()) {
@@ -578,6 +578,9 @@ public class ChatTools {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", w.id());
         m.put("name", w.name());
+        if (w.shared()) {
+            m.put("shared", true);
+        }
         m.put("keywords", w.keywords());
         if (!w.exclude().isEmpty()) {
             m.put("exclude", w.exclude());

@@ -9,6 +9,7 @@ import java.util.Optional;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -45,6 +46,9 @@ import io.sensinghub.registration.RegistrationService;
  *       ({@code registration_request} AWAITING_APPROVAL, 승인은 /registrations/{id}/approve → {@link #start}).</li>
  *   <li>진행 상태는 registration_request 한 행({@code input_url = "watch:<이름>"})으로 /registrations/mine에서 본다.</li>
  *   <li>키워드 수정은 설정 새 버전 활성화다 (이전 버전은 RETIRED로 남아 롤백할 수 있다). 모드는 그대로 이어진다.</li>
+ *   <li>보는 범위: 관리자(ADMIN 역할 사용자)가 만든 감시는 <b>공용</b>이라 누구나 본다(목록·키워드별 기사·네이버 실시간). 그 밖의 감시는
+ *       만든 사람과 ADMIN만 본다. 키워드 수정은 ADMIN 또는 만든 사람(그래서 공용 감시는 ADMIN만), 제외·다시 켜기는 ADMIN만이다.
+ *       목록은 제외(EXCLUDED)된 감시를 빼고, ADMIN은 {@code include_excluded}로 함께 볼 수 있다.</li>
  * </ul>
  */
 @Service
@@ -60,12 +64,18 @@ public class WatchService {
     /** 수집 기사 대조 모드의 안내 문구 (등록 요청 결과 메시지). */
     public static final String MATCH_MESSAGE = "등록된 언론사에서 수집한 기사에 키워드를 대조합니다.";
 
-    /** @param naver 네이버 뉴스 검색으로 저장 수집도 하는지 (store 모드에서만 true, false면 수집 기사 대조만) */
+    /**
+     * @param naver 네이버 뉴스 검색으로 저장 수집도 하는지 (store 모드에서만 true, false면 수집 기사 대조만)
+     * @param shared 공용 감시인가 (만든 사람이 ADMIN 역할: 모든 사용자가 읽기 전용으로 본다)
+     * @param mine 보는 사람이 만든 감시인가
+     * @param editable 보는 사람이 키워드·이름을 고칠 수 있는가 (ADMIN 또는 만든 사람)
+     */
     public record WatchView(long id, String name, List<String> keywords, List<String> exclude, boolean naver,
                             String status, String statusReason, Integer configVersion, int intervalMinutes,
                             OffsetDateTime lastSuccessAt, OffsetDateTime nextRunAt, long documentCount,
                             String requestedBy, Long registrationId, String registrationStatus,
-                            String registrationMessage, OffsetDateTime createdAt) {
+                            String registrationMessage, OffsetDateTime createdAt,
+                            boolean shared, boolean mine, boolean editable) {
     }
 
     private final JdbcClient jdbc;
@@ -197,6 +207,50 @@ public class WatchService {
      */
     @Transactional
     public boolean start(CurrentUser user, long sourceId, long requestId, boolean approved) {
+        return begin(user, sourceId, requestId, approved ? "승인되어 키워드 감시를 시작합니다. " : "키워드 감시를 시작합니다. ",
+                "REGISTRATION");
+    }
+
+    /**
+     * 제외(EXCLUDED)한 감시를 다시 켠다 (ADMIN). 시작({@link #start})과 같은 규칙으로 모드를 맞춘다: 대조 모드면 ACTIVE + next_run_at NULL,
+     * 네이버 모드(store + 키)면 ACTIVE로 두고 ONBOARD(MANUAL)를 넣어 워커가 키를 확인하고 첫 검색을 한다({@link #attachNaver}와 같다).
+     * 같은 이름의 감시가 이미 켜져 있거나(회사를 다시 가져와 새 감시가 생긴 경우 등), 보관(ARCHIVED)한 회사의 감시면 409.
+     * 마지막 등록 요청은 결과 메시지를 새로 적는다(승인 대기였다면 관리자가 다시 켠 것이 곧 승인이다).
+     */
+    @Transactional
+    public WatchView reactivate(CurrentUser user, long id) {
+        user.require(Role.ADMIN);
+        WatchView w = get(user, id);
+        if (!"EXCLUDED".equals(w.status())) {
+            throw ApiException.conflict("제외된 감시만 다시 켤 수 있습니다 (지금 상태: " + w.status() + ").");
+        }
+        Optional<Long> other = findOpenWatch(w.name());
+        if (other.isPresent() && other.get() != id) {
+            throw ApiException.conflict("같은 이름의 감시가 이미 켜져 있습니다: " + w.name() + " (#" + other.get() + ")");
+        }
+        Optional<String> archivedCompany = jdbc.sql("SELECT name FROM company WHERE watch_source_id = ? AND status = 'ARCHIVED'")
+                .param(id).query(String.class).optional();
+        if (archivedCompany.isPresent()) {
+            throw ApiException.conflict("보관한 회사(" + archivedCompany.get() + ")의 감시입니다. 회사를 다시 가져오면 감시도 새로 만듭니다.");
+        }
+        jdbc.sql("""
+                UPDATE source SET status = 'ACTIVE', status_reason = NULL, next_run_at = NULL, consecutive_failures = 0,
+                       updated_at = now()
+                WHERE id = ?
+                """).param(id).update();
+        Long requestId = jdbc.sql("SELECT id FROM registration_request WHERE source_id = ? ORDER BY id DESC LIMIT 1").param(id)
+                .query(Long.class).optional().orElse(null);
+        boolean naver = begin(user, id, requestId, "관리자가 감시를 다시 켰습니다. ", "MANUAL");
+        audit.log(user.id(), "WATCH_REACTIVATED", "source", id,
+                "{\"name\":" + quote(w.name()) + ",\"naver\":" + naver + "}");
+        return get(user, id);
+    }
+
+    /**
+     * 감시를 지금 모드로 시작한다 ({@link #start}, {@link #reactivate}). 네이버 모드면 ONBOARD를 넣고(소스 상태는 그대로 — 새 감시는
+     * PENDING, 다시 켠 감시는 ACTIVE), 대조 모드면 ACTIVE + next_run_at NULL. requestId가 있으면 그 등록 요청에 결과를 적는다.
+     */
+    private boolean begin(CurrentUser user, long sourceId, Long requestId, String lead, String trigger) {
         boolean naver = naverStoreAvailable();
         String config = activeConfig(sourceId);
         if (config == null || !parse(config).containsKey("naver") || naverOf(config) != naver) {
@@ -204,12 +258,11 @@ public class WatchService {
                     naver ? "네이버 뉴스 검색 키가 있어 네이버 검색 함께"
                             : naverSettings.storeEnabled() ? "네이버 키 없음 — 수집 기사 대조" : "네이버 표시 전용 — 수집 기사 대조");
         }
-        String lead = approved ? "승인되어 키워드 감시를 시작합니다. " : "키워드 감시를 시작합니다. ";
         if (naver) {
             jdbc.sql("""
-                    INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', 'REGISTRATION')
+                    INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (?, 'ONBOARD', ?)
                     ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
-                    """).param(sourceId).update();
+                    """).params(sourceId, trigger).update();
             updateRequest(requestId, "PROCESSING", "QUEUED",
                     lead + MATCH_MESSAGE + " 네이버 뉴스 검색 API 키를 확인한 뒤 네이버 검색도 함께 첫 수집을 합니다.");
         } else {
@@ -318,7 +371,10 @@ public class WatchService {
         }
     }
 
-    private void updateRequest(long requestId, String status, String step, String message) {
+    private void updateRequest(Long requestId, String status, String step, String message) {
+        if (requestId == null) {
+            return;
+        }
         jdbc.sql("UPDATE registration_request SET status = ?, step = ?, result_message = ?, updated_at = now() WHERE id = ?")
                 .params(status, step, message, requestId).update();
     }
@@ -330,6 +386,9 @@ public class WatchService {
     @Transactional
     public WatchView update(CurrentUser user, long id, String name, List<String> keywords, List<String> exclude) {
         WatchView current = get(user, id);
+        if (!current.editable()) {
+            throw new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", "공용 감시는 관리자만 고칠 수 있습니다.");
+        }
         List<String> terms = keywords == null ? current.keywords() : cleanTerms(keywords, "keywords");
         List<String> excluded = exclude == null ? current.exclude() : cleanTerms(exclude, "exclude");
         if (terms.isEmpty()) {
@@ -352,29 +411,35 @@ public class WatchService {
         return get(user, id);
     }
 
-    /** 내 감시. ADMIN은 전체. */
+    /** 켜져 있는(제외하지 않은) 감시: 공용 + 내 감시, ADMIN은 전체. */
     public List<WatchView> list(CurrentUser user) {
-        if (user.role().atLeast(Role.ADMIN)) {
-            return jdbc.sql(SELECT + " WHERE s.kind = 'WATCH' ORDER BY s.id").query(this::map).list();
-        }
-        return jdbc.sql(SELECT + " WHERE s.kind = 'WATCH' AND s.requested_by = ? ORDER BY s.id").param(user.id()).query(this::map).list();
+        return list(user, false);
     }
 
+    /**
+     * 보이는 감시: 공용(ADMIN이 만든 것) 먼저 만든 순서로, 그다음 내 감시(ADMIN에게는 다른 사용자의 감시). 제외(EXCLUDED)된 감시는
+     * 빼고, includeExcluded는 ADMIN에게만 듣는다(다시 켜기를 위한 "제외된 감시 보기").
+     */
+    public List<WatchView> list(CurrentUser user, boolean includeExcluded) {
+        boolean admin = user.role().atLeast(Role.ADMIN);
+        return jdbc.sql(SELECT + """
+                 WHERE s.kind = 'WATCH' AND (CAST(? AS boolean) OR s.requested_by = ? OR u.role = 'ADMIN')
+                   AND (CAST(? AS boolean) OR s.status <> 'EXCLUDED')
+                 ORDER BY (u.role = 'ADMIN') IS TRUE DESC, s.id
+                """).params(admin, user.id(), admin && includeExcluded).query(mapper(user)).list();
+    }
+
+    /** 공용 감시는 누구나, 그 밖의 감시는 만든 사람과 ADMIN만 (아니면 404). 제외된 감시도 볼 수 있다(문서 필터·다시 켜기). */
     public WatchView get(CurrentUser user, long id) {
-        WatchView w = jdbc.sql(SELECT + " WHERE s.id = ?").param(id).query(this::map).optional()
+        WatchView w = jdbc.sql(SELECT + " WHERE s.id = ? AND s.kind = 'WATCH'").param(id).query(mapper(user)).optional()
                 .orElseThrow(() -> ApiException.notFound("키워드 감시"));
-        if (!user.role().atLeast(Role.ADMIN) && !isOwner(user, id)) {
+        if (!user.role().atLeast(Role.ADMIN) && !w.mine() && !w.shared()) {
             throw ApiException.notFound("키워드 감시");
         }
         return w;
     }
 
     // ------------------------------------------------------------------
-
-    private boolean isOwner(CurrentUser user, long sourceId) {
-        return jdbc.sql("SELECT count(*) FROM source WHERE id = ? AND requested_by = ?")
-                .params(sourceId, user.id()).query(Long.class).single() > 0;
-    }
 
     private Optional<Long> findOpenWatch(String watchName) {
         return jdbc.sql("""
@@ -490,6 +555,7 @@ public class WatchService {
     private static final String SELECT = """
             SELECT s.id, s.watch_name, s.status, s.status_reason, s.interval_minutes, s.last_success_at, s.next_run_at,
                    s.created_at, v.version AS config_version, v.config::text AS config, u.name AS requested_by,
+                   s.requested_by AS requested_by_id, (u.role = 'ADMIN') IS TRUE AS shared,
                    (SELECT count(*) FROM document_watch w WHERE w.source_id = s.id) AS document_count,
                    r.id AS registration_id, r.status AS registration_status, r.result_message AS registration_message
             FROM source s
@@ -500,15 +566,22 @@ public class WatchService {
                 WHERE source_id = s.id ORDER BY id DESC LIMIT 1) r ON true
             """;
 
-    private WatchView map(java.sql.ResultSet rs, int n) throws java.sql.SQLException {
-        String config = rs.getString("config");
-        return new WatchView(rs.getLong("id"), rs.getString("watch_name"), terms(config, "keywords"),
-                terms(config, "exclude"), naverOf(config) && naverSettings.storeEnabled(), rs.getString("status"),
-                rs.getString("status_reason"),
-                (Integer) rs.getObject("config_version"), rs.getInt("interval_minutes"),
-                rs.getObject("last_success_at", OffsetDateTime.class), rs.getObject("next_run_at", OffsetDateTime.class),
-                rs.getLong("document_count"), rs.getString("requested_by"),
-                rs.getObject("registration_id", Long.class), rs.getString("registration_status"),
-                rs.getString("registration_message"), rs.getObject("created_at", OffsetDateTime.class));
+    /** 보는 사람(user)에 따라 mine·editable이 달라진다. */
+    private RowMapper<WatchView> mapper(CurrentUser user) {
+        boolean admin = user.role().atLeast(Role.ADMIN);
+        return (rs, n) -> {
+            String config = rs.getString("config");
+            Long owner = rs.getObject("requested_by_id", Long.class);
+            boolean mine = owner != null && owner == user.id();
+            return new WatchView(rs.getLong("id"), rs.getString("watch_name"), terms(config, "keywords"),
+                    terms(config, "exclude"), naverOf(config) && naverSettings.storeEnabled(), rs.getString("status"),
+                    rs.getString("status_reason"),
+                    (Integer) rs.getObject("config_version"), rs.getInt("interval_minutes"),
+                    rs.getObject("last_success_at", OffsetDateTime.class), rs.getObject("next_run_at", OffsetDateTime.class),
+                    rs.getLong("document_count"), rs.getString("requested_by"),
+                    rs.getObject("registration_id", Long.class), rs.getString("registration_status"),
+                    rs.getString("registration_message"), rs.getObject("created_at", OffsetDateTime.class),
+                    rs.getBoolean("shared"), mine, admin || mine);
+        };
     }
 }

@@ -151,6 +151,7 @@ tr.clickable { cursor: pointer; }
 tr.clickable:hover { background: #f7f9fc; }
 tr.overdue td { background: #fff7ed; }
 tr.detail-row td { background: #fafbfc; }
+tr.excluded td:not(.actions) { opacity: 0.55; }
 td.actions { white-space: nowrap; }
 
 .badge {
