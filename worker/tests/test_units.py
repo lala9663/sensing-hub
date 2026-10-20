@@ -2437,3 +2437,52 @@ def test_watch_keywords_match_crawled_documents():
     assert match_keywords("경제 소식", "본문에 반도체 수출이 늘었다", watches) == [(11, "반도체")]   # 본문도 본다
     assert match_keywords("메타 넷 소식", None, watches) == []                           # 띄어쓰기가 다르면 다른 말
     assert match_keywords(None, None, watches) == []
+
+
+def test_watch_keywords_respect_latin_word_boundaries():
+    """영문·숫자로 시작·끝나는 키워드는 그 끝 바로 바깥이 라틴 문자·숫자가 아니어야 걸린다 (2026-10-20: "DS"가 "applauds"에 걸렸다).
+    한글 쪽 끝은 부분 문자열 그대로, 섞인 키워드는 영문 쪽 끝만, 제외어도 같은 규칙."""
+    from sensing_worker.watchmatch import contains, from_configs, latin_edged, match_keywords, normalize
+
+    def hit(text, keyword):
+        return contains(normalize(text), keyword)
+
+    for text in ("삼성전자 DS부문 실적", "DS투자증권 보고서", "사업부(DS) 개편", "ds", "DS, DX 부문장 교체"):
+        assert hit(text, "DS"), text
+    for text in ("Yoon applauds chip makers", "Exports lead as funds flow", "MDS테크 수주", "GADS 도입", "DSR 규제", "DS2 출시"):
+        assert not hit(text, "DS"), text
+    assert hit("DSR 규제 강화", "DSR") and hit("스트레스DSR 3단계", "DSR") and not hit("DSRS 표준", "DSR")
+    assert hit("반도체가 살아난다", "반도체") and hit("SK하이닉스 HBM", "하이닉스")       # 한글은 부분 문자열 (조사)
+    assert hit("삼성전자 DS부문", "삼성전자 DS") and not hit("삼성전자 DSR", "삼성전자 DS")  # 섞인 키워드
+    assert hit("삼성전자  ds", "삼성전자 DS")                                             # 연속 공백
+    assert hit("Café 개업", "café") and not hit("Cafés", "café")                          # 라틴 확장 글자도 단어 글자
+    assert hit("5G망 구축", "5G") and not hit("25G 모듈", "5G")
+    assert not hit("아무 글", " ") and not hit("", "DS")
+    assert latin_edged("DS") and latin_edged("삼성전자 DS") and latin_edged("5G망") and not latin_edged("반도체")         and not latin_edged(" ")
+
+    watches = from_configs([
+        {"id": 83, "config": {"keywords": ["DS"], "exclude": []}},
+        {"id": 85, "config": {"keywords": ["DSR"], "exclude": ["AD"]}},
+        {"id": 90, "config": {"keywords": ["applaud", "삼성전자"], "exclude": []}},
+    ])
+    assert match_keywords("Korea applauds DSR easing", None, watches) == [(85, "DSR")]
+    assert match_keywords("Lead story: DSR", "MDS테크 GADS", watches) == [(85, "DSR")]   # 제외어 AD는 "Lead" 속이라 무시
+    assert match_keywords("AD 캠페인과 DSR", None, watches) == []                        # 제외어가 단어로 있으면 뺀다
+    assert match_keywords("삼성전자 DS부문", "applauded", watches) == [(83, "DS"), (90, "삼성전자")]
+
+
+def test_naver_connector_exclude_uses_word_boundaries():
+    from fakenaver import GOOD_KEY, article, naver_handler
+    from sensing_worker.apis.naver_news import NaverNewsConnector
+    handler = naver_handler({"DSR": [article("DSR", 1, title="DSR 규제 Leads 시장"),          # "Leads" 속 "ad"는 제외어 아님
+                                     article("DSR", 2, title="DSR AD 캠페인")]})               # 단어 AD → 뺀다
+    c = NaverNewsConnector(_api_fetcher(handler))
+    items = c.fetch(GOOD_KEY, {"keywords": ["DSR"], "exclude": ["ad"]}, since=datetime(2026, 1, 1).date(), limit=50)
+    assert [i.title for i in items] == ["DSR 규제 Leads 시장"]
+
+
+def test_backfill_watch_dry_run_needs_recheck():
+    from sensing_worker.backfill_watch import main as backfill_main
+    for argv in (["--dry-run"], ["--drop-unverifiable"]):
+        with pytest.raises(SystemExit):
+            backfill_main(argv)          # DB에 붙기 전에 인자 오류로 끝난다
