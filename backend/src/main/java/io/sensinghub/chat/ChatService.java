@@ -41,6 +41,7 @@ import io.sensinghub.llm.LlmClient;
 import io.sensinghub.llm.LlmClient.Message;
 import io.sensinghub.llm.LlmClient.ToolCall;
 import io.sensinghub.llm.LlmException;
+import io.sensinghub.relation.CompanyRelationService;
 
 /**
  * 챗봇 1단계: 도구 호출형 대화, 대화 저장, 근거(인용) 저장. 의미 검색(임베딩)은 2단계.
@@ -149,6 +150,7 @@ public class ChatService {
     private final LlmClient llm;
     private final ChatTools tools;
     private final FeaturedKeywordService featuredKeywords;
+    private final CompanyRelationService relations;
     private final int maxToolRounds;
     private final int historyTurns;
     private final boolean streaming;
@@ -156,7 +158,7 @@ public class ChatService {
     private final Set<Long> busy = ConcurrentHashMap.newKeySet();
 
     public ChatService(JdbcClient jdbc, ObjectMapper json, LlmClient llm, ChatTools tools,
-                       FeaturedKeywordService featuredKeywords,
+                       FeaturedKeywordService featuredKeywords, CompanyRelationService relations,
                        @Value("${sensing.chat.max-tool-rounds:4}") int maxToolRounds,
                        @Value("${sensing.chat.history-turns:6}") int historyTurns,
                        @Value("${sensing.chat.stream:true}") boolean streaming) {
@@ -165,6 +167,7 @@ public class ChatService {
         this.llm = llm;
         this.tools = tools;
         this.featuredKeywords = featuredKeywords;
+        this.relations = relations;
         this.maxToolRounds = Math.max(1, maxToolRounds);
         this.historyTurns = Math.max(0, historyTurns);
         this.streaming = streaming;
@@ -445,7 +448,7 @@ public class ChatService {
         List<Message> convo = new ArrayList<>(history);
         convo.add(Message.user(text));
 
-        String system = ChatPrompt.system(user, ZonedDateTime.now());
+        String system = ChatPrompt.system(user, ZonedDateTime.now(), relations.summary());
         List<LlmClient.Tool> definitions = tools.definitions();
         ChatTools.Context context = new ChatTools.Context(previousCitations(sessionId));
         Refs refs = new Refs();

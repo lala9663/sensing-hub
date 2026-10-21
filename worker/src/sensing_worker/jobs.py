@@ -30,6 +30,8 @@ from . import portal
 from .backfill import run_backfill
 from .policy import defaults_for, guess_site_type, is_routine_notice, next_interval, passes_quality
 from .recipe import propose_recipe
+from .relations import Relation, match_relations
+from .relations import from_rows as relations_from_rows
 from .watchmatch import WatchKeywords, from_configs, match_keywords
 
 LLM_STEP_MESSAGE = "사이트 구조를 분석해 수집 방법을 만드는 중입니다."
@@ -81,6 +83,7 @@ class JobRunner:
         # 등록 시 수집 레시피를 쓰는 LLM. 설정이 없으면 NoLlm → 휴리스틱 탐색만 한다
         self.llm = llm if llm is not None else make_llm(settings)
         self._watch_cache: list[WatchKeywords] | None = None   # 작업 하나 동안의 키워드 감시 목록
+        self._relation_cache: list[Relation] | None = None     # 작업 하나 동안의 회사 관계 목록 (자사·경쟁사 등)
 
     def _record(self, job: Job, failure: CrawlFailure) -> None:
         """실패를 기록한다. 응답 본문이 붙어 있으면 증거 파일로 남기고 경로를 함께 적는다."""
@@ -89,6 +92,7 @@ class JobRunner:
     def run(self, job: Job) -> str:
         source = self.db.load_source(job.source_id)
         self._watch_cache = None   # 감시 키워드는 작업마다 다시 읽는다 (그 사이 감시가 바뀌었을 수 있다)
+        self._relation_cache = None   # 회사 관계 목록도 같다
         try:
             if job.job_type == "ONBOARD":
                 return self._onboard(job, source)
@@ -683,7 +687,9 @@ class JobRunner:
     def _match_watches(self, doc_id: int, title: str | None, body: str | None) -> int:
         """새로 저장한 문서를 모든 키워드 감시와 대조해 document_watch(와 회사 연결)로 남긴다. 걸린 감시 수를 돌려준다.
 
-        감시 목록은 작업 하나 동안만 캐시한다 (run()이 작업마다 비운다).
+        같은 시점에 회사 관계 목록(자사·경쟁사 등)도 대조해 document_relation으로 남긴다 — 언론 기사는 본문을 저장하지 않으므로
+        본문에서 걸린 관계는 지금만 알 수 있다 (분류 라벨은 보강이 이 기록과 제목·저장된 본문으로 붙인다, relations).
+        두 목록 모두 작업 하나 동안만 캐시한다 (run()이 작업마다 비운다).
         """
         if self._watch_cache is None:
             self._watch_cache = from_configs(self.db.load_watch_keywords())
@@ -693,6 +699,10 @@ class JobRunner:
             company_id = self.db.company_of_watch(watch_id)
             if company_id is not None:
                 self.db.add_document_company(doc_id, company_id, "WATCH")
+        if self._relation_cache is None:
+            self._relation_cache = relations_from_rows(self.db.load_company_relations())
+        for relation_id, matched in match_relations(title, body, self._relation_cache):
+            self.db.add_relation_hit(doc_id, relation_id, matched)
         return len(hits)
 
     # ------------------------------------------------------------------ CHECK (회사 단위 점검, M3)

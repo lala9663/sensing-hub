@@ -1632,7 +1632,7 @@ def _doc(i: int, **kw):
 
 
 def test_enrich_prompt_numbers_documents_and_hides_press_bodies():
-    from sensing_worker.enrich import SYSTEM_PROMPT, TOPICS, build_batch_prompt
+    from sensing_worker.enrich import ENRICH_SCHEMA, LLM_TOPICS, SYSTEM_PROMPT, TOPICS, build_batch_prompt
     docs = [_doc(1, body="가나다 " * 3000),                                                    # 본문 4,000자 넘김
             _doc(2, site_type="NEWS", body="언론사 본문이 있어도 보여 주지 않는다", domain="news.example.com",
                  watches=[("자사 보도", "메타넷"), (None, None)]),
@@ -1644,7 +1644,14 @@ def test_enrich_prompt_numbers_documents_and_hides_press_bodies():
     assert "[문서 2]\n출처: 도메인 news.example.com / 섹션 보도자료 / 언론사 / 감시 '자사 보도' 검색어 '메타넷' / 감시\n" in prompt
     assert "언론사 본문이 있어도" not in prompt and prompt.count("본문: (없음 — 언론 기사, 제목만 저장)") == 2
     assert "[문서 3]\n출처: 도메인 a.go.kr\n제목: 제목 3\n" in prompt
-    assert all(t in SYSTEM_PROMPT for t in TOPICS)
+    assert all(f"· {t}:" in SYSTEM_PROMPT for t in LLM_TOPICS) and len(LLM_TOPICS) == 7
+    # 자사·경쟁사·고객사·협력사는 고를 값으로 주지 않는다 (회사 관계 목록이 붙인다)
+    relation_topics = [t for t in TOPICS if t not in LLM_TOPICS]
+    assert relation_topics == ["자사", "경쟁사", "고객사", "협력사"]
+    assert not any(f"· {t}:" in SYSTEM_PROMPT for t in relation_topics)
+    assert "topics에 넣지 않습니다" in SYSTEM_PROMPT and '"topics": ["자사"' not in SYSTEM_PROMPT
+    described = ENRICH_SCHEMA["properties"]["items"]["items"]["properties"]["topics"]["description"]
+    assert not any(t in described for t in relation_topics) and all(t in described for t in LLM_TOPICS)
 
 
 def test_enrich_parse_matches_idx_drops_unknown_topics_and_caps_tags():
@@ -1664,7 +1671,7 @@ def test_enrich_parse_matches_idx_drops_unknown_topics_and_caps_tags():
     assert set(out) == {1, 2, 3}
     assert out[1].summary == "첫 문장. 둘째 문장." and out[1].topics == ["정책·규제"]
     assert out[1].tags == ["a", "b", "c", "d", "e"]                       # 빈 값·중복 제거 후 5개
-    assert out[2].summary is None and out[2].topics == ["자사", "경쟁사"]  # 언론 기사는 summary 강제 null, 체계 밖 제거
+    assert out[2].summary is None and out[2].topics == ["기타"]   # 언론 기사는 summary 강제 null, 체계 밖·자사·경쟁사 제거
     assert out[3].summary is None and out[3].topics == ["기타"] and out[3].tags == ["국토교통부"]
     assert all(s.status == "DONE" for s in out.values())
 
@@ -1708,6 +1715,16 @@ class _FakeEnrichStore:
 
     def save_enrichment(self, document_id, document_version, **fields):
         self.saved.append((document_id, document_version, fields))
+
+    # 회사 관계 목록: relations=[{id, name, aliases, exclude, relation}], relation_hits={document_id: [(relation_id, matched)]}
+    relations: list = []
+    relation_hits: dict = {}
+
+    def load_company_relations(self):
+        return list(self.relations)
+
+    def load_relation_hits(self, ids):
+        return {i: list(self.relation_hits[i]) for i in ids if i in self.relation_hits}
 
     # 회사 레이어 (M3): companies=[{id, name, aliases}], links={document_id: [(company_id, matched_by)]}
     companies: list = []
@@ -1776,6 +1793,118 @@ def test_enrich_pending_saves_results_and_skips_empty_documents():
     assert saved[1]["status"] == "DONE" and saved[1]["model"] == "fake fake-1"
     assert saved[3]["status"] == "SKIPPED" and saved[3]["topics"] == []
     assert saved[4]["summary"] == "요약 3" and saved[4]["status"] == "DONE"                 # 본문 있는 문서는 요약 저장
+
+
+SAMSUNG = {"id": 1, "name": "삼성전자", "aliases": ["Samsung Electronics", "삼성 DS", "삼성 DX", "DS부문", "DX부문"],
+           "exclude": [], "relation": "OWN"}
+
+
+def test_relation_labels_follow_watch_rules_for_names_and_aliases():
+    """자사·경쟁사 라벨: 이름·별칭이 감시 대조와 같은 규칙(한글 부분 일치, 영문 단어 경계)으로 나오면 붙는다."""
+    from sensing_worker.relations import from_rows, match_relations, relation_labels
+    relations = from_rows([SAMSUNG,
+                           {"id": 2, "name": "SK하이닉스", "aliases": ["하이닉스", "SK hynix", " "], "exclude": [],
+                            "relation": "COMPETITOR"},
+                           {"id": 3, "name": "TSMC", "aliases": ["tsmc", "대만 TSMC"], "exclude": [], "relation": "COMPETITOR"},
+                           {"id": 4, "name": "모르는 관계", "aliases": [], "exclude": [], "relation": "FRIEND"}])
+    assert [r.names for r in relations] == [
+        ("삼성전자", "Samsung Electronics", "삼성 DS", "삼성 DX", "DS부문", "DX부문"),
+        ("SK하이닉스", "하이닉스", "SK hynix"), ("TSMC", "대만 TSMC")]                      # 빈 별칭·대소문자만 다른 것·모르는 관계는 뺀다
+
+    def labels(title, body=None):
+        return relation_labels(title, body, [], relations)
+    assert labels("삼성전자가 HBM4 양산") == ["자사"]                                         # 한글: 조사가 붙어도 부분 일치
+    assert labels("삼성전자서비스 노조 파업") == ["자사"]                                     # 한글 이름은 앞부분만 같아도 걸린다
+    assert labels("SAMSUNG ELECTRONICS unveils HBM4") == ["자사"]                           # 대소문자 무시
+    assert labels("Samsung Electronicsx 상표 분쟁") == []                                   # 영문 단어 경계
+    assert labels("삼성  DS부문 실적") == ["자사"] and labels("MDS부문 매각") == []          # 공백 정규화, "DS부문" 앞 경계
+    assert labels("삼성바이오로직스 4공장 가동") == [] and labels("삼성생명 보험료 인하") == []   # '삼성' 단독 별칭은 기본에 없다
+    assert labels("광동제약, 창립 63주년") == [] and labels("이케아, 어린이 컬렉션 출시") == []  # 예전 오분류 예
+    assert labels("SK하이닉스, 삼성전자 제치고 D램 1위") == ["자사", "경쟁사"]                 # 순서는 자사 → 경쟁사
+    assert labels("하이닉스 노조 성과급") == ["경쟁사"] and labels("ASK hynix 아님") == []
+    assert labels("반도체 수출 증가", "본문에 TSMC 3나노 언급") == ["경쟁사"]                # 저장된 본문도 본다
+    assert match_relations("SK하이닉스·하이닉스", None, relations) == [(2, "SK하이닉스")]       # 항목마다 처음 걸린 이름 하나
+    assert labels("", None) == [] and labels(None, "  ") == []
+
+
+def test_relation_exclude_words_mask_only_their_own_spot():
+    """제외어는 그 자리만 지운다: '인텔리전스'는 인텔이 아니지만 같은 제목의 다른 '인텔'은 걸린다 (감시 제외어와 다르다)."""
+    from sensing_worker.relations import from_rows, relation_labels
+    relations = from_rows([{"id": 5, "name": "인텔", "aliases": ["Intel"], "exclude": ["인텔리전스", "Intelligence"],
+                            "relation": "COMPETITOR"},
+                           {"id": 6, "name": "애플", "aliases": ["Apple"], "exclude": [], "relation": "CUSTOMER"},
+                           {"id": 7, "name": "한미반도체", "aliases": [], "exclude": [], "relation": "PARTNER"}])
+
+    def labels(title):
+        return relation_labels(title, None, [], relations)
+    assert labels("비즈니스 인텔리전스 시장 성장") == [] and labels("Business Intelligence 2026") == []
+    assert labels("인텔리전스 시대, 인텔의 반격") == ["경쟁사"] and labels("Intel Intelligence Day") == ["경쟁사"]
+    assert labels("애플, 한미반도체 장비 도입") == ["고객사", "협력사"]
+    assert labels("파인애플 수입 증가") == ["고객사"]                                        # 한글 부분 일치 그대로 — 필요하면 제외어로
+    assert labels("Pineapple Express") == []                                                # 영문은 경계
+
+
+def test_relation_labels_use_recorded_crawl_hits_while_name_still_listed():
+    """언론 기사는 본문을 저장하지 않으므로 수집 때 본문에서 걸린 기록(document_relation)을 쓴다. 그 이름이 목록에서 빠졌거나
+    항목이 없어졌으면 버린다."""
+    from sensing_worker.relations import from_rows, relation_labels
+    relations = from_rows([SAMSUNG])
+    assert relation_labels("반도체 업황 회복", None, [(1, "DS부문")], relations) == ["자사"]
+    assert relation_labels("반도체 업황 회복", None, [(1, "ds부문")], relations) == ["자사"]   # 정규화해 비교
+    assert relation_labels("반도체 업황 회복", None, [(1, "삼성")], relations) == []          # 지금 별칭이 아니다
+    assert relation_labels("반도체 업황 회복", None, [(9, "삼성전자")], relations) == []      # 없어진 항목
+
+
+def test_merge_topics_drops_llm_relation_labels_and_other():
+    from sensing_worker.relations import merge_topics
+    assert merge_topics(["자사", "산업동향", "경쟁사"], []) == ["산업동향"]                   # LLM이 보낸 자사·경쟁사는 버린다
+    assert merge_topics(["자사"], []) == ["기타"]                                            # 남는 것이 없으면 기타
+    assert merge_topics(["기타"], ["자사"]) == ["자사"]                                      # 관계 라벨이 붙으면 기타는 뺀다
+    assert merge_topics(["경쟁사", "사건·사고"], ["자사", "경쟁사", "자사"]) == ["사건·사고", "자사", "경쟁사"]
+    assert merge_topics([], []) == ["기타"] and merge_topics(["정책·규제"], ["모르는라벨"]) == ["정책·규제"]
+
+
+def test_enrich_pending_ignores_llm_relation_topics_and_adds_list_labels():
+    """LLM이 자사·경쟁사를 보내도 버리고, 회사 관계 목록이 제목·저장된 본문·수집 때 기록에서 찾은 라벨만 붙인다."""
+    from fakellm import BatchFakeLlm
+    from sensing_worker.enrich import SYSTEM_PROMPT, enrich_pending
+    rows = _rows(1, title="광동제약, 창립 63주년")
+    rows += _rows(1, id=2, title="이케아, 어린이 컬렉션 출시")
+    rows += _rows(1, id=3, title="삼성전자, HBM4 양산 돌입")
+    rows += _rows(1, id=4, title="메모리 업황 반등")                                      # 수집 때 본문에서 DS부문이 걸렸다
+    rows += _rows(1, id=5, site_type="PUBLIC", title="반도체 지원 사업 공고", body_text="삼성전자 DS부문 협력사 대상 " * 3)
+    rows += _rows(1, id=6, title="삼성바이오로직스 수주")
+    store = _FakeEnrichStore(rows)
+    store.relations = [SAMSUNG]
+    store.relation_hits = {4: [(1, "DS부문")], 6: [(1, "삼성")]}                           # 6번 기록은 지금 별칭이 아니다
+    topics = {1: ["자사", "기타"], 2: ["경쟁사"], 3: ["자사", "산업동향"], 4: ["산업동향", "경쟁사"], 5: ["지원사업"],
+              6: ["경쟁사", "산업동향"]}
+    llm = BatchFakeLlm(lambda idx, prompt: {"idx": idx, "summary": None, "topics": topics[idx], "tags": []})
+    outcome = enrich_pending(store, llm, Settings(), limit=10)
+    assert outcome.done == 6
+    saved = {doc_id: fields["topics"] for doc_id, _, fields in store.saved}
+    assert saved == {1: ["기타"], 2: ["기타"], 3: ["산업동향", "자사"], 4: ["산업동향", "자사"], 5: ["지원사업", "자사"],
+                     6: ["산업동향"]}
+    assert "· 자사:" not in SYSTEM_PROMPT and "· 경쟁사:" not in SYSTEM_PROMPT
+
+
+def test_relabel_command_takes_dry_run_and_days(monkeypatch):
+    """다시 라벨링 명령: --dry-run·--days만 받는다 (LLM 설정 없이 돈다)."""
+    from sensing_worker import relabel as rl
+    seen = {}
+
+    class _Store:
+        def __init__(self, dsn):
+            seen["dsn"] = dsn
+
+        def close(self):
+            seen["closed"] = True
+    monkeypatch.setattr(rl, "Store", _Store)
+    monkeypatch.setattr(rl, "relabel", lambda store, dry_run, days: seen.update(dry_run=dry_run, days=days) or rl.RelabelResult())
+    rl.main(["--dry-run", "--days", "30"])
+    assert seen["dry_run"] is True and seen["days"] == 30 and seen["closed"]
+    with pytest.raises(SystemExit):
+        rl.main(["--recheck"])
 
 
 def test_main_loop_runs_enrich_only_when_idle_and_llm_is_configured(monkeypatch):

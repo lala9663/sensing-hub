@@ -1,6 +1,6 @@
 'use strict';
 
-/** 관리자: 처리 대기 큐, 소스 목록·건강 상태·상세, API 키, 주요 키워드. */
+/** 관리자: 처리 대기 큐, 소스 목록·건강 상태·상세, API 키, 주요 키워드, 자사·경쟁사(회사 관계 목록). */
 (() => {
   const { api, esc, badge, html } = App;
   const PROVIDERS = [['dart', 'dart — DART 공시'], ['naver_news', 'naver_news — 네이버 뉴스 검색 (NAVER API HUB)'], ['data_go_kr', 'data_go_kr — 공공데이터포털']];
@@ -750,6 +750,171 @@
       App.notice('주요 키워드를 저장했습니다. 네이버 뉴스 탭과 챗봇 칩에 바로 반영됩니다.');
     }));
     view.querySelector('#kw-revert').addEventListener('click', () => App.guard(load));
+
+    await App.guard(load);
+  }, { admin: true });
+
+  // ================================================================ 자사·경쟁사 (회사 관계 목록)
+  /**
+   * 문서 분류의 자사·경쟁사·고객사·협력사 라벨을 붙이는 목록. 항목마다 추가·수정·삭제하고(POST·PUT·DELETE /company-relations),
+   * 바뀐 전후는 감사 로그(COMPANY_RELATION_*)에 남아 아래 "최근 변경"에 보인다.
+   */
+  const RELATION_LABELS = { OWN: '자사', COMPETITOR: '경쟁사', CUSTOMER: '고객사', PARTNER: '협력사' };
+  const RELATION_ACTIONS = { COMPANY_RELATION_CREATE: '추가', COMPANY_RELATION_UPDATE: '수정', COMPANY_RELATION_DELETE: '삭제' };
+
+  /** "a, b\nc" → ['a', 'b', 'c'] (빈 값 제외) */
+  function splitWords(text) {
+    return String(text || '').split(/[,\n]/).map(s => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  }
+
+  /** 감사 로그 detail 한 줄 요약: 추가·삭제는 항목, 수정은 바뀐 칸만. */
+  function relationChange(h) {
+    const d = h.detail || {};
+    const show = s => s ? `${esc(s.name)} (${esc(RELATION_LABELS[s.relation] || s.relation)})` : '';
+    if (!d.before) return show(d.after);
+    if (!d.after) return show(d.before);
+    const parts = [];
+    const list = v => (v || []).join(', ') || '없음';
+    if (d.before.name !== d.after.name) parts.push(`이름 ${esc(d.before.name)} → ${esc(d.after.name)}`);
+    if (d.before.relation !== d.after.relation) {
+      parts.push(`관계 ${esc(RELATION_LABELS[d.before.relation])} → ${esc(RELATION_LABELS[d.after.relation])}`);
+    }
+    if (list(d.before.aliases) !== list(d.after.aliases)) parts.push(`별칭 ${esc(list(d.before.aliases))} → ${esc(list(d.after.aliases))}`);
+    if (list(d.before.exclude) !== list(d.after.exclude)) parts.push(`제외어 ${esc(list(d.before.exclude))} → ${esc(list(d.after.exclude))}`);
+    if ((d.before.note || '') !== (d.after.note || '')) parts.push('메모');
+    return `${esc(d.after.name)}: ${parts.join(' · ') || '변경 없음'}`;
+  }
+
+  App.route('/admin/relations', async (view) => {
+    let items = [];
+    let editing = null;   // 고치는 항목 id (null이면 새로 추가)
+
+    view.innerHTML = `
+      <h1>자사·경쟁사</h1>
+      <div class="panel">
+        <p class="muted small">문서 분류의 <b>자사·경쟁사·고객사·협력사</b>는 AI가 고르지 않고 이 목록으로 붙습니다. 문서 제목과 본문
+          (언론 기사는 수집할 때 본 본문)에 이름이나 별칭이 나오면 그 관계가 분류에 더해집니다. 대조 규칙은 키워드 감시와 같습니다:
+          한글은 부분 일치(<span class="mono">삼성전자</span>는 ‘삼성전자가’·‘삼성전자서비스’에도 걸림), 영문은 단어 단위
+          (<span class="mono">Intel</span>은 ‘Intelligence’에 걸리지 않음).</p>
+        <p class="muted small">바꾸면 새로 수집·보강하는 문서부터 반영됩니다. 이미 분류된 문서에 반영하려면 운영자가 다시 라벨링 명령
+          (<span class="mono">python -m sensing_worker.relabel</span>)을 돌립니다. 바꿀 때마다 감사 로그에 남습니다.</p>
+        <div id="rel-hint"></div>
+        <table class="rel-table">
+          <thead><tr><th>회사</th><th>관계</th><th>별칭</th><th>제외어</th><th>메모</th><th>마지막 변경</th><th></th></tr></thead>
+          <tbody id="rel-rows"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2 id="rel-form-title">회사 추가</h2>
+        <form id="rel-form" class="rel-form">
+          <div class="form-grid">
+            <label class="field"><span>회사 이름</span><input type="text" name="name" maxlength="100" required placeholder="예: SK하이닉스"></label>
+            <label class="field"><span>관계</span><select name="relation">
+              ${Object.entries(RELATION_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label>
+          </div>
+          <label class="field"><span>별칭 (쉼표로 구분 — 영문명·약칭·사업부)</span>
+            <input type="text" name="aliases" class="wide" placeholder="예: 하이닉스, SK hynix"></label>
+          <label class="field"><span>제외어 (쉼표로 구분 — 이 말 안에 든 이름은 세지 않습니다)</span>
+            <input type="text" name="exclude" class="wide" placeholder="예: 인텔 → 인텔리전스"></label>
+          <label class="field"><span>메모 (선택)</span><input type="text" name="note" class="wide" maxlength="300"></label>
+          <p class="muted small">‘삼성’·‘SK’처럼 넓은 이름은 계열사(삼성바이오·삼성생명 등)와 다른 뜻(프로야구 삼성, 삼성역)까지 걸립니다.
+            가능하면 회사 이름 그대로(‘삼성전자’)나 사업부 이름(‘DS부문’)을 쓰세요. 한 글자 이름은 받지 않습니다.</p>
+          <div class="kw-actions">
+            <button type="submit" class="primary" id="rel-submit">추가</button>
+            <button type="button" id="rel-cancel" hidden>취소</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <h2>최근 변경</h2>
+        <div id="rel-history"></div>
+      </div>`;
+
+    const tbody = view.querySelector('#rel-rows');
+    const form = view.querySelector('#rel-form');
+
+    function render() {
+      const competitors = items.filter(r => r.relation === 'COMPETITOR').length;
+      view.querySelector('#rel-hint').innerHTML = competitors ? '' : `<p class="notice-warn small">경쟁사가 아직 없습니다 —
+        경쟁사 분류는 비어 있습니다. 예: SK하이닉스, 마이크론, TSMC, 인텔 (현업이 정해 주세요).</p>`;
+      tbody.innerHTML = items.length ? items.map(r => `
+        <tr data-id="${r.id}">
+          <td><b>${esc(r.name)}</b></td>
+          <td>${esc(r.label)}</td>
+          <td>${(r.aliases || []).map(a => `<span class="mono">${esc(a)}</span>`).join(', ') || '<span class="muted">-</span>'}</td>
+          <td>${(r.exclude || []).map(a => `<span class="mono">${esc(a)}</span>`).join(', ') || '<span class="muted">-</span>'}</td>
+          <td class="small">${esc(r.note || '')}</td>
+          <td class="small muted">${App.fmtDateTime(r.updatedAt)}${r.updatedBy ? ` · ${esc(r.updatedBy)}` : ''}</td>
+          <td class="actions"><button type="button" class="small edit">수정</button>
+            <button type="button" class="small danger remove">삭제</button></td>
+        </tr>`).join('') : '<tr><td colspan="7" class="empty">목록이 비어 있습니다. 아래에서 추가하세요.</td></tr>';
+      tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+        const r = items.find(x => x.id === Number(tr.dataset.id));
+        tr.querySelector('.edit').addEventListener('click', () => startEdit(r));
+        tr.querySelector('.remove').addEventListener('click', () => App.guard(async () => {
+          if (!await App.confirm(`${r.name}(${r.label})을(를) 목록에서 지울까요? 새로 분류하는 문서부터 ${r.label} 라벨이 붙지 않습니다.`, '삭제')) return;
+          await api('DELETE', `/company-relations/${r.id}`);
+          if (editing === r.id) resetForm();
+          App.notice(`${r.name}을(를) 지웠습니다.`);
+          await load();
+        }));
+      });
+    }
+
+    function startEdit(r) {
+      editing = r.id;
+      form.name.value = r.name;
+      form.relation.value = r.relation;
+      form.aliases.value = (r.aliases || []).join(', ');
+      form.exclude.value = (r.exclude || []).join(', ');
+      form.note.value = r.note || '';
+      view.querySelector('#rel-form-title').textContent = `${r.name} 수정`;
+      view.querySelector('#rel-submit').textContent = '저장';
+      view.querySelector('#rel-cancel').hidden = false;
+      form.name.focus();
+    }
+
+    function resetForm() {
+      editing = null;
+      form.reset();
+      view.querySelector('#rel-form-title').textContent = '회사 추가';
+      view.querySelector('#rel-submit').textContent = '추가';
+      view.querySelector('#rel-cancel').hidden = true;
+    }
+
+    async function loadHistory() {
+      const el = view.querySelector('#rel-history');
+      const history = await api('GET', '/company-relations/history');
+      el.innerHTML = history.length ? `<table><thead><tr><th>시각</th><th>누가</th><th>무엇</th><th>내용</th></tr></thead><tbody>
+        ${history.map(h => `<tr><td class="small">${App.fmtDateTime(h.at)}</td><td>${esc(h.actor || '-')}</td>
+          <td>${esc(RELATION_ACTIONS[h.action] || h.action)}</td><td class="small">${relationChange(h)}</td></tr>`).join('')}
+        </tbody></table>` : '<p class="muted small">아직 바꾼 기록이 없습니다 (기본값: 자사 = 삼성전자).</p>';
+    }
+
+    async function load() {
+      items = (await api('GET', '/company-relations')).items;
+      render();
+      await loadHistory();
+    }
+
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      App.guard(async () => {
+        const body = {
+          name: form.name.value.replace(/\s+/g, ' ').trim(),
+          relation: form.relation.value,
+          aliases: splitWords(form.aliases.value),
+          exclude: splitWords(form.exclude.value),
+          note: form.note.value.trim() || null,
+        };
+        const saved = editing === null ? await api('POST', '/company-relations', body)
+          : await api('PUT', `/company-relations/${editing}`, body);
+        App.notice(`${saved.name}(${saved.label})을(를) ${editing === null ? '추가' : '저장'}했습니다. 새로 분류하는 문서부터 반영됩니다.`);
+        resetForm();
+        await load();
+      });
+    });
+    view.querySelector('#rel-cancel').addEventListener('click', resetForm);
 
     await App.guard(load);
   }, { admin: true });

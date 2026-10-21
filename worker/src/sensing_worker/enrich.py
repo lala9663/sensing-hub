@@ -4,6 +4,8 @@
 돌아가 다음 루프에 다시 시도한다. 검증 실패는 FAILED로 기록해 무한 반복을 막되 24시간 뒤 다시 대상이 된다.
 
 - 분류 체계는 고정(TOPICS)이고 체계 밖 값은 버린다. 자유 태그는 최대 5개.
+- LLM은 내용 분류 7개(LLM_TOPICS)만 고른다. 자사·경쟁사·고객사·협력사는 관리자가 정한 회사 관계 목록으로 결정적으로 붙인다
+  (relations — 모델에게 고르게 했더니 '기사 속 그 회사'를 자사로, 아무 회사나 경쟁사로 붙였다). 응답에 와도 버린다.
 - 언론 기사(본문 미저장 또는 NEWS 사이트)는 제목만으로 분류하고 summary는 None으로 강제한다.
   제목만 저장하는 저작권 원칙을 지키기 위해 요약을 만들어 저장하지 않는다.
 - 한 번의 호출에 문서 여러 건(기본 10)을 번호를 붙여 묶고, 출력은 {items:[{idx, summary, topics, tags}]}다.
@@ -21,10 +23,14 @@ from .company import build_name_index, match_companies_by_tags, news_signal
 from .config import Settings
 from .db import sha256
 from .llm import Generation, LlmClient, LlmPaused, LlmUnavailable, describe, generate_recipe
+from .relations import RELATION_TOPIC_NAMES, Relation, merge_topics, relation_labels
+from .relations import from_rows as relations_from_rows
 
 log = logging.getLogger(__name__)
 
-TOPICS: tuple[str, ...] = ("정책·규제", "입찰·공고", "지원사업", "자사", "경쟁사", "산업동향", "인사·조직", "사건·사고", "기타")
+# 전체 분류 체계 (백엔드 DigestComposer.TOPIC_ORDER와 같은 순서). LLM이 고르는 것은 LLM_TOPICS뿐이다.
+TOPICS: tuple[str, ...] = ("정책·규제", "입찰·공고", "지원사업", *RELATION_TOPIC_NAMES, "산업동향", "인사·조직", "사건·사고", "기타")
+LLM_TOPICS: tuple[str, ...] = tuple(t for t in TOPICS if t not in RELATION_TOPIC_NAMES)
 MAX_TAGS = 5
 MAX_TAG_CHARS = 100
 MAX_SUMMARY_CHARS = 600
@@ -45,7 +51,7 @@ ENRICH_SCHEMA: dict = {
                     "idx": {"type": "integer", "description": "입력의 [문서 N] 번호"},
                     "summary": {"type": ["string", "null"], "description": "본문이 있는 문서의 2문장 이내 요약. 본문이 없으면 null"},
                     "topics": {"type": "array", "items": {"type": "string"},
-                               "description": "분류 체계 안의 값만 1~3개: " + ", ".join(TOPICS)},
+                               "description": "분류 체계 안의 값만 1~3개: " + ", ".join(LLM_TOPICS)},
                     "tags": {"type": "array", "items": {"type": "string"},
                              "description": "자유 태그 최대 5개 (인명·기관명·제품명 등)"},
                 },
@@ -54,7 +60,7 @@ ENRICH_SCHEMA: dict = {
     },
 }
 
-SYSTEM_PROMPT = f"""당신은 대외협력(정책·규제·공고)과 커뮤니케이션(자사·경쟁사 보도) 담당자를 위해 수집된 문서를 분류하고 요약하는 분석가입니다.
+SYSTEM_PROMPT = f"""당신은 대외협력(정책·규제·공고)과 커뮤니케이션(언론 보도) 담당자를 위해 수집된 문서를 분류하고 요약하는 분석가입니다.
 번호가 붙은 문서 여러 건을 받아 문서마다 요약·분류·태그를 JSON 객체 하나로 돌려줍니다.
 
 규칙
@@ -67,19 +73,18 @@ SYSTEM_PROMPT = f"""당신은 대외협력(정책·규제·공고)과 커뮤니�
   · 정책·규제: 법령·고시·규제 변경, 정부·국회·규제기관의 방침
   · 입찰·공고: 입찰·공모·사업자 선정·조달 공고
   · 지원사업: 보조금·지원 프로그램·공모 사업·바우처
-  · 자사: 우리 회사(출처 줄의 감시 이름이 자사·회사명인 키워드) 관련 보도·언급
-  · 경쟁사: 경쟁사·동종 업계 회사 관련 보도
   · 산업동향: 시장·기술·업계 흐름, 통계, 전망
   · 인사·조직: 임원 인사·조직 개편·채용
   · 사건·사고: 장애·사고·소송·제재·논란
   · 기타: 위 어디에도 맞지 않음
-  출처 줄에 감시 이름과 검색어가 있으면 참고합니다 (예: 감시 '자사 보도'에 걸린 기사는 보통 자사, 감시 '경쟁사'는 경쟁사).
+  회사와의 관계(자사·경쟁사·고객사·협력사)는 시스템이 따로 붙이므로 topics에 넣지 않습니다. 회사 소식도 내용으로 고릅니다
+  (신제품·실적·투자는 산업동향, 임원 인사는 인사·조직, 사고·소송은 사건·사고, 창립 기념처럼 어디에도 맞지 않으면 기타).
 - tags: 문서에 실제로 나온 인명·기관명·회사명·제품명·법령명 같은 고유명사를 최대 {MAX_TAGS}개. 일반 명사는 넣지 않습니다. 없으면 빈 배열.
 
 출력 예시 (형식 참고용이며 값은 입력과 무관합니다)
 {{"items": [
   {{"idx": 1, "summary": "국토교통부가 10월 20일부터 드론 비행 승인 절차를 간소화한다. 150m 이하 비행은 사전 승인이 면제된다.", "topics": ["정책·규제"], "tags": ["국토교통부", "항공안전법"]}},
-  {{"idx": 2, "summary": null, "topics": ["자사", "산업동향"], "tags": ["메타넷", "AI 컨택센터"]}}
+  {{"idx": 2, "summary": null, "topics": ["산업동향"], "tags": ["메타넷", "AI 컨택센터"]}}
 ]}}
 """
 
@@ -193,8 +198,9 @@ def _clean_tags(raw) -> list[str]:
 
 
 def _clean_topics(raw) -> list[str]:
+    """LLM 분류: 7개(LLM_TOPICS) 밖의 값은 버리고 순서는 유지한다. 자사·경쟁사 같은 관계 라벨이 와도 버린다 (relations가 붙인다)."""
     out = [t.strip() for t in (raw or []) if isinstance(t, str)]
-    out = [t for t in dict.fromkeys(out) if t in TOPICS]      # 체계 밖 값은 버리고 순서는 유지
+    out = [t for t in dict.fromkeys(out) if t in LLM_TOPICS]
     return out or ["기타"]
 
 
@@ -231,6 +237,12 @@ def enrich_batch(llm: LlmClient, docs: list[PendingDoc], settings: Settings) -> 
         error = f"LLM 응답 검증 실패 ({gen.attempts}회): " + "; ".join(gen.errors)
         return {i: Enrichment(None, [], [], status="FAILED", error=error[:500]) for i in range(1, len(docs) + 1)}, gen
     return parse_items(gen.data, docs), gen
+
+
+def with_relation_labels(llm_topics: list[str], doc: PendingDoc, recorded: list[tuple[int, str]],
+                         relations: list[Relation]) -> list[str]:
+    """최종 분류 = LLM 분류(관계 라벨은 버림) + 회사 관계 목록이 문서 제목·저장된 본문·수집 때 기록에서 찾은 관계 라벨."""
+    return merge_topics(llm_topics, relation_labels(doc.title, doc.body, recorded, relations))
 
 
 def _to_pending(row: dict, watches: dict[int, list[tuple[str | None, str | None]]]) -> PendingDoc:
@@ -299,6 +311,9 @@ def enrich_pending(store, llm: LlmClient, settings: Settings, limit: int | None 
                 return outcome
             outcome.usage = dict(gen.usage)
 
+        # 자사·경쟁사 등은 회사 관계 목록으로 붙인다 (제목·저장된 본문 + 수집 때 본문에서 걸린 기록)
+        relations = relations_from_rows(store.load_company_relations())
+        recorded = store.load_relation_hits([d.id for d in to_send]) if relations else {}
         saved: dict[int, Enrichment] = {}
         for d in docs:
             if d.is_empty:
@@ -309,6 +324,8 @@ def enrich_pending(store, llm: LlmClient, settings: Settings, limit: int | None 
             r = results.get(to_send.index(d) + 1)
             if r is None:   # 번호가 빠진 경우는 check_items가 걸러 재요청하므로 드물지만, 그래도 FAILED로 남긴다
                 r = Enrichment(None, [], [], status="FAILED", error="LLM 응답에 이 문서의 항목이 없습니다")
+            if r.status == "DONE":
+                r.topics = with_relation_labels(r.topics, d, recorded.get(d.id, []), relations)
             store.save_enrichment(d.id, d.version, summary=r.summary, topics=r.topics, tags=r.tags, model=model,
                                   status=r.status, error=r.error)
             saved[d.id] = r

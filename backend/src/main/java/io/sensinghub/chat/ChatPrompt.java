@@ -20,7 +20,8 @@ final class ChatPrompt {
     private ChatPrompt() {
     }
 
-    static String system(CurrentUser user, ZonedDateTime now) {
+    /** relations: 회사 관계 목록 한 줄 ({@link io.sensinghub.relation.CompanyRelationService#summary}). */
+    static String system(CurrentUser user, ZonedDateTime now, String relations) {
         ZonedDateTime kst = now.withZoneSameInstant(DigestComposer.KST);
         String weekday = kst.getDayOfWeek().getDisplayName(TextStyle.SHORT, Locale.KOREAN);
         return """
@@ -45,6 +46,10 @@ final class ChatPrompt {
                 - 검색어만 준 경우(회사·주제 이름만, 예: "반도체", "삼성전자 DS 실적", "테슬라?")는 무엇을 원하는지 되묻지 말고 바로
                   search_documents(query=그 낱말, days=7)를 부른다. 없으면 days=30으로 한 번 더 찾는다.
                 - "기사·보도·문서 찾아 줘" → search_documents (기간은 days 또는 since, 분류는 topic: %s).
+                - 분류의 자사·경쟁사·고객사·협력사는 관리자가 정한 회사 관계 목록의 이름·별칭이 제목·본문에 나온 문서에 붙는다
+                  (지금 목록 — %s). "우리 회사·자사 보도" → topic 자사, "경쟁사 소식" → topic 경쟁사. 목록에 없는 회사를
+                  경쟁사·고객사라고 단정하지 않는다. 목록이 비어 있는 관계는 그 분류의 문서가 없으니, 관리자가 관리자 메뉴
+                  '자사·경쟁사'에서 정한다고 안내하고 회사 이름을 알면 query로 찾는다.
                 - 사이트·기사 종류를 말하면("정책브리핑 연설문 최근 3개", "동아일보 스포츠 기사") search_documents의 site·section으로 거르고,
                   그 이름은 query에 넣지 않는다 (넣으면 그 낱말이 든 문서만 찾아 대개 0건이다). 다른 주제어가 없으면 query는 비우고, "N개"는 limit.
                   사용자가 말한 종류 낱말('연설문', '브리핑', '문화')은 정확한 이름이 아니어도 section에 넣는다 (도구가 실제 이름에 맞춘다).
@@ -62,7 +67,7 @@ final class ChatPrompt {
                 - 네이버 뉴스는 도구로 찾을 수 없다 (표시 전용이라 너에게 오지 않는다). 네이버에서 찾아 달라고 하면 입력창에
                   "네이버 - 검색어"처럼 보내면 네이버 결과를 화면에서 바로 볼 수 있다고 안내한다.
                 """.formatted(kst.format(DATE_TIME), weekday, user.name(), roleName(user.role()),
-                String.join(", ", DigestComposer.TOPIC_ORDER));
+                String.join(", ", DigestComposer.TOPIC_ORDER), relations == null || relations.isBlank() ? "(알 수 없음)" : relations);
     }
 
     static String roleName(Role role) {
