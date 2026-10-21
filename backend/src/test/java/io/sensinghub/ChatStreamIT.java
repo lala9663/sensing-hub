@@ -422,11 +422,14 @@ class ChatStreamIT {
             assertThat(result.path("within_previous").asText()).contains("3건");
             assertThat(titles(result)).containsExactly("삼성전자 반도체 HBM 공급 확대", "메모리 반도체 가격 반등");
             assertThat(result.path("documents").get(1).path("companies").get(0).asText()).isEqualTo("삼성전자");
+            // 앞 답의 번호 그대로 (실측: Gemini는 거른 답에도 앞 목록의 번호를 쓴다)
             assertThat(result.path("documents").get(0).path("ref").asInt()).isEqualTo(1);
-            return text("앞 목록 중 삼성전자 관련은 2건입니다.\n- [1]\n- [2]");
+            assertThat(result.path("documents").get(1).path("ref").asInt()).isEqualTo(3);
+            return text("앞 목록 중 삼성전자 관련은 2건입니다.\n- [1]\n- [3]");
         });
         JsonNode narrowed = send("viewer", s, "이 중 삼성전자 관련만").get("assistant");
         assertThat(narrowed.get("citations")).extracting(c -> c.get("documentId").asLong()).containsExactly(d1, d3);
+        assertThat(narrowed.get("citations")).extracting(c -> c.get("refNo").asInt()).containsExactly(1, 3);
         assertThat(narrowed.get("tools").get(0).get("name").asText()).isEqualTo("search_documents");
         assertThat(chips(narrowed)).containsExactly("이 중 HBM 관련만", "1번 기사 원문 보기");
         assertThat(narrowed.get("followUps").get(1).get("url").asText()).isEqualTo("https://news.example.com/1");
@@ -442,13 +445,19 @@ class ChatStreamIT {
         assertThat(none.get("citations")).isEmpty();
         assertThat(chips(none)).containsExactly("‘이데일리’ 기사 새로 찾아 줘");
 
-        // 앞 답의 번호: 근거가 있는 가장 최근 답(삼성전자 2건)의 2번
+        // 앞 답의 번호: 근거가 있는 가장 최근 답(삼성전자 2건 — [1]·[3])의 3번. 없는 번호면 고를 수 있는 번호를 알려 준다
         LLM.then(toolCall("w3", "search_documents", "{\"previous_refs\":[2]}")).then(body -> {
-            assertThat(titles(lastToolResult(body))).containsExactly("메모리 반도체 가격 반등");
-            return text("[1] 메모리 반도체 가격 반등 기사입니다.");
+            assertThat(lastToolResult(body).path("note").asText()).contains("앞 답의 근거 번호는 1, 3입니다");
+            return toolCall("w4", "search_documents", "{\"previous_refs\":[3]}");
+        }).then(body -> {
+            JsonNode result = lastToolResult(body);
+            assertThat(titles(result)).containsExactly("메모리 반도체 가격 반등");
+            assertThat(result.path("documents").get(0).path("ref").asInt()).isEqualTo(3);
+            return text("[3] 메모리 반도체 가격 반등 기사입니다.");
         });
-        JsonNode picked = send("viewer", s, "2번 기사만 다시 보여 줘").get("assistant");
+        JsonNode picked = send("viewer", s, "3번 기사만 다시 보여 줘").get("assistant");
         assertThat(picked.get("citations")).extracting(c -> c.get("documentId").asLong()).containsExactly(d3);
+        assertThat(picked.get("citations").get(0).get("refNo").asInt()).isEqualTo(3);
         assertThat(LLM.pending()).isZero();
 
         // 근거가 없는 대화에서는 거를 수 없다고 알려 준다
