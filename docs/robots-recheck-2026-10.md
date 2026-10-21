@@ -1,4 +1,4 @@
-# robots.txt 재점검 (2026-10-21)
+# robots.txt 재점검과 기사 주소 누락 점검 (2026-10-21)
 
 ## 왜 다시 봤나
 
@@ -127,53 +127,125 @@ PYTHONPATH=src python -m sensing_worker.robots_recheck --dsn postgresql://sensin
 - 처음 실측(깊이 병합 전)에서는 종류가 깊이마다 갈렸다: `news`(`/news/{*}/…`, 368건) · `news (news)`(`/news/{*}/{*}/…`, 328건) ·
   `sport`(`/news/sport/golf/iceberggolf/…`, 8건). 종류가 둘 이상이면 문서 `section`에 종류 이름이 들어가 기사 자체의 분류(정치·경제…)가
   `news`·`news (news)`로 덮이므로, 깊이가 다른 서명을 `{**}`(경로 조각 1~3개)로 합치는 병합을 더했다(how-collection-works.md 3절).
-- 회귀 확인: 평가 목록 13곳(`docs/eval-sites.txt`·`docs/eval-samples.txt`)을 새 코드와 변경 전 코드(HEAD)로 차례로 돌려 비교했다.
-  13곳 모두 방식·대표 패턴·허브·기사 종류(켜짐/꺼짐)가 같다(12곳 OK). www.eetimes.com은 두 코드 모두
-  `UNEXPECTED: AttributeError: 'list' object has no attribute 'strip'`로 실패한다 — 이번 변경과 무관한 기존 문제다.
+## 기사 주소 누락 점검 (2026-10-21)
+
+같은 날 다른 세션이 ACTIVE 사이트 소스 50곳을 읽기 전용으로 점검했다(운영 DB SELECT, robots가 허용한 사이트맵 또는 허브 한두 건).
+공개 목록의 기사 주소 가운데 켜진 기사 종류(패턴)에 맞지 않는 것:
+
+| 소스 | 사이트 | 지금 설정 | 비교 목록 | 누락 | 빠진 모양 |
+|---:|---|---|---|---:|---|
+| 49 | 동아일보 | RSS v1 `/news/Society/article/all/{n}/{n}/{n}` | 허브 RSS 122건 | **99 (81%)** | Politics 42, Economy 35, It 9, Inter 6 … (사회면만 수집, 저장 272건 모두 Society) |
+| 28 | 서울신문 | RSS v1 `/news/{*}/{n}/{n}/{n}/{n}` | 사이트맵 721건 | **353 (49%)** | `/news/economy/industry/…` 등 작은 분류 |
+| 54 | 한국경제 | RSS v1 `/article/{n}` | 사이트맵 latest-article 897건 | **412 (46%)** | `/article/202610214628g` (끝에 영문자, 저장 0건) |
+| 76 | 수원시 소식 | STATIC v1 `/?mode=*&p={n}&reqIdx={n}&viewMode=*` | 허브 링크 96개 | **30** | `?p=35&viewMode=view&reqIdx=…` (mode 없는 상세) |
+| 48 | 한겨레 | RSS v1 `/arti/{*}/{*}/{n}.html` | 사이트맵 250건 | 3 | `/arti/sports/sportstemp/asiangame/{n}.html` (3단) |
+| 55 | 조선비즈 | SITEMAP v1 `/{*}/{*}/{n}/{n}/{n}/{id}/` | 뉴스 사이트맵 100건 | 4 | `/policy/politics/president_office/…`(3단), 숫자 없는 Arc ID(`LOEDJZEKQNHLDOXRKAGNXNVDYY`) |
+
+누락이 아닌 것: MBN(사이트맵은 새 형식이지만 RSS 옛 형식으로 하루 104건 수집 중), 데일리안·주간동아(사이트맵 주소 꼴만 다름),
+산업부·전자신문·오마이뉴스·연합뉴스TV·뉴시스·OSEN·아시아투데이(맞지 않은 것은 안내·목록·회사 소개 같은 기사 아닌 페이지).
+수원시 허브의 나머지 50개(`/?p=58` 메뉴 35, `?p=22&mode=blog` 목록 14 등)도 기사가 아니다.
+
+공통 원인은 **등록할 때 본 주소들로 패턴을 하나 고정하면 다른 주소 모양을 조용히 놓친다**는 것이다. 동아일보는 섹션 병합(`{*}`)과
+기사 종류 기능 전에 등록된 설정이라 다시 탐색만 하면 되고, 나머지는 탐색 규칙을 고쳤다(how-collection-works.md 3절).
+
+### 고친 탐색으로 다시 탐색 (DB 없이)
+
+`sensing_worker.evaluate`(사전 점검 + `jobs.discover()`, DB·LLM 없이, 간격 2초)로 6곳을 다시 탐색했다. 위 표의 빠진 모양 예시 주소가
+모두 켜진 종류에 맞는다.
+
+| 소스 | 사이트 | 방식 | 새 대표 패턴 | 품질 검사 | 고친 규칙 |
+|---:|---|---|---|---|---|
+| 49 | 동아일보 | RSS | `/news/{*}/article/all/{n}/{n}/{n}` | 5건 중 4건 | 없음 (고치기 전 코드로도 같은 결과 — 설정 v1이 오래됐을 뿐) |
+| 28 | 서울신문 | SITEMAP | `/news/{**}/{n}/{n}/{n}/{n}` | 5건 중 5건 | robots 판정, 섹션 깊이 병합 |
+| 54 | 한국경제 | RSS | `/article/{id}` | 5건 중 5건 | 넓은 서명이 받는 횟수 (`{id}` ⊇ `{n}`) |
+| 76 | 수원시 소식 | STATIC | `/?p={n}&reqIdx={n}&viewMode=*` (72건, 고치기 전 46건) | 5건 중 5건 | 넓은 서명이 받는 횟수 (mode 없는 쿼리) |
+| 48 | 한겨레 | RSS | `/arti/{**}/{n}.html` | 5건 중 5건 | 두 단 병합을 1~3단으로 |
+| 55 | 조선비즈 | SITEMAP | `/{**}/{n}/{n}/{n}/{id}/` | 5건 중 5건 | 대문자 Arc ID, 날짜+ID 꼬리의 앞머리 없는 `{**}` |
+
+회귀 확인: 평가 목록 13곳(`docs/eval-sites.txt`·`docs/eval-samples.txt`)을 새 코드와 변경 전 코드(HEAD)로 차례로 돌려 비교했다.
+한국경제만 `/article/{n}` → `/article/{id}`로 바뀌고 나머지 12곳은 방식·대표 패턴·허브·기사 종류(켜짐/꺼짐)가 같다.
+중간 시도에서 쿼리 키 흡수를 모든 서명에 적용했더니 산업부의 `공지사항`(`/kor/article/{id}/{n}/view?mno=`) 종류가
+`보도·참고자료`에 합쳐져, 키 수가 다른 흡수는 글을 쿼리로 가리키는 서명에만 하도록 좁혔다(그 뒤 산업부는 변경 전과 같음).
+www.eetimes.com은 두 코드 모두 `UNEXPECTED: AttributeError: 'list' object has no attribute 'strip'`로 실패한다 — 이번 변경과 무관한 기존 문제다.
+
+### 누락 점검 지표 (pattern_check, V21)
+
+워커가 주기 수집 중 소스마다 하루 한 번(설정 버전이 바뀌면 바로) 위 점검과 같은 비율을 재서 `pattern_check`에 남기고, 관리자
+운영 지표 화면의 "기사 주소 누락 점검"이 소스별 마지막 점검을 보여 준다. 누락 20% 이상이면서 5건 이상이면 "재탐색 후보"다.
+비교 목록은 그 실행에서 연 허브 + robots가 허용한 사이트맵 하나(요청 최대 3회)이고, HTML 목록의 메뉴 링크는 켜진 종류와 가까운
+것만 센다. 위 표의 수치로 넣어 본 화면에서 동아일보·한국경제·수원시가 후보, 다시 탐색한 서울신문은 "다음 수집에서 다시 잼",
+한겨레(1%)는 후보가 아니었다. 운영 수치는 새 워커·백엔드를 배포한 뒤 첫 주기 수집부터 쌓인다.
 
 ## 운영 DB에 쓰는 명령 (준비만, 실행하지 않음)
 
-순서가 중요하다. **예전 워커로 다시 탐색하면 다시 RSS를 고른다**(예전 판정은 `/xml/`을 허용으로 본다). 새 워커를 배포한 뒤에 한다.
-새 워커가 배포되고 다시 탐색 전에 주기 수집이 돌면, 소스 28은 허브 5개가 모두 `ROBOTS_DISALLOWED`로 거절돼 그 실행이 실패로 남는다
-(요청은 보내지 않는다. 상태는 ACTIVE 그대로, `consecutive_failures`만 오른다).
+**순서가 중요하다.**
 
-1. (선택, 지금) 배포 전까지 서울신문 수집 멈추기 — 지금 운영 워커는 막힌 피드를 한 시간마다 읽고 있다.
+1. 백엔드를 먼저 배포해 V21(`pattern_check`)을 적용한다. 워커가 먼저 떠도 수집은 돌지만 누락 점검은 건너뛴다.
+   V20은 회사 관계 브랜치(`claude/upbeat-swirles-f07998`)가 쓰므로, 그 브랜치를 먼저 병합하거나 같이 병합한다. 이 브랜치만 먼저 병합해
+   V21이 적용된 DB에는 Flyway가 V20을 "적용 안 된 낮은 버전"으로 보고 시작을 거부한다(`spring.flyway.out-of-order=true`로 한 번 풀 수 있다).
+2. 워커를 다시 띄운다. **예전 워커로 다시 탐색하면 예전 규칙으로 같은 설정을 다시 만든다**(서울신문은 다시 막힌 RSS를 고른다).
+   새 워커가 뜨고 다시 탐색 전에 주기 수집이 돌면, 서울신문(28)은 허브 5개가 모두 `ROBOTS_DISALLOWED`로 거절돼 그 실행이 실패로
+   남는다(요청은 보내지 않는다. 상태는 ACTIVE 그대로, `consecutive_failures`만 오른다).
+
+(선택, 지금) 배포 전까지 서울신문 수집 멈추기 — 지금 운영 워커는 막힌 피드를 한 시간마다 읽고 있다.
+
+```bash
+curl -s -X POST -H "X-User: admin" http://127.0.0.1:8080/api/v1/sources/28/actions/pause
+```
+
+3. 수원시 소식(76): 다시 탐색 **전에** 저장된 주소에서 `mode`를 뺀다. 새 패턴은 `mode`를 필수 키에서 빼므로 정규 주소가
+   `?p=…&reqIdx=…&viewMode=…`가 되고, 그대로 두면 허브에 아직 보이는 기사(약 40건)를 새 주소로 한 번 더 저장한다. 2026-10-21 기준
+   저장 51건 모두 `mode=blog`가 붙어 있고 `mode` 없는 주소는 0건이다(겹칠 행 없음). `url_hash`는 워커와 같은 sha256(주소)이다.
 
    ```bash
-   curl -s -X POST -H "X-User: admin" http://127.0.0.1:8080/api/v1/sources/28/actions/pause
+   curl -s -X POST -H "X-User: admin" http://127.0.0.1:8080/api/v1/sources/76/actions/pause
    ```
 
-2. 이 브랜치를 main에 병합하고 운영 워커를 다시 띄운 뒤, 서울신문 다시 탐색 (ONBOARD 작업 → 설정 v2, ACTIVE·PAUSED 어느 쪽에서도 된다.
-   성공하면 ACTIVE로 돌아온다).
+   ```sql
+   BEGIN;
+   WITH fixed AS (
+       SELECT id, regexp_replace(url, '([?&])mode=[^&]*&', '\1') AS url FROM document
+       WHERE source_id = 76 AND url ~ '[?&]mode=[^&]*&')
+   UPDATE document d SET url = f.url, url_hash = encode(sha256(convert_to(f.url, 'UTF8')), 'hex')
+   FROM fixed f WHERE d.id = f.id;
+   -- 기대: UPDATE 51. 겹침 확인 (0이어야 한다)
+   SELECT count(*) - count(DISTINCT url_hash) FROM document WHERE source_id = 76;
+   COMMIT;
+   ```
+
+4. 다시 탐색 (ONBOARD 작업 → 설정 새 버전. ACTIVE·PAUSED 어느 쪽에서도 되고, 성공하면 ACTIVE로 돌아온다):
 
    ```bash
-   curl -s -X POST -H "X-User: admin" http://127.0.0.1:8080/api/v1/sources/28/actions/rediscover
+   for id in 28 49 54 76 48 55; do curl -s -X POST -H "X-User: admin" http://127.0.0.1:8080/api/v1/sources/$id/actions/rediscover; echo; done
    ```
 
    백엔드가 떠 있지 않을 때의 같은 작업(감사 로그는 남지 않는다):
 
    ```sql
    INSERT INTO crawl_job (source_id, job_type, config_version_id, trigger)
-   SELECT id, 'ONBOARD', active_config_version_id, 'MANUAL' FROM source WHERE id = 28
+   SELECT id, 'ONBOARD', active_config_version_id, 'MANUAL' FROM source WHERE id IN (28, 49, 54, 76, 48, 55)
    ON CONFLICT (source_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING;
    ```
 
-3. 확인 (읽기만):
+5. 확인 (읽기만):
 
    ```sql
-   SELECT version, status, config->>'method' AS method, config->'hubs' AS hubs,
-          config->'article_pattern'->>'signature' AS signature, change_note
-   FROM source_config_version WHERE source_id = 28 ORDER BY version;
-   -- 기대: v2 ACTIVE, SITEMAP, ["https://www.seoul.co.kr/sitemap/sitemap_latestArticle"], /news/{**}/{n}/{n}/{n}/{n}
-   SELECT count(*) FILTER (WHERE url ~ '^https?://[^/]+/news/[^/]+/[^/]+/\d+/') AS sub_category,
-          count(*) FILTER (WHERE url ~ '^https?://[^/]+/news/[^/]+/\d+/') AS short
-   FROM document WHERE source_id = 28 AND collected_at > now() - interval '1 day';
+   SELECT s.id, t.domain, s.status, v.version, v.config->>'method' AS method, v.config->'article_pattern'->>'signature' AS signature,
+          v.change_note
+   FROM source s JOIN site t ON t.id = s.site_id JOIN source_config_version v ON v.id = s.active_config_version_id
+   WHERE s.id IN (28, 49, 54, 76, 48, 55) ORDER BY s.id;
+   -- 기대 (DB 없이 다시 탐색한 결과): 28 SITEMAP /news/{**}/{n}/{n}/{n}/{n} · 49 RSS /news/{*}/article/all/{n}/{n}/{n}
+   --   · 54 RSS /article/{id} · 76 STATIC /?p={n}&reqIdx={n}&viewMode=* · 48 RSS /arti/{**}/{n}.html · 55 SITEMAP /{**}/{n}/{n}/{n}/{id}/
+   SELECT source_id, checked_at, article_count, unmatched_count, unmatched_ratio, top_unmatched
+   FROM pattern_check WHERE source_id IN (28, 49, 54, 76, 48, 55) ORDER BY source_id, checked_at DESC;
+   -- 다시 탐색 뒤 첫 주기 수집에서 새 설정으로 다시 잰다 (누락 비율이 0에 가까워야 한다)
    ```
 
-   새 설정은 한 실행에 기사 40건(`SENSING_MAX_ARTICLES`)까지, 사이트맵 최신 120건 안에서 고른다. 그보다 오래된 작은 분류 기사(오늘
-   확인한 누락 322건 중 일부)는 평소 수집으로는 다시 오지 않으니, 필요하면 소스 상세에서 과거 기사 채우기(BACKFILL)를 건다.
+   새 설정은 한 실행에 기사 40건(`SENSING_MAX_ARTICLES`)까지, 허브(사이트맵이면 최신 120건) 안에서 고른다. 그보다 오래된 누락 기사
+   (서울신문 작은 분류 322건, 한국경제 영숫자 번호, 동아일보 사회면 밖 등)는 평소 수집으로는 다시 오지 않으니, 필요하면 소스 상세에서
+   과거 기사 채우기(BACKFILL)를 건다.
 
-4. (선택) 상태 표시만 맞추기 — 다시 탐색하지 않는 9곳의 `site.robots_status`를 새 방식 값으로. 수집 동작은 바뀌지 않는다.
+6. (선택) 상태 표시만 맞추기 — 다시 탐색하지 않는 9곳의 `site.robots_status`를 새 방식 값으로. 수집 동작은 바뀌지 않는다.
 
    ```sql
    UPDATE site SET robots_status = 'ALLOWED'

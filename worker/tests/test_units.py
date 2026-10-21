@@ -10,8 +10,9 @@ import pytest
 from fakellm import FakeLlm, portal_recipe
 from sensing_worker.codes import Code, CrawlFailure
 from sensing_worker.config import Settings
-from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, merge_depths, merge_signatures,
-                                      parse_sitemap, pattern_from_signature, signature, sitemap_urls)
+from sensing_worker.discovery import (Discoverer, canonical_article_url, fold_subsumed, matches, merge_depths,
+                                      merge_signatures, parse_sitemap, pattern_from_signature, signature, sitemap_urls,
+                                      _widen_sections)
 from sensing_worker.evidence import EvidenceStore
 from sensing_worker.extract import Article, extract_article, links_with_dates
 from sensing_worker.jobs import discover
@@ -557,6 +558,68 @@ def test_ranked_patterns_merge_section_depths():
     assert merge_depths({"/news/a/{n}?p=*": 3, "/news/b/c/{n}": 3}) == {}
     assert merge_depths({"/kor/{n}/headquarters": 3, "/kor/a/{n}/sitemap": 3}) == {}
     assert merge_depths({"/news/a/view.do?id={n}": 3, "/news/b/c/view.do?id={n}": 3}) == {}  # 경로에 식별자가 없다
+
+
+def test_ranked_patterns_fold_shapes_the_wider_pattern_already_matches():
+    """2026-10-21 누락 점검: 한국경제 숫자 번호·영숫자 번호, 수원시 mode 있는·없는 상세 링크."""
+    # 한국경제: 숫자 번호가 더 많아도 두 모양을 다 맞히는 /article/{id}가 앞에 온다
+    hk = [f"https://www.hankyung.com/article/20261021{i:05d}" for i in range(6)] \
+        + [f"https://www.hankyung.com/article/2026102146{i:02d}g" for i in range(4)]
+    ranked = Discoverer._ranked_patterns(hk, 2)
+    assert ranked[0]["signature"] == "/article/{id}"
+    assert all(matches(u, ranked[0]) for u in hk)
+
+    # 수원시: mode 없는 서명이 mode 있는 링크도 맞히므로 앞에 온다. 메뉴(/?p={n})는 식별자 키가 달라 글을 흡수하지 못한다
+    base = "https://news.suwon.go.kr/"
+    with_mode = [f"{base}?mode=blog&p=22&reqIdx=2026102009251435{i:02d}&viewMode=view" for i in range(5)]
+    no_mode = [f"{base}?p=35&viewMode=view&reqIdx=2026102110044444{i:02d}" for i in range(3)]
+    menus = [f"{base}?p={i}" for i in range(50, 62)]
+    ranked = Discoverer._ranked_patterns(with_mode + no_mode + menus, 3)
+    assert ranked[0]["signature"] == "/?p={n}&reqIdx={n}&viewMode=*"
+    assert all(matches(u, ranked[0]) for u in with_mode + no_mode)
+    assert not any(matches(u, ranked[0]) for u in menus)
+    folded = fold_subsumed({"/?p={n}": 12, "/?p={n}&reqIdx={n}&viewMode=*": 3, "/?mode=*&p={n}&reqIdx={n}&viewMode=*": 5})
+    assert folded == {"/?p={n}": 12, "/?p={n}&reqIdx={n}&viewMode=*": 8, "/?mode=*&p={n}&reqIdx={n}&viewMode=*": 5}
+    # 고정 값(게시판별 종류)이 다르거나 조각 수가 다르면 흡수하지 않는다
+    assert fold_subsumed({"/v.do?bbsId=B01&id={n}": 3, "/v.do?bbsId=B02&id={n}": 4}) \
+        == {"/v.do?bbsId=B01&id={n}": 3, "/v.do?bbsId=B02&id={n}": 4}
+    assert fold_subsumed({"/a/{id}": 3, "/a/{n}/x": 4}) == {"/a/{id}": 3, "/a/{n}/x": 4}
+    # 글을 경로로 가리키면 남는 쿼리는 다른 게시판일 수 있다 (산업부 공지사항 ?mno=): 흡수하지 않는다
+    assert fold_subsumed({"/kor/article/{id}/{n}/view": 5, "/kor/article/{id}/{n}/view?mno=*": 4})         == {"/kor/article/{id}/{n}/view": 5, "/kor/article/{id}/{n}/view?mno=*": 4}
+
+
+def test_chosunbiz_arc_ids_and_section_depths():
+    """조선비즈(Arc XP): 26자 대문자 ID에 숫자가 없는 것도 있고, 섹션이 /policy/politics/president_office처럼 3단인 것도 있다."""
+    assert signature("https://biz.chosun.com/en/en-finance/2026/10/21/LOEDJZEKQNHLDOXRKAGNXNVDYY/") \
+        == "/en/en-finance/{n}/{n}/{n}/{id}/"
+    assert signature("https://x.com/news/ABOUTUS/") == "/news/ABOUTUS/"                    # 짧은 대문자 단어는 그대로
+    base = "https://biz.chosun.com"
+    urls = [f"{base}/{sec}/2026/10/21/FAMZC7LJIBE2TP2G7TQZJTXC{i:02d}/" for sec in
+            ("economy/finance", "industry/company", "stock/market") for i in range(4)] \
+        + [f"{base}/policy/politics/president_office/2026/10/21/FAMZC7LJIBE2TP2G7TQZJTXD{i:02d}/" for i in range(2)] \
+        + [f"{base}/en/en-finance/2026/10/21/LOEDJZEKQNHLDOXRKAGNXNVDY{c}/" for c in "ABC"] \
+        + [f"{base}/en/en-economy-finance/2026/10/21/FAMZC7LJIBE2TP2G7TQZJTXE{i:02d}/" for i in range(3)]  # 섹션이 {slug}로 보인다
+    ranked = Discoverer._ranked_patterns(urls, 2)
+    assert ranked[0]["signature"] == "/{**}/{n}/{n}/{n}/{id}/"
+    assert all(matches(u, ranked[0]) for u in urls)
+    assert not matches(f"{base}/2026/10/21/FAMZC7LJIBE2TP2G7TQZJTXC00/", ranked[0])     # 섹션 조각이 없으면 아니다
+    # 앞머리 없는 {**}는 꼬리가 날짜+번호처럼 자리 표시 3개 이상일 때만
+    assert merge_depths({"/a/{slug}": 3, "/b/c/{slug}": 3}) == {}
+    assert merge_depths({"/a/{n}/{id}": 3, "/b/c/{n}/{id}": 3}) == {}
+    assert merge_depths({"/a/{n}/{n}/{id}": 3, "/b/c/{n}/{n}/{id}": 3}) == {"/{**}/{n}/{n}/{id}": 6}
+
+
+def test_two_level_section_merges_are_written_as_section_depths():
+    """한겨레: RSS에는 /arti/{섹션}/{작은분류}/{n}.html만 보여도 사이트맵에는 3단(/arti/sports/sportstemp/asiangame/…)이 있다."""
+    hani = [f"https://www.hani.co.kr/arti/{sec}/{i}.html" for sec in
+            ("politics/politics_general", "society/health", "economy/finance") for i in range(1283400, 1283403)]
+    pattern = Discoverer._ranked_patterns(hani, 2)[0]
+    assert pattern["signature"] == "/arti/{**}/{n}.html"
+    assert matches("https://www.hani.co.kr/arti/sports/sportstemp/asiangame/1283322.html", pattern)
+    assert _widen_sections("/{*}/{*}/{n}/{n}/{n}/{id}/") == "/{**}/{n}/{n}/{n}/{id}/"   # 앞머리 없어도 날짜+번호 꼬리
+    assert _widen_sections("/{*}/{*}/{slug}") == "/{*}/{*}/{slug}"                     # 앞머리도 없고 꼬리도 약하다
+    assert _widen_sections("/news/{*}/{n}") == "/news/{*}/{n}"                         # 한 단은 그대로
+    assert _widen_sections("/kor/{n}/{*}/{*}/{n}") == "/kor/{n}/{*}/{*}/{n}"           # 앞머리에 자리 표시
 
 
 def test_discover_merges_section_paths_into_one_article_pattern():
@@ -1303,6 +1366,31 @@ def test_crawl_with_legacy_single_pattern_config_is_unchanged(tmp_path):
         stats = runner._crawl(job, {"domain": "127.0.0.1", "active_config_version_id": None}, config)
         assert stats.found == 8 and stats.new == 8 and stats.errors == 0      # 보도자료만 (색인의 최신 하위 3개에서)
         assert {c.kwargs["section"] for c in store.upsert_document.call_args_list} == {None}   # 상세 메타 그대로
+    finally:
+        runner.f.close()
+        site.close()
+
+
+def test_crawl_continues_when_pattern_check_table_is_missing(tmp_path):
+    """워커를 백엔드(V21 pattern_check)보다 먼저 배포해도 주기 수집은 그대로 돈다 — 누락 점검만 건너뛴다."""
+    import psycopg
+    from sensing_worker.db import Job
+    from sensing_worker.jobs import JobRunner
+    site = _policy_site()
+    s = Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True, evidence_dir=str(tmp_path))
+    store = MagicMock()
+    store.found_baseline.return_value = None
+    store.known_urls.return_value = set()
+    store.upsert_document.return_value = (1, "NEW")
+    store.pattern_check_due.side_effect = psycopg.errors.UndefinedTable('relation "pattern_check" does not exist')
+    runner = JobRunner(store, PoliteFetcher(s), s, llm=NoLlm())
+    job = Job(id=7, source_id=3, job_type="CRAWL", trigger="SCHEDULE", config_version_id=None, attempt=1)
+    config = {"method": "SITEMAP", "hubs": [f"{site.base}/sitemapindex.xml"], "site_domain": "127.0.0.1",
+              "article_pattern": pattern_from_signature("/briefing/pressReleaseView.do?newsId={n}")}
+    try:
+        stats = runner._crawl(job, {"domain": "127.0.0.1", "active_config_version_id": None}, config)
+        assert stats.found == 8 and stats.new == 8
+        store.save_pattern_check.assert_not_called()
     finally:
         runner.f.close()
         site.close()

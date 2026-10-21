@@ -321,6 +321,29 @@ class Store:
             """, (source_id, config_version_id, runs)).fetchone()
         return float(row["a"]) if row["n"] >= min_runs else None
 
+    def pattern_check_due(self, source_id: int, config_version_id: int | None, hours: float) -> bool:
+        """누락 점검 차례인가: 점검이 없거나, 마지막 점검이 hours시간보다 오래됐거나, 그 뒤 설정 버전이 바뀌었으면(재탐색) True."""
+        row = self.conn.execute(
+            """
+            SELECT checked_at >= now() - %s * interval '1 hour' AS fresh, config_version_id
+            FROM pattern_check WHERE source_id = %s ORDER BY checked_at DESC, id DESC LIMIT 1
+            """, (hours, source_id)).fetchone()
+        return row is None or not row["fresh"] or row["config_version_id"] != config_version_id
+
+    def save_pattern_check(self, source_id: int, config_version_id: int | None, reference: str,
+                           reference_urls: list[str], m) -> None:
+        """누락 점검 결과 한 줄 (m: pattern_check.PatternMeasure). 90일 지난 점검은 지운다."""
+        with self.conn.transaction():
+            self.conn.execute(
+                """
+                INSERT INTO pattern_check (source_id, config_version_id, reference, reference_urls, article_count,
+                                           matched_count, off_count, unmatched_count, unmatched_ratio, top_unmatched)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
+                """, (source_id, config_version_id, reference, json.dumps(reference_urls, ensure_ascii=False), m.article,
+                      m.matched, m.off, m.unmatched, m.ratio, json.dumps(m.top, ensure_ascii=False)))
+            self.conn.execute("DELETE FROM pattern_check WHERE source_id = %s AND checked_at < now() - interval '90 days'",
+                              (source_id,))
+
     def recent_new_counts(self, source_id: int, runs: int) -> list[int]:
         """최근 주기 수집(CRAWL, SUCCESS·PARTIAL)의 새 문서 수, 최신순. 주기 자동 조정의 재료.
 

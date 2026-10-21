@@ -549,4 +549,68 @@ class BulkOpsIT {
         assertThat(jdbc.sql("SELECT string_agg(action, ',' ORDER BY id) FROM audit_log").query(String.class).single())
                 .isEqualTo("SOURCE_UPDATED,SOURCE_UPDATED");
     }
+
+    // ------------------------------------------------------------------ 누락 점검 (V21 pattern_check)
+
+    /** 활성 설정 버전을 하나 더 만들어 source.active_config_version_id로 삼는다. */
+    private long activeConfig(long sourceId, int version) {
+        long id = jdbc.sql("INSERT INTO source_config_version (source_id, version, config, status) VALUES (?, ?, '{}'::jsonb, 'ACTIVE') "
+                + "RETURNING id").params(sourceId, version).query(Long.class).single();
+        jdbc.sql("UPDATE source SET active_config_version_id = ? WHERE id = ?").params(id, sourceId).update();
+        return id;
+    }
+
+    /** 워커 pattern_check.save_pattern_check가 남기는 행을 흉내 낸다. */
+    private void patternCheck(long sourceId, long configVersionId, String ago, int articles, int unmatched, String top) {
+        jdbc.sql("""
+                INSERT INTO pattern_check (source_id, config_version_id, checked_at, reference, reference_urls, article_count,
+                                           matched_count, off_count, unmatched_count, unmatched_ratio, top_unmatched)
+                VALUES (?, ?, now() - CAST(? AS interval), 'HUB+SITEMAP', '["https://x/sitemap.xml"]'::jsonb, ?, ?, 0, ?,
+                        round(?::numeric / GREATEST(?, 1), 4), ?::jsonb)
+                """).params(sourceId, configVersionId, ago, articles, articles - unmatched, unmatched, unmatched, articles, top)
+                .update();
+    }
+
+    @Test
+    void patternChecksListLatestCheckPerSourceWithRediscoveryCandidatesFirst() {
+        long donga = source("donga.example.org", "ACTIVE", 60, "1 hour");
+        long seoul = source("seoul.example.org", "ACTIVE", 60, "1 hour");
+        long hani = source("hani.example.org", "ACTIVE", 60, "1 hour");
+        long small = source("small.example.org", "ACTIVE", 60, "1 hour");
+        long gone = source("gone.example.org", "EXCLUDED", 60, "1 hour");
+        source("never.example.org", "ACTIVE", 60, "1 hour");                       // 점검이 없으면 빠진다
+        String top = "[{\"signature\":\"/news/Politics/article/all/{n}/{n}/{n}\",\"count\":42,\"example\":\"https://x/a\"}]";
+        long dongaV1 = activeConfig(donga, 1);
+        patternCheck(donga, dongaV1, "2 days", 122, 10, "[]");                     // 오래된 점검은 쓰지 않는다
+        patternCheck(donga, dongaV1, "1 hour", 122, 99, top);
+        long seoulV1 = activeConfig(seoul, 1);
+        patternCheck(seoul, seoulV1, "3 hours", 721, 353, "[]");
+        activeConfig(seoul, 2);                                                    // 그 뒤 다시 탐색 → 후보에서 뺀다
+        patternCheck(hani, activeConfig(hani, 1), "1 hour", 250, 3, "[]");         // 1%
+        patternCheck(small, activeConfig(small, 1), "1 hour", 4, 2, "[]");         // 50%지만 2건뿐
+        patternCheck(gone, activeConfig(gone, 1), "1 hour", 100, 90, "[]");
+
+        HttpHeaders viewer = new HttpHeaders();
+        viewer.set("X-User", "viewer");
+        assertThat(http.exchange("/api/v1/ops/pattern-checks", HttpMethod.GET, new HttpEntity<>(viewer), String.class)
+                .getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        JsonNode checks = get("admin", "/api/v1/ops/pattern-checks");
+        assertThat(checks.findValuesAsText("domain"))
+                .containsExactly("donga.example.org", "small.example.org", "seoul.example.org", "hani.example.org");
+        JsonNode d = checks.get(0);
+        assertThat(d.get("sourceId").asLong()).isEqualTo(donga);
+        assertThat(d.get("candidate").asBoolean()).isTrue();
+        assertThat(d.get("stale").asBoolean()).isFalse();
+        assertThat(d.get("articleCount").asInt()).isEqualTo(122);
+        assertThat(d.get("unmatchedCount").asInt()).isEqualTo(99);
+        assertThat(d.get("unmatchedRatio").asDouble()).isEqualTo(0.8115);
+        assertThat(d.get("reference").asText()).isEqualTo("HUB+SITEMAP");
+        assertThat(d.get("topUnmatched").get(0).get("signature").asText()).isEqualTo("/news/Politics/article/all/{n}/{n}/{n}");
+        assertThat(checks.get(1).get("candidate").asBoolean()).isFalse();          // 누락 2건은 기준(5건) 아래
+        JsonNode s = checks.get(2);
+        assertThat(s.get("stale").asBoolean()).isTrue();
+        assertThat(s.get("candidate").asBoolean()).isFalse();
+        assertThat(checks.get(3).get("candidate").asBoolean()).isFalse();
+    }
 }

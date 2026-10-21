@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlsplit
 
+import psycopg
+
 from .apis import ApiConnector, Provider, catalog as api_catalog, make_check_connector, make_connector
 from .apis import lookup as api_lookup
 from .codes import API_KEY_CODES, Code, CrawlFailure, MESSAGES
@@ -27,6 +29,7 @@ from .extract import Article, extract_article, links_with_dates
 from .fetcher import EVIDENCE_CHARS, Page, PoliteFetcher
 from .llm import LlmClient, LlmUnavailable, NoLlm, make_llm
 from . import portal
+from . import pattern_check
 from .backfill import run_backfill
 from .policy import defaults_for, guess_site_type, is_routine_notice, next_interval, passes_quality
 from .recipe import propose_recipe
@@ -509,6 +512,7 @@ class JobRunner:
         # 허브 열기
         entries_by_hub: dict[str, list[tuple[str, str | None]]] = {}
         sitemap_hubs: set[str] = set()   # 날짜가 lastmod인 허브 (목록·피드 날짜보다 약한 힌트)
+        hub_origin: dict[str, str] = {}  # 허브 → 피드·사이트맵·HTML 목록 (누락 점검이 HTML 목록의 메뉴 링크를 거르는 데 쓴다)
         first_hub_html: str | None = None
         hub_failures: list[CrawlFailure] = []  # 못 연 허브의 비차단 오류 (섹션 하나가 404여도 수집은 계속한다)
         for hub in hubs:
@@ -528,6 +532,8 @@ class JobRunner:
             entries_by_hub[hub] = page_entries(self.f, page, self.s.max_articles_per_run * 3)
             if looks_like_sitemap(page.text):
                 sitemap_hubs.add(hub)
+            hub_origin[hub] = (pattern_check.SITEMAP if hub in sitemap_hubs
+                               else pattern_check.FEED if looks_like_feed(page.text) else pattern_check.LIST)
         if not entries_by_hub and hub_failures:
             # 허브를 하나도 못 열었다 → 마지막 오류로 실패 처리 (run()이 기록·반영). 앞의 오류는 여기서 남긴다
             for hf in hub_failures[:-1]:
@@ -559,6 +565,8 @@ class JobRunner:
             groups.append(group)
         hints = ChainMap(strong, weak)
         stats.found = len(taken)
+        # 누락 점검(하루 한 번): 패턴이 하나도 맞지 않아 아래에서 PARSE_EMPTY로 끝나는 실행도 재 둔다
+        self._check_patterns(job, source, config, domain, entries_by_hub, hub_origin)
 
         hub_evidence = (first_hub_html or "")[:EVIDENCE_CHARS] or None
         if not taken:
@@ -626,6 +634,37 @@ class JobRunner:
             stats.errors += 1
             stats.anomalies += 1
         return stats
+
+    def _check_patterns(self, job: Job, source: dict, config: dict, domain: str,
+                        entries_by_hub: dict[str, list[tuple[str, str | None]]], hub_origin: dict[str, str]) -> None:
+        """누락 점검 (pattern_check): 이미 연 허브의 주소에 robots가 허용한 사이트맵 하나를 더해, 기사로 보이는 주소 중 켜진 종류에
+        맞지 않는 비율을 남긴다. 주기 수집(CRAWL)의 사이트 소스에서만, settings.pattern_check_hours마다(설정 버전이 바뀌면 바로) 한 번.
+        사이트맵을 못 읽어도 수집은 계속한다. 차단 신호만은 평소처럼 수집을 멈춘다. 점검 표(V21)가 아직 없으면(백엔드보다 워커를 먼저
+        배포) 점검만 건너뛴다."""
+        hours = self.s.pattern_check_hours
+        version = source.get("active_config_version_id")
+        if hours <= 0 or job.job_type != "CRAWL" or source.get("kind", "SITE") != "SITE":
+            return
+        try:
+            if not self.db.pattern_check_due(job.source_id, version, hours):
+                return
+        except psycopg.Error as e:
+            log.warning("pattern check skipped source=%s: %s", job.source_id, str(e).splitlines()[0][:200])
+            return
+        entries = [(u, hub_origin.get(hub, pattern_check.LIST)) for hub, rows in entries_by_hub.items() for u, _ in rows]
+        base_url = source.get("base_url") or next(iter(entries_by_hub), None)
+        sitemaps = self.f.sitemaps(base_url) if base_url else []
+        sitemap, urls = pattern_check.sitemap_reference(self.f.get, sitemaps, domain, skip=set(entries_by_hub))
+        entries += [(u, pattern_check.SITEMAP) for u in urls]
+        m = pattern_check.measure(entries, config, domain)
+        refs = list(entries_by_hub) + ([sitemap] if sitemap else [])
+        try:
+            self.db.save_pattern_check(job.source_id, version, "HUB+SITEMAP" if sitemap else "HUB", refs, m)
+        except psycopg.Error as e:
+            log.warning("pattern check not saved source=%s: %s", job.source_id, str(e).splitlines()[0][:200])
+            return
+        log.info("pattern check source=%s domain=%s: %s/%s unmatched (%.0f%%)%s", job.source_id, domain, m.unmatched,
+                 m.article, m.ratio * 100, f" top={m.top[0]['signature']}" if m.top else "")
 
     def _crawl_api(self, job: Job, source: dict, config: dict, *, connector: ApiConnector | None = None,
                    secret: str | None = None) -> CrawlStats:
