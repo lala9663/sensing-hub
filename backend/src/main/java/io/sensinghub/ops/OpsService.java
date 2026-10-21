@@ -9,6 +9,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.auth.Role;
 import io.sensinghub.llm.LlmLedger;
@@ -90,17 +94,37 @@ public class OpsService {
                                boolean overdue) {
     }
 
+    /**
+     * 누락 점검 한 줄 (pattern_check, V21): 소스의 마지막 점검. 워커가 주기 수집 중 하루 한 번(설정이 바뀌면 바로), 허브와 robots가 허용한
+     * 사이트맵 하나의 기사 주소 중 켜진 기사 종류에 맞지 않는 비율을 잰다.
+     * @param topUnmatched 맞지 않는 주소 모양 [{signature, count, example}] 많은 순
+     * @param stale        점검 뒤 설정 버전이 바뀌었다 (다시 탐색함 — 다음 수집에서 다시 잰다)
+     * @param candidate    재탐색 후보: 지금 설정으로 잰 점검에서 누락 비율이 {@link #PATTERN_MISS_RATIO} 이상이고 누락 주소가
+     *                     {@link #PATTERN_MISS_MIN}개 이상
+     */
+    public record PatternCheck(long sourceId, String domain, String name, String status, String method,
+                               OffsetDateTime checkedAt, String reference, int articleCount, int matchedCount, int offCount,
+                               int unmatchedCount, double unmatchedRatio, JsonNode topUnmatched, boolean stale,
+                               boolean candidate) {
+    }
+
+    /** 재탐색 후보 기준: 누락 비율 20% 이상, 누락 주소 5개 이상 (기사 몇 건뿐인 작은 목록의 흔들림은 빼려고 개수도 본다). */
+    static final double PATTERN_MISS_RATIO = 0.2;
+    static final int PATTERN_MISS_MIN = 5;
+
     private final JdbcClient jdbc;
     private final ReviewQueueService reviewQueue;
     private final LlmLedger llmLedger;
     private final int enrichDailyCalls;
+    private final ObjectMapper json;
 
     public OpsService(JdbcClient jdbc, ReviewQueueService reviewQueue, LlmLedger llmLedger,
-                      @Value("${sensing.llm.enrich-daily-calls:300}") int enrichDailyCalls) {
+                      @Value("${sensing.llm.enrich-daily-calls:300}") int enrichDailyCalls, ObjectMapper json) {
         this.jdbc = jdbc;
         this.reviewQueue = reviewQueue;
         this.llmLedger = llmLedger;
         this.enrichDailyCalls = enrichDailyCalls;
+        this.json = json;
     }
 
     public Overview overview(CurrentUser user) {
@@ -143,6 +167,40 @@ public class OpsService {
                 dbl(rs, "avg_found"), dbl(rs, "avg_new"),
                 rs.getString("last_job_status"), rs.getObject("last_job_at", OffsetDateTime.class),
                 rs.getBoolean("overdue"))).list();
+    }
+
+    /** 사이트 소스(EXCLUDED 제외)마다 마지막 누락 점검. 재탐색 후보 → 누락 비율이 높은 순. 점검이 없는 소스는 빠진다. */
+    public List<PatternCheck> patternChecks(CurrentUser user) {
+        user.require(Role.ADMIN);
+        return jdbc.sql("""
+                SELECT s.id, t.domain, s.name, s.status, s.method, p.checked_at, p.reference, p.article_count, p.matched_count,
+                       p.off_count, p.unmatched_count, p.unmatched_ratio, p.top_unmatched::text AS top_unmatched,
+                       p.config_version_id IS DISTINCT FROM s.active_config_version_id AS stale
+                FROM source s
+                JOIN site t ON t.id = s.site_id
+                JOIN LATERAL (SELECT * FROM pattern_check WHERE source_id = s.id ORDER BY checked_at DESC, id DESC LIMIT 1) p ON true
+                WHERE s.kind = 'SITE' AND s.status <> 'EXCLUDED'
+                ORDER BY p.unmatched_ratio DESC, p.unmatched_count DESC, s.id
+                """).query((rs, n) -> {
+                    boolean stale = rs.getBoolean("stale");
+                    double ratio = rs.getBigDecimal("unmatched_ratio").doubleValue();
+                    int unmatched = rs.getInt("unmatched_count");
+                    return new PatternCheck(rs.getLong("id"), rs.getString("domain"), rs.getString("name"),
+                            rs.getString("status"), rs.getString("method"), rs.getObject("checked_at", OffsetDateTime.class),
+                            rs.getString("reference"), rs.getInt("article_count"), rs.getInt("matched_count"),
+                            rs.getInt("off_count"), unmatched, ratio, readJson(rs.getString("top_unmatched")), stale,
+                            !stale && ratio >= PATTERN_MISS_RATIO && unmatched >= PATTERN_MISS_MIN);
+                }).list().stream()
+                .sorted(java.util.Comparator.comparing((PatternCheck c) -> !c.candidate()))
+                .toList();
+    }
+
+    private JsonNode readJson(String text) {
+        try {
+            return json.readTree(text == null ? "[]" : text);
+        } catch (JsonProcessingException e) {
+            return json.createArrayNode();
+        }
     }
 
     // ------------------------------------------------------------------

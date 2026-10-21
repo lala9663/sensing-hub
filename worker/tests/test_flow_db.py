@@ -1755,3 +1755,42 @@ def test_relabel_replaces_llm_relation_labels_with_list_labels(env):
     store.conn.execute("UPDATE company_relation SET aliases = '[]' WHERE id = %s", (samsung,))
     again = relabel(store, dry_run=True)
     assert again.changed == 1 and again.samples[0][:3] == (body, ["산업동향", "자사"], ["산업동향"])
+
+
+def test_crawl_records_daily_pattern_check_and_rechecks_after_config_change(env):
+    """누락 점검: 주기 수집이 허브의 기사 주소 중 켜진 종류에 맞지 않는 비율을 하루 한 번 남긴다 (설정이 바뀌면 바로 다시)."""
+    from fakesite import seoul_routes, with_base
+    from sensing_worker.discovery import pattern_from_signature
+    store, runner, settings, sites = env
+    site = Site({}); sites.append(site)
+    site.routes.update(with_base(seoul_routes(), site.base))
+    source_id = register(store, site.base)
+    assert process_one(store, runner, settings) == "SUCCESS"                 # ONBOARD: 첫 수집에서는 재지 않는다
+    assert q(store, "SELECT count(*) AS c FROM pattern_check")["c"] == 0
+
+    def crawl():
+        store.conn.execute("INSERT INTO crawl_job (source_id, job_type, trigger) VALUES (%s, 'CRAWL', 'MANUAL')", (source_id,))
+        process_one(store, runner, settings)
+        return store.conn.execute("SELECT * FROM pattern_check ORDER BY id").fetchall()
+
+    rows = crawl()
+    assert len(rows) == 1
+    r = rows[0]
+    # robots의 사이트맵이 곧 허브라 다시 받지 않는다. {**} 패턴이 사이트맵 20건을 모두 잡는다
+    assert r["reference"] == "HUB" and r["reference_urls"] == [f"{site.base}/sitemap/sitemap_latestArticle"]
+    assert (r["article_count"], r["matched_count"], r["unmatched_count"], float(r["unmatched_ratio"])) == (20, 20, 0, 0.0)
+
+    # 예전처럼 작은 분류 없는 패턴 하나로 바꾸면(설정 새 버전) 다음 수집에서 바로 다시 잰다
+    cfg = q(store, "SELECT v.config FROM source s JOIN source_config_version v ON v.id = s.active_config_version_id "
+                   "WHERE s.id = %s", source_id)["config"]
+    narrow = {k: v for k, v in cfg.items() if k != "article_patterns"}
+    narrow["article_pattern"] = pattern_from_signature("/news/{*}/{n}/{n}/{n}/{n}")
+    store.activate_new_config(source_id, narrow, "test: legacy pattern", 60)
+    rows = crawl()
+    assert len(rows) == 2
+    r = rows[1]
+    assert (r["article_count"], r["matched_count"], r["unmatched_count"]) == (20, 9, 11)
+    assert float(r["unmatched_ratio"]) == 0.55
+    assert r["top_unmatched"][0]["signature"].startswith("/news/")
+    assert {t["signature"] for t in r["top_unmatched"]} >= {"/news/sport/golf/iceberggolf/{n}/{n}/{n}/{n}"}
+    assert len(crawl()) == 2                                                  # 하루 안에는 다시 재지 않는다

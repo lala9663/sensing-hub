@@ -25,6 +25,7 @@ dev = ["pytest>=8.3"]
 [project.scripts]
 sensing-worker = "sensing_worker.main:main"
 sensing-discovery-eval = "sensing_worker.evaluate:main"
+sensing-robots-recheck = "sensing_worker.robots_recheck:main"
 sensing-watch-backfill = "sensing_worker.backfill_watch:main"
 sensing-index-backfill = "sensing_worker.indexer:main"
 sensing-embed-backfill = "sensing_worker.embed:main"

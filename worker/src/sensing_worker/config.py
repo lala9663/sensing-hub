@@ -141,3 +141,6 @@ class Settings:
     # 목록 페이지를 거꾸로 넘길 때 허브 하나에서 볼 쪽 수 상한
     backfill_max_sitemaps: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_MAX_SITEMAPS", "60")))
     backfill_max_pages: int = field(default_factory=lambda: int(os.getenv("SENSING_BACKFILL_MAX_PAGES", "300")))
+    # 누락 점검(pattern_check): 주기 수집 중 이 시간(시)마다 한 번, 허브와 robots가 허용한 사이트맵 하나의 기사 주소 중 켜진 종류에
+    # 맞지 않는 비율을 남긴다 (설정 버전이 바뀌면 바로 다시 잰다). 0이면 끈다
+    pattern_check_hours: float = field(default_factory=lambda: float(os.getenv("SENSING_PATTERN_CHECK_HOURS", "24")))

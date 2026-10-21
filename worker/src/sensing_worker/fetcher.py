@@ -2,7 +2,7 @@
 
 모든 사이트에 공통으로 적용한다.
 - 도메인 단위 최소 요청 간격, 식별 가능한 User-Agent
-- robots.txt 판정 (24시간 캐시)
+- robots.txt 판정 (RFC 9309: 가장 길게 맞는 규칙, 같은 길이면 Allow. robots.py, 24시간 캐시)
 - 5xx·타임아웃 재시도와 백오프, Retry-After 준수
 - 차단 신호(403·429·봇 확인 화면·로그인)는 재시도하지 않고 즉시 실패로 분류
 - 내부망 주소로 풀리는 호스트 접속 차단
@@ -18,7 +18,6 @@ import re
 import socket
 import ssl
 import time
-import urllib.robotparser
 import zlib
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
@@ -27,6 +26,7 @@ import httpx
 
 from .codes import Code, CrawlFailure
 from .config import Settings
+from .robots import RobotsRules
 from .throttle import DbThrottle, LocalThrottle
 
 CHALLENGE_MARKERS = (
@@ -91,7 +91,7 @@ class PoliteFetcher:
         self.compat_hosts: set[str] = set()
         # 워커 여러 대가 돌 때는 DbThrottle을 넘겨 도메인 간격을 공유한다
         self.throttle = throttle or LocalThrottle(settings.min_interval_seconds)
-        self._robots: dict[str, tuple[float, urllib.robotparser.RobotFileParser | None, str]] = {}
+        self._robots: dict[str, tuple[float, RobotsRules | None, str]] = {}
         self.request_count = 0
 
     def _make_client(self, transport: httpx.BaseTransport | None, verify: ssl.SSLContext | bool = True) -> httpx.Client:
@@ -129,7 +129,7 @@ class PoliteFetcher:
 
     def sitemaps(self, base_url: str) -> list[str]:
         rp, _, _ = self._load_robots(base_url)
-        return list(rp.site_maps() or []) if rp else []
+        return list(rp.sitemaps) if rp else []
 
     def allowed(self, url: str) -> bool:
         rp, _, _ = self._load_robots(url)
@@ -142,20 +142,14 @@ class PoliteFetcher:
         cached = self._robots.get(root)
         if cached and time.time() - cached[0] < 24 * 3600:
             return cached[1], cached[0], cached[2]
-        rp: urllib.robotparser.RobotFileParser | None = None
+        rp: RobotsRules | None = None
         status = "MISSING"
         try:
             page = self._request(root + "/robots.txt", check_robots=False, classify=False)
             body = page.text if page.status == 200 else ""
             if page.status == 200 and "<html" not in body[:500].lower():
-                rp = urllib.robotparser.RobotFileParser()
-                rp.parse(body.splitlines())
-                if not rp.can_fetch(self.s.user_agent, root + "/"):
-                    status = "DISALLOWED"
-                elif "disallow:" in body.lower():
-                    status = "PARTIAL"
-                else:
-                    status = "ALLOWED"
+                rp = RobotsRules(body)
+                status = rp.status(self.s.user_agent, root)
         except CrawlFailure:
             status = "MISSING"
         self._robots[root] = (time.time(), rp, status)

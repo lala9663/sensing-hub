@@ -1,6 +1,6 @@
 'use strict';
 
-/** 관리자 운영 지표: /ops/overview 를 카드로, 30초마다 갱신. */
+/** 관리자 운영 지표: /ops/overview 를 카드로, 30초마다 갱신. 아래에 소스별 기사 주소 누락 점검(/ops/pattern-checks). */
 App.route('/admin/ops', async (view) => {
   const { api, esc, badge } = App;
 
@@ -15,7 +15,7 @@ App.route('/admin/ops', async (view) => {
   }
 
   async function load() {
-    const o = await api('GET', '/ops/overview');
+    const [o, checks] = await Promise.all([api('GET', '/ops/overview'), api('GET', '/ops/pattern-checks')]);
     view.querySelector('#generated').textContent = `기준 ${App.fmtDateTime(o.generatedAt)} · 30초마다 갱신`;
     const q = o.jobQueue || {};
     const j = o.jobs24h || {};
@@ -77,6 +77,40 @@ App.route('/admin/ops', async (view) => {
       <div class="card" style="grid-column:1 / -1">
         <h3>워커 <span class="muted small" style="font-weight:400">30초마다 신호 · 2분 넘게 없으면 멈춤으로 봄 · 최근 24시간</span></h3>
         ${workerTable(o.workers || [])}
+      </div>
+      ${patternCard(checks || [])}`;
+  }
+
+  const SHOW_CHECKS = 15;
+
+  /** 기사 주소 누락 점검: 공개 목록(허브·robots가 허용한 사이트맵)의 기사 주소 중 켜진 기사 종류에 맞지 않는 비율 (V21 pattern_check). */
+  function patternCard(checks) {
+    const candidates = checks.filter(c => c.candidate).length;
+    const rows = checks.slice(0, SHOW_CHECKS).map(c => {
+      const top = (c.topUnmatched || [])[0];
+      const pct = `${(Number(c.unmatchedRatio) * 100).toFixed(0)}%`;
+      return `
+      <tr>
+        <td><a href="#/admin/sources/${c.sourceId}">${esc(c.domain)}</a> ${badge(c.status)}</td>
+        <td class="small">${esc(c.method || '-')} · ${esc(c.reference)}</td>
+        <td class="right">${App.fmtNum(c.articleCount)}${c.offCount ? ` <span class="muted small">(꺼진 종류 ${App.fmtNum(c.offCount)})</span>` : ''}</td>
+        <td class="right ${c.candidate ? 'warn' : ''}"><b>${App.fmtNum(c.unmatchedCount)}</b> <span class="small">${pct}</span></td>
+        <td class="small">${top ? `<code>${esc(top.signature)}</code> ${App.fmtNum(top.count)}건 <a href="${esc(top.example)}" target="_blank" rel="noopener">예</a>` : '<span class="muted">-</span>'}</td>
+        <td>${c.candidate ? '<span class="badge badge-orange">재탐색 후보</span>'
+          : c.stale ? '<span class="muted small">다시 탐색함 · 다음 수집에서 다시 잼</span>' : ''}</td>
+        <td class="small muted">${App.fmtDateTime(c.checkedAt)}</td>
+      </tr>`;
+    }).join('');
+    return `
+      <div class="card" style="grid-column:1 / -1">
+        <h3>기사 주소 누락 점검 <span class="muted small" style="font-weight:400">허브·사이트맵의 기사 주소 중 켜진 기사 종류에 맞지 않는 비율 · 소스마다 하루 한 번
+          · 20% 이상이고 5건 이상이면 재탐색 후보 (소스 상세의 '다시 탐색')</span></h3>
+        ${checks.length ? `
+          <div class="${candidates ? 'warn' : ''}" style="${candidates ? '' : 'color:var(--green)'}">${candidates ? `재탐색 후보 ${App.fmtNum(candidates)}곳` : '재탐색 후보가 없습니다'}</div>
+          <table class="mt"><thead><tr><th>소스</th><th>방식 · 비교 목록</th><th class="right">기사 주소</th><th class="right">누락</th><th>가장 많이 빠진 모양</th><th></th><th>점검</th></tr></thead>
+          <tbody>${rows}</tbody></table>
+          ${checks.length > SHOW_CHECKS ? `<div class="muted small mt">누락 비율이 높은 ${SHOW_CHECKS}곳만 보입니다 (전체 ${App.fmtNum(checks.length)}곳).</div>` : ''}`
+          : '<div class="muted small">아직 점검한 소스가 없습니다. 워커가 주기 수집 중에 하루 한 번 잽니다.</div>'}
       </div>`;
   }
 

@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import io.sensinghub.auth.CurrentUser;
 import io.sensinghub.ops.OpsService.Overview;
+import io.sensinghub.ops.OpsService.PatternCheck;
 import io.sensinghub.ops.OpsService.SourceHealth;
 
 /** 관리자 운영 지표 (M3): 대량 소스를 한 화면에서 운영하기 위한 집계. */
@@ -33,5 +34,11 @@ public class OpsController {
     public List<SourceHealth> sourceHealth(CurrentUser user, @RequestParam(required = false) String status,
                                            @RequestParam(defaultValue = "200") int limit) {
         return service.sourceHealth(user, status, limit);
+    }
+
+    /** 소스마다 마지막 누락 점검(공개 목록의 기사 주소 중 켜진 기사 종류에 맞지 않는 비율). 재탐색 후보가 먼저, 누락 비율이 높은 순. */
+    @GetMapping("/pattern-checks")
+    public List<PatternCheck> patternChecks(CurrentUser user) {
+        return service.patternChecks(user);
     }
 }
