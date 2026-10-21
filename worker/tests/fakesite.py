@@ -222,6 +222,37 @@ def sectioned_news_routes(sections=("economy", "society"), per_section=4) -> dic
     return routes
 
 
+def seoul_routes() -> dict:
+    """서울신문형 (2026-10-21): robots.txt가 "Allow:/"를 맨 앞에 두고 "Disallow : /xml/"로 홈이 알리는 RSS(/xml/rss/…)를 막는다.
+    기사 주소는 /news/{섹션}/{yyyy}/{mm}/{dd}/{id}와 작은 분류가 붙은 /news/{섹션}/{작은분류}/{yyyy}/…가 섞여 있고
+    (골프는 3단), robots가 허용한 사이트맵(/sitemap/sitemap_latestArticle)에 모두 있다. 주소의 {base}는 호출자가 채운다."""
+    paths = ([f"/news/{sec}/2026/10/21/202610215{k}{i:04d}" for k, sec in enumerate(("politics", "society", "economy"))
+              for i in range(3)]
+             + [f"/news/{sec}/2026/10/21/202610216{k}{i:04d}" for k, sec in enumerate(
+                 ("economy/industry", "society/accident", "international/topic-global")) for i in range(3)]
+             + [f"/news/sport/golf/iceberggolf/2026/10/21/2026102170{i:04d}" for i in range(2)])
+    rss = "".join(f"<item><title>기사 {p}</title><link>{{base}}{p}</link></item>" for p in paths)
+    sitemap = ('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+               + "".join(f"<url><loc>{{base}}{p}</loc><lastmod>{_iso(i / 24)}</lastmod></url>" for i, p in enumerate(paths))
+               + "</urlset>")
+    routes = {
+        "/": (200, "text/html; charset=utf-8", """<html><head><title>서울 테스트 신문</title>
+              <link rel="alternate" type="application/rss+xml" href="/xml/rss/google_top.xml"></head>
+              <body><nav><a href="/newsList/economy/">경제</a></nav></body></html>"""),
+        "/robots.txt": (200, "text/plain", "User-agent: *\nAllow:/\nDisallow : /xml/\nDisallow : /members/\n\n"
+                                           "Sitemap: {base}/sitemap/sitemap_latestArticle\n"),
+        "/xml/rss/google_top.xml": (200, "application/rss+xml", f"<rss><channel>{rss}</channel></rss>"),
+        "/sitemap/sitemap_latestArticle": (200, "application/xml", sitemap),
+    }
+    for i, p in enumerate(paths):
+        routes[p] = (200, "text/html; charset=utf-8", f"""<html><head><title>기사 {i}번 | 서울 테스트 신문</title>
+            <meta property="og:type" content="article"><meta property="og:title" content="기사 {i}번">
+            <meta property="article:section" content="{p.split('/')[2]}">
+            <meta property="article:published_time" content="{_iso(1)}"></head>
+            <body><article><p>{BODY}</p><p>{BODY}</p></article></body></html>""")
+    return routes
+
+
 # 정책브리핑(korea.kr)형: (하위 사이트맵, 상세 경로, 종류 이름, 글 수, 상세 품질)
 POLICY_KINDS = (
     ("brief", "/briefing/pressReleaseView.do", "보도자료", 8, "good"),

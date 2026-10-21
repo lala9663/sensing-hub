@@ -80,6 +80,9 @@ ID_SEGMENT_RE = re.compile(r"^(?=.*\d.*\d.*\d)[A-Za-z0-9_-]{6,}$")  # 숫자 3�
 SLUG_SEGMENT_RE = re.compile(r"^(?=.*[a-z])[a-z0-9]+(?:-[a-z0-9]+){2,}$")
 SLUG_REGEX = r"[a-z0-9]+(?:-[a-z0-9]+){2,}"
 WILDCARD_REGEX = r"[^/]+"                      # {*}: 경로 조각 하나 (섹션 이름처럼 기사마다 다른 고정 단어)
+MAX_SECTION_DEPTH = 3
+# {**}: 경로 조각 1~3개 (섹션·작은 분류처럼 기사마다 깊이가 다른 고정 단어: /news/economy/industry/…)
+SECTIONS_REGEX = r"[^/]+(?:/[^/]+){0,%d}" % (MAX_SECTION_DEPTH - 1)
 ID_PLACEHOLDERS = ("{n}", "{id}", "{slug}")     # 기사를 구분하는 자리. 이 중 하나는 있어야 기사 패턴이다
 
 
@@ -99,7 +102,7 @@ def has_identifier(sig: str) -> bool:
 
 def signature(url: str) -> str:
     """URL을 패턴 서명으로 바꾼다. 숫자는 {n}, 영숫자 식별자는 {id}, 소문자 단어 3개 이상의 슬러그는 {slug},
-    쿼리 값은 숫자면 {n} 아니면 *. (서명끼리 합칠 때 생기는 {*}는 signature()가 직접 내지 않는다)"""
+    쿼리 값은 숫자면 {n} 아니면 *. (서명끼리 합칠 때 생기는 {*}·{**}는 signature()가 직접 내지 않는다)"""
     parts = urlsplit(url)
     path = "/".join(_generalize_segment(seg) for seg in (parts.path or "/").split("/"))
     q = sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not TRACKING_PARAM.match(k))
@@ -115,6 +118,7 @@ def pattern_from_signature(sig: str) -> dict:
     regex = ("^" + re.escape(path).replace(re.escape("{n}"), r"\d+")
              .replace(re.escape("{id}"), r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*")
              .replace(re.escape("{slug}"), SLUG_REGEX)
+             .replace(re.escape("{**}"), SECTIONS_REGEX)
              .replace(re.escape("{*}"), WILDCARD_REGEX) + "$")
     pairs = [kv.partition("=")[::2] for kv in query.split("&") if kv]
     pattern = {"path": regex, "query_keys": [k for k, _ in pairs], "id_keys": [k for k, v in pairs if v == "{n}"],
@@ -491,11 +495,12 @@ class Discoverer:
             return []
         sigs = Counter(signature(u) for u in urls)
         article_like = {sig: count for sig, count in sigs.items() if has_identifier(sig) and not _is_list_signature(sig)}
-        # 섹션 이름만 다른 같은 형태의 서명(/news/economy/{n} + /news/society/{n})은 {*}로 합친 서명도 후보에 넣는다.
+        # 섹션 이름만 다른 같은 형태의 서명(/news/economy/{n} + /news/society/{n})은 {*}로, 작은 분류가 붙어 깊이가 다른
+        # 서명(/news/politics/{n} + /news/economy/industry/{n})은 {**}로 합친 서명도 후보에 넣는다.
         # 합친 서명은 원래 것들의 횟수를 모두 더해 받으므로 보통 앞에 온다. limit는 원래 서명에만 적용해 병합이
         # 틀려도 전과 같은 후보가 남고, 품질 검사가 그중에서 고른다
         originals = _score_signatures(article_like)[:limit]
-        merged = _score_signatures(merge_signatures(article_like))[:MAX_MERGED_PATTERNS]
+        merged = _score_signatures({**merge_signatures(article_like), **merge_depths(article_like)})[:MAX_MERGED_PATTERNS]
         ranked = sorted(originals + merged, reverse=True)
         return [pattern_from_signature(sig) for _, sig in ranked]
 
@@ -565,6 +570,50 @@ def merge_signatures(counts: dict[str, int]) -> dict[str, int]:
                       if split[sig][1] == mq and len(split[sig][0]) == len(mp)
                       and all(t == "{*}" or t == p for t, p in zip(mp, split[sig][0])))
         out[merged] = covered
+    return out
+
+
+def _depth_shape(sig: str) -> tuple[list[str], str, str] | None:
+    """(앞 고정 조각들, 첫 자리 표시부터 끝까지의 꼬리, 쿼리). 앞이 고정 단어만이 아니거나 꼬리에 식별자가 없으면 None."""
+    path, _, query = sig.partition("?")
+    pieces = path.split("/")
+    first = next((k for k in range(1, len(pieces)) if "{" in pieces[k]), None)
+    if first is None:
+        return None
+    head, tail = pieces[1:first], "/".join(pieces[first:])
+    if not head or "" in head or not has_identifier(tail):
+        return None
+    return head, tail, query
+
+
+def merge_depths(counts: dict[str, int]) -> dict[str, int]:
+    """섹션 깊이만 다른 서명을 {**}(경로 조각 1~MAX_SECTION_DEPTH개)로 합친 서명과, 그 서명이 덮는 횟수의 합.
+
+    서울신문처럼 기사 주소가 /news/{섹션}/{yyyy}/{mm}/{dd}/{id}와 작은 분류가 붙은 /news/{섹션}/{작은분류}/{yyyy}/…로
+    섞이면 조각 수가 달라 merge_signatures가 합치지 못하고, 깊이마다 기사 종류가 따로 생겨 문서 section이 종류 이름으로
+    덮인다. 첫 자리 표시({n}·{id}·{slug})부터 끝까지(꼬리)와 쿼리가 같고, 그 앞이 고정 단어뿐이며, 같은 앞머리(/news)
+    뒤의 고정 조각 수가 서로 다른(각 1~MAX_SECTION_DEPTH개) 서명 쌍을 합친다. 앞머리가 비면(/{**}/{slug}: 사이트 전체를
+    덮는 서명) 합치지 않는다. /news/{n} + /news/photo/{n}처럼 한쪽에 섹션 조각이 없어도 합치지 않는다.
+    예) /news/politics/{n}/{n}/{n}/{n} + /news/economy/industry/{n}/{n}/{n}/{n} → /news/{**}/{n}/{n}/{n}/{n}
+    """
+    shapes = {sig: shape for sig in counts if (shape := _depth_shape(sig)) is not None}
+    templates: set[tuple[tuple[str, ...], str, str]] = set()
+    items = list(shapes.values())
+    for i, (ha, ta, qa) in enumerate(items):
+        for hb, tb, qb in items[i + 1:]:
+            if ta != tb or qa != qb or len(ha) == len(hb):
+                continue
+            n = 0
+            while n < min(len(ha), len(hb)) and ha[n] == hb[n]:
+                n += 1
+            if n and all(1 <= len(h) - n <= MAX_SECTION_DEPTH for h in (ha, hb)):
+                templates.add((tuple(ha[:n]), ta, qa))
+    out: dict[str, int] = {}
+    for prefix, tail, query in templates:
+        merged = "/" + "/".join(prefix) + "/{**}/" + tail + (f"?{query}" if query else "")
+        out[merged] = sum(count for sig, count in counts.items() if (shape := shapes.get(sig))
+                          and shape[1] == tail and shape[2] == query and tuple(shape[0][:len(prefix)]) == prefix
+                          and 1 <= len(shape[0]) - len(prefix) <= MAX_SECTION_DEPTH)
     return out
 
 

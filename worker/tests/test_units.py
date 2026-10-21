@@ -10,8 +10,8 @@ import pytest
 from fakellm import FakeLlm, portal_recipe
 from sensing_worker.codes import Code, CrawlFailure
 from sensing_worker.config import Settings
-from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, merge_signatures, parse_sitemap,
-                                      pattern_from_signature, signature, sitemap_urls)
+from sensing_worker.discovery import (Discoverer, canonical_article_url, matches, merge_depths, merge_signatures,
+                                      parse_sitemap, pattern_from_signature, signature, sitemap_urls)
 from sensing_worker.evidence import EvidenceStore
 from sensing_worker.extract import Article, extract_article, links_with_dates
 from sensing_worker.jobs import discover
@@ -530,6 +530,35 @@ def test_ranked_patterns_merge_signatures_that_differ_only_in_section():
     assert ranked == ["/{*}/{n}", "/d/{n}", "/c/{n}"]                      # 원래 서명 2개 + 병합 서명
 
 
+def test_ranked_patterns_merge_section_depths():
+    """서울신문: /news/{섹션}/{yyyy}/{mm}/{dd}/{id}와 작은 분류가 붙은 /news/{섹션}/{작은분류}/… 가 섞인다 (2026-10-21)."""
+    base = "https://www.seoul.co.kr/news"
+    short = [f"{base}/{sec}/2026/10/21/2026102150{i:04d}" for sec in ("politics", "society", "economy") for i in range(4)]
+    sub = [f"{base}/{sec}/2026/10/21/2026102150{i:04d}" for sec in ("economy/industry", "society/accident")
+           for i in range(4)]
+    deep = [f"{base}/sport/golf/iceberggolf/2026/10/21/2026102150{i:04d}" for i in range(3)]
+    ranked = [p["signature"] for p in Discoverer._ranked_patterns(short + sub + deep, 2)]
+    assert ranked[0] == "/news/{**}/{n}/{n}/{n}/{n}"
+    pattern = pattern_from_signature(ranked[0])
+    assert all(matches(u, pattern) for u in short + sub + deep)
+    assert not matches(f"{base}/2026/10/21/20261021500001", pattern)                   # 섹션 조각이 없으면 아니다
+    assert not matches(f"{base}/a/b/c/d/2026/10/21/20261021500001", pattern)           # 4단계는 넘는다
+    assert not matches("https://www.seoul.co.kr/newsList/economy/industry/", pattern)
+
+    assert merge_depths({"/news/politics/{n}/{n}": 5, "/news/economy/industry/{n}/{n}": 4,
+                         "/news/sport/golf/club/{n}/{n}": 3, "/news/a/b/c/d/{n}/{n}": 3}) \
+        == {"/news/{**}/{n}/{n}": 12}
+    # 깊이가 같으면 {*} 병합(merge_signatures)의 몫이다
+    assert merge_depths({"/news/economy/{n}": 3, "/news/society/{n}": 3}) == {}
+    # 한쪽에 섹션 조각이 없거나, 앞머리가 비거나, 꼬리·쿼리가 다르면 합치지 않는다
+    assert merge_depths({"/news/{n}": 3, "/news/photo/{n}": 3}) == {}
+    assert merge_depths({"/a/{slug}": 3, "/b/c/{slug}": 3}) == {}
+    assert merge_depths({"/news/a/{n}": 3, "/news/b/c/{id}": 3}) == {}
+    assert merge_depths({"/news/a/{n}?p=*": 3, "/news/b/c/{n}": 3}) == {}
+    assert merge_depths({"/kor/{n}/headquarters": 3, "/kor/a/{n}/sitemap": 3}) == {}
+    assert merge_depths({"/news/a/view.do?id={n}": 3, "/news/b/c/view.do?id={n}": 3}) == {}  # 경로에 식별자가 없다
+
+
 def test_discover_merges_section_paths_into_one_article_pattern():
     from fakesite import Site, sectioned_news_routes
     site = Site(sectioned_news_routes())
@@ -541,6 +570,27 @@ def test_discover_merges_section_paths_into_one_article_pattern():
         for sec in ("economy", "society"):
             assert matches(f"{site.base}/news/{sec}/9999", result.article_pattern)
         assert {u.split("/")[-2] for u in result.sample_urls} == {"economy", "society"}   # 두 섹션의 기사를 다 잡는다
+    finally:
+        f.close()
+        site.close()
+
+
+def test_discover_seoul_skips_robots_blocked_rss_and_merges_section_depths():
+    """서울신문 사례: robots가 막은 /xml/ RSS는 요청하지 않고 사이트맵으로 가며, 섹션 깊이가 다른 주소를 한 종류로 잡는다."""
+    from fakesite import Site, seoul_routes, with_base
+    site = Site({})
+    site.routes.update(with_base(seoul_routes(), site.base))
+    f = PoliteFetcher(Settings(min_interval_seconds=0, max_retries=1, allow_private_hosts=True))
+    try:
+        result, detail = discover(f, "127.0.0.1", site.base, "NEWS")
+        assert not [h for h in site.hits if h.startswith("/xml/")]          # 막힌 피드는 한 번도 요청하지 않는다
+        assert any("ROBOTS_DISALLOWED" in n for n in result.notes)
+        assert result.method == "SITEMAP" and result.hubs == [f"{site.base}/sitemap/sitemap_latestArticle"]
+        assert result.article_pattern["signature"] == "/news/{**}/{n}/{n}/{n}/{n}"
+        assert [k["enabled"] for k in result.kinds] == [True]                 # 깊이마다 종류가 갈리지 않는다
+        for path in ("/news/politics/2026/10/21/1", "/news/economy/industry/2026/10/21/2",
+                     "/news/sport/golf/iceberggolf/2026/10/21/3"):
+            assert matches(site.base + path, result.kinds[0])
     finally:
         f.close()
         site.close()

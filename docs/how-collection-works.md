@@ -18,6 +18,17 @@ URL 입력 → 도메인으로 정규화 → [워커] 사전 점검 → 입구 �
 
 - `robots.txt`를 읽는다. 전체 금지면 `ROBOTS_DISALLOWED`로 등록을 거절한다(네이버 뉴스·의안정보시스템이 이 경우).
   GPTBot·ClaudeBot 등 AI 봇만 막아 둔 사이트는 수집하되 `ai_restricted`로 표시해 챗봇 근거에서 뺄 수 있게 한다(주간조선·연합뉴스).
+- 판정은 RFC 9309 방식이다(`worker/src/sensing_worker/robots.py`, 2026-10-21부터). 이후 모든 요청(허브·사이트맵·기사, 리다이렉트
+  대상까지)이 같은 판정을 거치고, 사이트(scheme·호스트)마다 24시간 캐시한다.
+  - 그룹: 우리 이름(`SensingHubBot`, User-Agent의 `/` 앞, 대소문자 무시)과 같은 `User-agent` 그룹들을 합쳐 쓰고, 없으면 `*` 그룹들.
+    이어진 `User-agent` 줄은 한 그룹이고, 빈 줄은 그룹을 끝내지 않는다.
+  - 규칙: 주소의 경로+쿼리에 맞는 `Allow`·`Disallow` 중 **패턴이 가장 긴 것**을 쓰고, 길이가 같으면 `Allow`. 줄 순서는 상관없다.
+    `*`는 아무 글자열, 끝의 `$`는 경로 끝. 값이 빈 `Disallow:`는 아무것도 막지 않는다. 비교 전에 퍼센트 인코딩을 맞춘다(한글 경로 포함).
+  - 줄 형식: 키 대소문자·콜론 앞 공백(`Disallow : /xml/`)·주석을 허용하고, `Sitemap:`은 그룹과 관계없이 모은다. `Crawl-delay`는 읽기만
+    하고 간격은 도메인당 2초 그대로다.
+  - 상태: 홈(`/`)이 금지면 DISALLOWED, 우리 그룹에 값 있는 `Disallow`가 있으면 PARTIAL, 아니면 ALLOWED, 파일이 없으면(404·HTML) MISSING.
+  - 예전 판정(`urllib.robotparser`)은 처음 맞는 규칙을 써서, 서울신문처럼 `Allow:/`를 맨 앞에 둔 robots.txt의 `Disallow : /xml/`을
+    무시했다(막힌 RSS 피드 5개를 허브로 등록). 운영 소스 재점검 결과: [robots-recheck-2026-10.md](robots-recheck-2026-10.md).
 - 홈을 연다. 봇 확인 화면(Cloudflare·reCAPTCHA 등)·로그인 페이지·429면 **우회하지 않고** `BLOCKED`로 멈춘다(Congress.gov).
   홈이 403이면 사이트 단위 차단으로 본다. 추측해서 넘겨본 경로(`/rss/` 등)의 403은 "그 경로만 거부"로 넘어간다(주간조선은 이것 때문에 처음엔 BLOCKED였다 → 수정).
 - 홈 내용으로 사이트 유형을 정한다: `go.kr`·`or.kr` 등은 PUBLIC, 도메인·메타에 news/일보/신문 단서가 있으면 NEWS, 나머지 ETC.
@@ -39,13 +50,16 @@ URL 입력 → 도메인으로 정규화 → [워커] 사전 점검 → 입구 �
 ## 3. 기사 패턴 만들기 (URL 서명)
 
 링크 주소에서 숫자는 `{n}`, 숫자가 섞인 긴 영숫자 ID는 `{id}`, 하이픈으로 이어진 영문 슬러그는 `{slug}`로 바꾼 "서명"을 만들고,
-가장 많이 반복되는 서명을 기사 패턴으로 고른다. 섹션 이름만 다른 서명은 `{*}`로 합친다.
+가장 많이 반복되는 서명을 기사 패턴으로 고른다. 섹션 이름만 다른 서명은 `{*}`(조각 하나)로 합치고, 작은 분류가 붙어 섹션 깊이가
+다른 서명은 `{**}`(조각 1~3개)로 합친다.
 
 ```
 /news/articleView.html?idxno=50103            → /news/articleView.html?idxno={n}      주간조선·블로터 (ndsoft CMS)
 /view/AKR20261015138000530                    → /view/{id}                             연합뉴스
 /briefing/pressReleaseView.do?newsId=156748578 → /briefing/pressReleaseView.do?newsId={n}  정책브리핑
 /news/economy/12175940 + /news/society/…      → /news/{*}/{n}                          매일경제 (섹션 병합)
+/news/politics/2026/10/21/20261021500111
+  + /news/economy/industry/2026/10/21/…       → /news/{**}/{n}/{n}/{n}/{n}             서울신문 (섹션 깊이 병합)
 /samsung-lays-out-ai-memory-roadmap/          → /{slug}/                               EE Times
 /news/articleList.html?sc_section_code=S1N1   → 목록 주소, 제외
 /member/login.html                            → 식별자 없음, 제외
@@ -53,6 +67,12 @@ URL 입력 → 도메인으로 정규화 → [워커] 사전 점검 → 입구 �
 
 목록·검색·로그인·태그·인쇄 경로와 이미지·PDF 등은 규칙으로 뺀다. 추적용 파라미터(`utm_*`, `page` 등)는 서명과 정규 주소에서 뺀다.
 이 패턴이 이후 "이 링크가 기사인가"를 가르는 기준이다.
+
+`{**}` 병합 조건: 첫 자리 표시(`{n}`·`{id}`·`{slug}`)부터 끝까지와 쿼리가 같고, 그 앞이 고정 단어뿐이며, 같은 앞머리(`/news`) 뒤의
+섹션 조각 수가 서로 다른(각 1~3개) 서명끼리만 합친다. 앞머리가 없거나(`/{**}/{slug}`처럼 사이트 전체를 덮는 서명) 한쪽에 섹션 조각이
+없으면(`/news/{n}` + `/news/photo/{n}`) 합치지 않는다. 서울신문(2026-10-21)은 사이트맵 723건 중 작은 분류 주소가 328건(45%)인데
+`/news/{*}/…`만 잡아 그중 6건만 수집했다. 병합 없이 종류 찾기에 맡기면 깊이마다 종류(`news`·`news (news)`·`sport`)가 생기고,
+종류가 둘 이상이면 문서 분류(`section`)가 기사 자체 분류 대신 종류 이름으로 바뀌므로 패턴 하나로 합친다.
 
 ## 4. 샘플 품질 검사 (QUALITY)
 
